@@ -122,7 +122,12 @@ if [ "$HAVE_PENDING" = "1" ]; then
 fi
 
 EXTRA=$((TAG_SLOTS + 1))
-mapfile -t TAGS < <(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n "$EXTRA")
+# (no mapfile: macOS ships bash 3.2, where it doesn't exist and the whole
+# changelog silently went missing from every IPA)
+TAGS=()
+while IFS= read -r tag; do
+    [ -n "$tag" ] && TAGS+=("$tag")
+done < <(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n "$EXTRA")
 DISPLAY=${#TAGS[@]}
 if [ "$DISPLAY" -gt "$TAG_SLOTS" ]; then DISPLAY="$TAG_SLOTS"; fi
 

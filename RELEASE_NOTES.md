@@ -48,6 +48,74 @@ activity, omit it.
 
 ## Released
 
+### v1.8.0 - 2026-10-10
+
+- [x] New File Browser: browse files, view them and edit plists. Write mode is optional and off by default; every save keeps a backup.
+- [x] Root access in the File Browser is read-only on purpose: writing system files as root can leave a device unable to boot.
+- [x] Editing files is at your own risk: we can't take responsibility for changes that break iOS, apps or data.
+- [x] New Location Services toggle for Control Center (iOS 18).
+- [x] New Location Services action for Shortcuts, Siri and the Action button (iOS 17+).
+- [x] Location Services links (cyanide://location-services/on, /off, /toggle), off by default: Settings → Launch Options.
+- [x] The Location Services switch needs kernel access from an earlier run and never starts a full exploit run itself.
+- [x] Cyanide only removes itself from the App Switcher if the switch opened it; it stays when it was open or live tweaks run.
+- [x] Tools card on the Home tab for Process Viewer and File Browser.
+- [x] Process Viewer: more accurate CPU usage, and Force Quit checks it is still the same process.
+- [x] Importing passcode originals runs in the background with progress and Cancel.
+- [x] Sources: the refresh banner says when some sources failed; details only when you refresh yourself.
+- [x] Removing a repo package or deleting a source also stops its running script.
+- [x] Log upload sends only the recent part of the log, without paths to your own files.
+- [x] Fixed a respring that could follow using the File Browser after the Process Viewer.
+- [x] A damaged ZIP or .deb now fails as a whole instead of leaving half-imported files.
+- [x] SBCustomizer, Home Layout Extras and DarkSword tweaks stop safely when SpringBoard doesn't answer instead of applying twice.
+- [x] Double Tap to Lock can no longer be installed twice; Axon can no longer show a notification twice.
+- [x] More kernel access paths stop safely when a read or write fails, instead of risking a reboot.
+
+### v1.7.3 - 2026-10-09
+
+- [x] Tweaks apply much faster. Applying the Home Screen tweaks used to spend most of its time waiting. On an iPhone 16 Pro Max, the DarkSword tweaks (App Library, icon fly-in, wake animation, backlight fade, double-tap to lock) went from about 1.7 seconds to about 0.3, and SBCustomizer's page arranging went from about 2.2 seconds to 1.4. Hide Labels, Dock Labels and the icon resize in Home Layout Extras are faster too.
+- [x] See what Apply is doing. The progress screen now shows the current step instead of only a spinner, for example "Resizing icons: page 3 of 7".
+- [x] Auto-retry failed runs. New in Settings → Launch Options: when the exploit misses, Cyanide can start the next attempt by itself until it works or reaches the attempt limit you set (1–20, default 8). Off by default. Each attempt carries the same small chance of a reboot, so the limit caps how many you take per tap.
+- [x] Run Again button. When a run fails to get kernel access, the progress screen offers Run Again right there.
+- [x] Repo sources switch. Settings → Launch Options → Repo sources turns the whole repo feature off: the Sources tab, repo packages, background refreshes and repo tweaks. Local QuickLoader .js files keep working.
+- [x] New default tweak source. The previous default source is offline. Cyanide now uses MinePlayer16's repository (MinePlayer16 / Iggy05). Tweaks you installed from the old source move over with their settings.
+- [x] New pe_v3 exploit path. It stops before the steps most likely to reboot the device and starts a clean new attempt instead. In testing it got kernel access on about half of its attempts. On first launch, Cyanide asks once whether you want to switch to it. You can change this any time in Settings → Launch Options → A18 exploit path.
+- [x] Less waiting on attempts that can't succeed. pe_v3 now spots attempts that won't land and moves on to the next one right away instead of waiting about a minute.
+- [x] If the injection into SpringBoard gets stuck, Cyanide now notices, makes the device safe and offers a Restart Cyanide button instead of hanging. A new diagnostic option, "Controlled panic on injection wedge", restarts the device right away with a clearly labelled panic log, for bug reports.
+- [x] Process Viewer: a process that couldn't be checked is no longer shown as gone, and a Force Quit that failed is no longer reported as successful.
+- [x] Process Viewer: fixed a rare way reading a process's CPU usage could reboot the device while one of its threads was exiting.
+- [x] Process Viewer: after a failed Force Quit, the background helper it uses now shuts down after 10 idle seconds, as it already did after a successful one.
+- [x] Process Viewer: fixed CPU % sometimes using the wrong source after re-calibrating.
+- [x] Process Viewer: fixed a small resource leak on every refresh.
+- [x] Fixed Cyanide closing itself when a kernel access failed. It now skips that access safely and carries on.
+- [x] Fixed a crash when importing a damaged or malicious ZIP theme.
+
+### v1.7.2 - 2026-10-07
+
+- [x] Much faster refreshes. Reading the process list used to take a few seconds and now takes a few milliseconds. The list keeps up with a 1-second auto-refresh, and the viewer puts far less load on the kernel session.
+- [x] CPU % now works on every launch. Before, the CPU column was often blank or stuck at 0.0%, and some processes never got a value. Now every process gets a reading.
+- [x] CPU % is accurate. Busy background services (Spotlight indexing, mail and others, especially while charging) now show their real load instead of almost nothing. 100% means one full core, so a busy multi-threaded process can go above 100%, up to 600% on a 6-core chip. The rows add up to the "CPU: X% busy" figure in the header, which counts all cores as 100%.
+- [x] Refreshes no longer overlap. Overlapping refreshes could briefly show an older list after a newer one, or a wrong CPU %.
+- [x] Tapping Force Quit on a second app while the first kill is still starting no longer freezes the screen.
+- [x] Auto-refresh now waits until every Force Quit in progress has finished before it resumes.
+- [x] Fixed a rare case where the check that blocks quitting critical processes (SpringBoard, backboardd, launchd) could read the wrong process name.
+- [x] Fixed a possible crash when a process name contains unusual characters.
+- [x] Extra safety checks on iOS 17 and later when reading details of processes that are just exiting.
+
+### v1.7.1 - 2026-10-05
+
+- [x] Fixed the main cause of a black screen on launch after using the Process Viewer. If you still hit one, please report it with a log.
+- [x] The large title no longer shrinks and re-centers when you open the viewer.
+- [x] The list no longer jumps down when the process count appears.
+- [x] Force Quit starts faster, and the first kill's "finishing kill" banner now sits at the top and only shows for that first, slower kill — no more flicker on quick ones.
+- [x] Cyanide now releases the privileged session on its own about ten seconds after a kill.
+- [x] Verbose logging moved to Settings → Launch Options (it now also covers exploit runs and tweak applies, and it sticks across launches).
+
+### v1.7.0 - 2026-10-05
+
+- [x] New Process Viewer (Settings → Process Viewer): every running process with live CPU and memory, and Force Quit.
+- [x] The kernel read/write primitive now survives backgrounding and sleep. When you leave Cyanide it hands the primitive to the system and re-attaches on return, so re-opening recovers in a couple of seconds instead of re-running the full exploit chain.
+- [x] The log is quieter — the verbose RemoteCall internals are kept out of it. If you hit an issue worth reporting, turn on Settings → Process Viewer → Verbose logging before reproducing it, then share the log: that restores the full detail we need to look into it.
+
 ### v1.3.6 - 2026-06-27
 
 - [x] Removed Patreon integration and ungated all installable Cyanide tweaks, with stale account-linking state cleared so beta access is the same for everyone.
