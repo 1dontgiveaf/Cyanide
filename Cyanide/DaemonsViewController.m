@@ -12,6 +12,9 @@
 // the screen reminds the user that changes are pending.
 static NSString * const kDaemonsChangedBootKey = @"DaemonsChangedBootUUID";
 
+// Set once the user has acknowledged the brick warning.
+static NSString * const kDaemonsWarningAcceptedKey = @"DaemonsWarningAccepted";
+
 static BOOL daemons_restart_pending(void)
 {
     NSString *saved = [NSUserDefaults.standardUserDefaults stringForKey:kDaemonsChangedBootKey];
@@ -33,6 +36,7 @@ static void daemons_note_change(void)
 @property (nonatomic, assign) BOOL busy;
 - (void)setLabels:(NSArray<NSString *> *)labels disabled:(BOOL)disable from:(UIViewController *)presenter;
 - (BOOL)isLabelDisabled:(NSString *)label;
+- (BOOL)warningAccepted;
 @end
 
 #pragma mark - One group
@@ -120,6 +124,42 @@ static void daemons_note_change(void)
     [self.tableView reloadData];   // a group screen may have changed something
 }
 
+- (void)viewDidAppear:(BOOL)animated
+{
+    [super viewDidAppear:animated];
+    [self showWarningIfNeeded];
+}
+
+// Once, before anything can be changed: a daemon entry applies at every boot,
+// and one that stops iOS from booting can't be undone from Cyanide.
+- (void)showWarningIfNeeded
+{
+    if ([NSUserDefaults.standardUserDefaults boolForKey:kDaemonsWarningAcceptedKey]) return;
+    if (self.presentedViewController) return;
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"Disabling Daemons Can Brick Your Device"
+                         message:@"Turning off system daemons changes how iOS starts, at every boot. The services listed here are "
+                                 @"widely disabled without problems, but that isn't guaranteed for every iOS version and device.\n\n"
+                                 @"If iOS can't finish starting, Cyanide can't undo the change, and only restoring the device "
+                                 @"fixes it, which erases it unless you have a backup.\n\n"
+                                 @"Back up first, change one thing at a time and restart to check it before the next."
+                  preferredStyle:UIAlertControllerStyleAlert];
+    __weak typeof(self) weakSelf = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
+        [weakSelf.navigationController popViewControllerAnimated:YES];
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"I Understand" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        [NSUserDefaults.standardUserDefaults setBool:YES forKey:kDaemonsWarningAcceptedKey];
+        [weakSelf refreshUI];
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (BOOL)warningAccepted
+{
+    return [NSUserDefaults.standardUserDefaults boolForKey:kDaemonsWarningAcceptedKey];
+}
+
 - (void)pullToRefresh
 {
     [self.refreshControl endRefreshing];
@@ -164,6 +204,7 @@ static void daemons_note_change(void)
 
 - (void)setLabels:(NSArray<NSString *> *)labels disabled:(BOOL)disable from:(UIViewController *)presenter
 {
+    if (disable && !self.warningAccepted) { [self refreshUI]; [self showWarningIfNeeded]; return; }
     CYDaemonGroup *group = nil;
     for (CYDaemonGroup *g in daemon_catalog_groups())
         if ([g.labels containsObject:labels.firstObject]) { group = g; break; }
@@ -271,8 +312,10 @@ static void daemons_note_change(void)
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section
 {
     return @"Switched on means the service runs. Turning one off writes it to launchd's disabled.plist; "
-           @"it stops after the next restart. Only daemons from a list that is known to be safe to disable "
-           @"on iOS 17 and 18 are offered. If something you need stops working, switch it back on and restart.";
+           @"it stops after the next restart. The daemons offered here are widely disabled on iOS 17 and 18 "
+           @"without problems. If something you need stops working, switch it back on and restart.\n\n"
+           @"⚠️ Disabling system daemons is at your own risk. If iOS can't finish starting, only a restore "
+           @"fixes it, which erases the device unless you have a backup. Change one thing at a time.";
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
