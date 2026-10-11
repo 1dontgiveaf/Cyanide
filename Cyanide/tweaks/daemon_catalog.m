@@ -152,3 +152,23 @@ BOOL daemon_catalog_contains_label(NSString *label)
     });
     return [label isKindOfClass:NSString.class] && [all containsObject:label];
 }
+
+NSString *daemon_catalog_executable_guess(NSString *label)
+{
+    static NSDictionary<NSString *, NSString *> *known;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        known = @{
+            @"com.apple.ReportCrash.Jetsam": @"ReportCrash",
+            @"com.apple.system.logger": @"syslogd",
+            @"com.apple.ProxiedCrashCopier.ProxyingDevice": @"ProxiedCrashCopier",
+            @"com.apple.logd.admin": @"logd",
+            @"com.apple.logd.events": @"logd",
+            @"com.apple.logd.watchdog": @"logd",
+            @"com.apple.logd_reporter.report_statistics": @"logd_reporter",
+            @"com.apple.spotlightknowledged.updater": @"spotlightknowledged",
+            @"com.apple.sysdiagnose.darwinos": @"sysdiagnose",
+        };
+    });
+    return known[label] ?: [label componentsSeparatedByString:@"."].lastObject;
+}

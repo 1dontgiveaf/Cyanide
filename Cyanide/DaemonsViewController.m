@@ -24,21 +24,41 @@ static BOOL daemons_restart_pending(void)
     return saved.length && boot.length && [saved isEqualToString:boot];
 }
 
-static void daemons_note_change(void)
+// Labels changed during the current boot: for them, a running process is
+// expected until the restart; for the others, a disabled daemon that runs
+// means the disable didn't take effect.
+static NSString * const kDaemonsChangedLabelsKey = @"DaemonsChangedLabels";   // @{ boot, labels }
+
+static NSSet<NSString *> *daemons_changed_this_boot(void)
+{
+    NSDictionary *d = [NSUserDefaults.standardUserDefaults dictionaryForKey:kDaemonsChangedLabelsKey];
+    NSString *boot = krw_persistence_current_boot_uuid();
+    if (!boot.length || ![d[@"boot"] isEqual:boot] || ![d[@"labels"] isKindOfClass:NSArray.class]) return [NSSet set];
+    return [NSSet setWithArray:d[@"labels"]];
+}
+
+static void daemons_note_change(NSArray<NSString *> *labels)
 {
     NSString *boot = krw_persistence_current_boot_uuid();
-    if (boot.length) [NSUserDefaults.standardUserDefaults setObject:boot forKey:kDaemonsChangedBootKey];
+    if (!boot.length) return;
+    [NSUserDefaults.standardUserDefaults setObject:boot forKey:kDaemonsChangedBootKey];
+    NSMutableSet *all = [daemons_changed_this_boot() mutableCopy];
+    [all addObjectsFromArray:labels];
+    [NSUserDefaults.standardUserDefaults setObject:@{ @"boot": boot, @"labels": all.allObjects }
+                                            forKey:kDaemonsChangedLabelsKey];
 }
 
 @class DaemonGroupViewController;
 
 @interface DaemonsViewController ()
 @property (nonatomic, copy) NSDictionary *disabled;   // nil until loaded
+@property (nonatomic, copy) NSDictionary *running;    // label -> @{ name, pid? }; nil if unknown
 @property (nonatomic, copy) NSString *status;          // shown while not loaded / on error
 @property (nonatomic, assign) BOOL busy;
 - (void)setLabels:(NSArray<NSString *> *)labels disabled:(BOOL)disable from:(UIViewController *)presenter;
 - (BOOL)isLabelDisabled:(NSString *)label;
 - (BOOL)warningAccepted;
+- (NSString *)statusForLabel:(NSString *)label warning:(BOOL *)warning;
 @end
 
 #pragma mark - One group
@@ -66,20 +86,26 @@ static void daemons_note_change(void)
 {
     NSString *s = self.group.summary;
     if (self.group.caution) s = [s stringByAppendingFormat:@"\n\n⚠️ %@", self.group.caution];
-    return [s stringByAppendingString:@"\n\nSwitched on means the daemon runs. Changes take effect after a restart."];
+    return [s stringByAppendingString:@"\n\nSwitched on means the daemon may run. Changes take effect after a restart. "
+                                      @"Most daemons only run while something needs them, so “not running” doesn't mean disabled. "
+                                      @"Pull down on the Daemons list to refresh."];
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
 {
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"label"];
-    if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"label"];
+    if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"label"];
     NSString *label = self.group.labels[(NSUInteger)indexPath.row];
-    UIListContentConfiguration *c = cell.defaultContentConfiguration;
+    UIListContentConfiguration *c = [UIListContentConfiguration subtitleCellConfiguration];
     c.text = label;
     c.textProperties.font = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
     c.textProperties.adjustsFontSizeToFitWidth = YES;
     c.textProperties.minimumScaleFactor = 0.7;
     c.textProperties.numberOfLines = 1;
+    BOOL warning = NO;
+    c.secondaryText = [self.owner statusForLabel:label warning:&warning];
+    c.secondaryTextProperties.color = warning ? UIColor.systemOrangeColor : UIColor.secondaryLabelColor;
+    c.secondaryTextProperties.numberOfLines = 0;
     cell.contentConfiguration = c;
     cell.selectionStyle = UITableViewCellSelectionStyleNone;
     UISwitch *sw = [UISwitch new];
@@ -174,6 +200,29 @@ static void daemons_note_change(void)
     return [self.disabled[label] boolValue];
 }
 
+// "tipsd · Running · PID 412", plus what to expect: a daemon disabled in an
+// earlier boot that still runs means the disable didn't take effect.
+- (NSString *)statusForLabel:(NSString *)label warning:(BOOL *)warning
+{
+    *warning = NO;
+    NSDictionary *info = self.running[label];
+    NSString *name = info[@"name"] ?: daemon_catalog_executable_guess(label);
+    if (!self.running) return [name stringByAppendingString:@" · status unknown"];
+    NSNumber *pid = info[@"pid"];
+    BOOL off = [self isLabelDisabled:label];
+    BOOL changed = [daemons_changed_this_boot() containsObject:label];
+    if (pid && off && changed)
+        return [NSString stringWithFormat:@"%@ · Running · PID %@ · stops after restart", name, pid];
+    if (pid && off) {
+        *warning = YES;
+        return [NSString stringWithFormat:@"%@ · Running · PID %@ · still running although disabled", name, pid];
+    }
+    if (pid) return [NSString stringWithFormat:@"%@ · Running · PID %@", name, pid];
+    if (off) return [name stringByAppendingString:@" · Not running"];
+    if (changed) return [name stringByAppendingString:@" · Not running · can start again after restart"];
+    return [name stringByAppendingString:@" · Not running (starts when needed)"];
+}
+
 - (void)refreshUI
 {
     self.navigationItem.rightBarButtonItem.enabled = self.disabled && !self.busy;
@@ -190,12 +239,13 @@ static void daemons_note_change(void)
     self.busy = YES;
     [self refreshUI];
     __weak typeof(self) weakSelf = self;
-    settings_daemons_read_async(allowFullExploit, ^(NSDictionary *disabled, NSString *message) {
+    settings_daemons_read_async(allowFullExploit, ^(NSDictionary *disabled, NSDictionary *running, NSString *message) {
         typeof(self) me = weakSelf;
         if (!me) return;
         me.busy = NO;
         if (disabled) {
             me.disabled = disabled;
+            me.running = running;
             me.status = nil;
         } else if (!me.disabled) {
             me.status = message;
@@ -247,7 +297,7 @@ static void daemons_note_change(void)
                 else [d removeObjectForKey:label];
             }
             me.disabled = d;
-            daemons_note_change();
+            daemons_note_change(labels);
         }
         [me refreshUI];
         if (!ok) [me handleFailure:message retry:^{
@@ -407,12 +457,23 @@ static void daemons_note_change(void)
     c.image = [UIImage systemImageNamed:g.symbol] ?: [UIImage systemImageNamed:@"gearshape"];
     c.imageProperties.tintColor = (g.caution || g.advanced) ? UIColor.systemOrangeColor : UIColor.systemBlueColor;
     c.text = g.title;
-    NSString *detail = g.summary;
+    NSUInteger running = 0;
+    BOOL anyWarning = NO;
+    for (NSString *label in g.labels) {
+        if (self.running[label][@"pid"]) running++;
+        BOOL warning = NO;
+        [self statusForLabel:label warning:&warning];
+        anyWarning |= warning;
+    }
+    NSMutableArray *facts = [NSMutableArray array];
     if (off > 0 && off < g.labels.count)
-        detail = [NSString stringWithFormat:@"%lu of %lu disabled · %@", (unsigned long)off,
-                  (unsigned long)g.labels.count, detail];
-    c.secondaryText = detail;
-    c.secondaryTextProperties.color = UIColor.secondaryLabelColor;
+        [facts addObject:[NSString stringWithFormat:@"%lu of %lu disabled", (unsigned long)off, (unsigned long)g.labels.count]];
+    if (self.running)
+        [facts addObject:running ? [NSString stringWithFormat:@"%lu running", (unsigned long)running] : @"not running"];
+    if (anyWarning) [facts addObject:@"still running although disabled"];
+    [facts addObject:g.summary];
+    c.secondaryText = [facts componentsJoinedByString:@" · "];
+    c.secondaryTextProperties.color = anyWarning ? UIColor.systemOrangeColor : UIColor.secondaryLabelColor;
     c.secondaryTextProperties.numberOfLines = 0;
     cell.contentConfiguration = c;
 

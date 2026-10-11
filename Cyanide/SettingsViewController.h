@@ -258,10 +258,13 @@ extern NSString * const kSettingsLocationServicesLinksEnabled;
 void settings_unlock_filesystem_async(BOOL allowFullExploit,
                                       void (^completion)(BOOL ok, NSString *message));
 // Daemons screen (launchd disabled.plist). `disabled` maps label -> value as
-// stored (nil on failure, with `message`); changes map label -> @YES to
-// disable / @NO to enable. allowFullExploit as above. Completions on main.
+// stored (nil on failure, with `message`); `running` maps every catalog label
+// to @{ @"name": executable, @"pid": pid if running } (nil if the process
+// list couldn't be read). Changes map label -> @YES to disable / @NO to
+// enable. allowFullExploit as above. Completions on main.
 void settings_daemons_read_async(BOOL allowFullExploit,
-                                 void (^completion)(NSDictionary *disabled, NSString *message));
+                                 void (^completion)(NSDictionary *disabled, NSDictionary *running,
+                                                    NSString *message));
 void settings_daemons_apply_async(NSDictionary<NSString *, NSNumber *> *changes, BOOL allowFullExploit,
                                   void (^completion)(BOOL ok, NSString *message));
 // The Daemons screen, for pushing from Home's tools.

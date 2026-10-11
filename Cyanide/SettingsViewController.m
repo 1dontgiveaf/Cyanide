@@ -6,6 +6,7 @@
 #import "SettingsViewController.h"
 #import "FileBrowserViewController.h"
 #import "DaemonsViewController.h"
+#import "tweaks/daemon_catalog.h"
 #import <dirent.h>
 #import <fcntl.h>
 #import <sys/stat.h>
@@ -6857,16 +6858,86 @@ static BOOL settings_daemons_kernel_ready(BOOL allowFullExploit, NSString **mess
     return NO;
 }
 
+// Label -> executable name from launchd's job cache (iOS 16+ keeps every
+// job in one plist). nil when it can't be read; read once per launch.
+static NSDictionary<NSString *, NSString *> *settings_launchd_job_programs(void)
+{
+    static NSDictionary *programs;
+    static BOOL tried;
+    @synchronized (NSNull.null) {
+        if (tried) return programs;
+        tried = YES;
+        NSData *data = [NSData dataWithContentsOfFile:@"/System/Library/xpc/launchd.plist"];
+        id root = data ? [NSPropertyListSerialization propertyListWithData:data options:0 format:NULL error:nil] : nil;
+        if (![root isKindOfClass:NSDictionary.class]) {
+            printf("[DAEMONS] launchd job cache not readable; guessing executable names\n");
+            return nil;
+        }
+        NSMutableDictionary *out = [NSMutableDictionary dictionary];
+        // Jobs are dictionaries with a Label, nested under LaunchDaemons /
+        // LaunchAgents / … keyed by their original plist path.
+        NSMutableArray *queue = [NSMutableArray arrayWithObject:root];
+        while (queue.count) {
+            id node = queue.lastObject;
+            [queue removeLastObject];
+            if (![node isKindOfClass:NSDictionary.class]) continue;
+            NSString *label = node[@"Label"];
+            if ([label isKindOfClass:NSString.class]) {
+                NSString *program = node[@"Program"];
+                NSArray *args = node[@"ProgramArguments"];
+                if (![program isKindOfClass:NSString.class] && [args isKindOfClass:NSArray.class] &&
+                    [args.firstObject isKindOfClass:NSString.class]) program = args.firstObject;
+                if ([program isKindOfClass:NSString.class]) out[label] = program.lastPathComponent;
+                continue;
+            }
+            for (id child in [node allValues]) if ([child isKindOfClass:NSDictionary.class]) [queue addObject:child];
+        }
+        printf("[DAEMONS] launchd job cache: %lu jobs\n", (unsigned long)out.count);
+        programs = out.count ? out : nil;
+        return programs;
+    }
+}
+
+// For every catalog label: its executable and, if running, its pid
+// (label -> @{ @"name": …, @"pid": @(pid) }). nil if the process list failed.
+static NSDictionary *settings_daemons_running(void)
+{
+    int cap = 4096;
+    procmgr_entry_t *buf = calloc((size_t)cap, sizeof(procmgr_entry_t));
+    int n = buf ? procmgr_list(buf, cap) : -1;
+    if (n < 0) { free(buf); return nil; }
+    NSMutableDictionary<NSString *, NSNumber *> *pids = [NSMutableDictionary dictionary];
+    for (int i = 0; i < n; i++) {
+        buf[i].name[sizeof(buf[i].name) - 1] = 0;
+        NSString *name = [NSString stringWithUTF8String:buf[i].name];
+        if (name.length && !pids[name]) pids[name] = @(buf[i].pid);
+    }
+    free(buf);
+    NSDictionary *programs = settings_launchd_job_programs();
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    for (CYDaemonGroup *g in daemon_catalog_groups()) {
+        for (NSString *label in g.labels) {
+            NSString *exe = programs[label] ?: daemon_catalog_executable_guess(label);
+            // The kernel keeps at most 31 characters of the name.
+            NSString *key = exe.length > sizeof(buf->name) - 1 ? [exe substringToIndex:sizeof(buf->name) - 1] : exe;
+            NSNumber *pid = pids[key];
+            out[label] = pid ? @{ @"name": exe, @"pid": pid } : @{ @"name": exe };
+        }
+    }
+    return out;
+}
+
 void settings_daemons_read_async(BOOL allowFullExploit,
-                                 void (^completion)(NSDictionary *disabled, NSString *message))
+                                 void (^completion)(NSDictionary *disabled, NSDictionary *running,
+                                                    NSString *message))
 {
     if (!settings_device_supported()) {
         NSString *m = settings_unsupported_message();
-        dispatch_async(dispatch_get_main_queue(), ^{ completion(nil, m); });
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(nil, nil, m); });
         return;
     }
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        NSDictionary *disabled = nil;
+        NSDictionary *disabled = nil, *running = nil;
         NSString *message = nil;
         if (!settings_try_claim_actions_lock("Daemons", "[DAEMONS] Another action is already running.")) {
             message = @"Another action is already running. Try again when it has finished.";
@@ -6875,12 +6946,13 @@ void settings_daemons_read_async(BOOL allowFullExploit,
                 if (settings_daemons_kernel_ready(allowFullExploit, &message)) {
                     disabled = launchd_disabled_read();
                     if (!disabled) message = @"The list of disabled daemons could not be read. Check the log.";
+                    else running = settings_daemons_running();
                 }
             } @finally {
                 settings_release_actions_lock();
             }
         }
-        dispatch_async(dispatch_get_main_queue(), ^{ completion(disabled, message); });
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(disabled, running, message); });
     });
 }
 

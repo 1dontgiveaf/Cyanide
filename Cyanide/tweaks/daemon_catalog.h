@@ -26,3 +26,6 @@
 
 NSArray<CYDaemonGroup *> *daemon_catalog_groups(void);
 BOOL daemon_catalog_contains_label(NSString *label);
+// The executable name a label most likely runs, when launchd's job cache
+// can't be read: the label's last component, with known exceptions.
+NSString *daemon_catalog_executable_guess(NSString *label);
