@@ -396,6 +396,11 @@ static const CGFloat kMargin = 20.0;
                                          icon:@"gearshape.2.fill"
                                         color:UIColor.systemTealColor
                                           sel:@selector(openDaemons)]];
+    [s addArrangedSubview:[self bigActionButton:@"System Info"
+                                          sub:@"Battery, uptime, kernel access, storage"
+                                         icon:@"info.circle.fill"
+                                        color:UIColor.systemGreenColor
+                                          sel:@selector(openSystemInfo)]];
     return card;
 }
 
@@ -726,6 +731,11 @@ static const CGFloat kMargin = 20.0;
 - (void)openProcessViewer
 {
     [self.navigationController pushViewController:settings_make_process_viewer() animated:YES];
+}
+
+- (void)openSystemInfo
+{
+    [self.navigationController pushViewController:settings_make_system_info_viewer() animated:YES];
 }
 
 - (void)openDaemons

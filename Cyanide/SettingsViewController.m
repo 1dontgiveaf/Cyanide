@@ -6,8 +6,10 @@
 #import "SettingsViewController.h"
 #import "FileBrowserViewController.h"
 #import "DaemonsViewController.h"
+#import "SystemInfoViewController.h"
 #import "tweaks/daemon_catalog.h"
 #import <dirent.h>
+#import <dlfcn.h>
 #import <fcntl.h>
 #import <sys/stat.h>
 #import "AppDelegate.h"   // round 31: cyanide_launch_trace
@@ -7031,6 +7033,131 @@ void settings_daemons_read_async(BOOL allowFullExploit,
     });
 }
 
+// ---- System Info ----
+
+NSDictionary *settings_kernel_access_status(void)
+{
+    NSString *state, *detail;
+    if (g_kexploit_done && kexploit_krw_session_active()) {
+        state = @"Active";
+        detail = @"Kernel access is live in Cyanide.";
+    } else if (krw_persistence_launchd_holds_krw() || krw_persistence_has_saved_recovery()) {
+        state = @"Parked";
+        detail = @"Saved in launchd for this boot; restored without a full exploit run.";
+    } else {
+        state = @"None";
+        detail = @"No saved kernel access for this boot; the next use needs a full exploit run.";
+    }
+    return @{ @"state": state, @"detail": detail, @"springboard": @(g_springboard_rc_ready != 0) };
+}
+
+// AppleSmartBattery's registry properties read in this process. The app
+// sandbox may hide them; nil (or no CycleCount) then.
+static NSDictionary *settings_battery_props_local(void)
+{
+    void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
+    if (!iokit) return nil;
+    CFMutableDictionaryRef (*matching)(const char *) = dlsym(iokit, "IOServiceMatching");
+    mach_port_t (*getService)(mach_port_t, CFDictionaryRef) = dlsym(iokit, "IOServiceGetMatchingService");
+    kern_return_t (*createProps)(mach_port_t, CFMutableDictionaryRef *, CFAllocatorRef, uint32_t) =
+        dlsym(iokit, "IORegistryEntryCreateCFProperties");
+    kern_return_t (*release)(mach_port_t) = dlsym(iokit, "IOObjectRelease");
+    if (!matching || !getService || !createProps || !release) return nil;
+    mach_port_t service = getService(MACH_PORT_NULL, matching("AppleSmartBattery"));   // consumes the dictionary
+    if (!service) return nil;
+    CFMutableDictionaryRef props = NULL;
+    kern_return_t kr = createProps(service, &props, kCFAllocatorDefault, 0);
+    release(service);
+    if (kr != KERN_SUCCESS || !props) return nil;
+    return (__bridge_transfer NSDictionary *)props;
+}
+
+// The same read inside SpringBoard, which isn't limited by the app sandbox.
+// The properties come back as a binary plist. Needs an open session.
+static NSDictionary *settings_battery_props_springboard_locked(void)
+{
+    uint64_t name = r_alloc_str("AppleSmartBattery");
+    if (!name) return nil;
+    uint64_t matching = r_dlsym_call(R_TIMEOUT, "IOServiceMatching", name, 0, 0, 0, 0, 0, 0, 0);
+    BOOL ok = r_last_call_ok();
+    r_free(name);
+    if (!ok || !matching) return nil;
+    uint32_t service = (uint32_t)r_dlsym_call(R_TIMEOUT, "IOServiceGetMatchingService", 0, matching, 0, 0, 0, 0, 0, 0);
+    if (!r_last_call_ok() || !service) return nil;
+    NSDictionary *result = nil;
+    uint64_t out = r_dlsym_call(R_TIMEOUT, "calloc", 1, 8, 0, 0, 0, 0, 0, 0);
+    if (r_last_call_ok() && out) {
+        uint32_t kr = (uint32_t)r_dlsym_call(R_TIMEOUT, "IORegistryEntryCreateCFProperties", service, out, 0, 0, 0, 0, 0, 0);
+        uint64_t props = 0;
+        if (r_last_call_ok() && kr == 0 && remote_read(out, &props, sizeof(props)) && props) {
+            // kCFPropertyListBinaryFormat_v1_0 = 200
+            uint64_t data = r_dlsym_call(R_TIMEOUT, "CFPropertyListCreateData", 0, props, 200, 0, 0, 0, 0, 0);
+            if (r_last_call_ok() && data) {
+                uint64_t length = r_dlsym_call(R_TIMEOUT, "CFDataGetLength", data, 0, 0, 0, 0, 0, 0, 0);
+                uint64_t bytes = r_last_call_ok() && length > 0 && length < 4 * 1024 * 1024
+                    ? r_dlsym_call(R_TIMEOUT, "CFDataGetBytePtr", data, 0, 0, 0, 0, 0, 0, 0) : 0;
+                if (r_last_call_ok() && bytes) {
+                    NSMutableData *local = [NSMutableData dataWithLength:(NSUInteger)length];
+                    if (remote_read(bytes, local.mutableBytes, length)) {
+                        id plist = [NSPropertyListSerialization propertyListWithData:local options:0 format:NULL error:nil];
+                        if ([plist isKindOfClass:NSDictionary.class]) result = plist;
+                    }
+                }
+                r_dlsym_call(R_TIMEOUT, "CFRelease", data, 0, 0, 0, 0, 0, 0, 0);
+            }
+            r_dlsym_call(R_TIMEOUT, "CFRelease", props, 0, 0, 0, 0, 0, 0, 0);
+        }
+        r_dlsym_call(R_TIMEOUT, "free", out, 0, 0, 0, 0, 0, 0, 0);
+    }
+    r_dlsym_call(R_TIMEOUT, "IOObjectRelease", service, 0, 0, 0, 0, 0, 0, 0);
+    return result;
+}
+
+void settings_battery_info_async(BOOL allowFullExploit,
+                                 void (^completion)(NSDictionary *battery, NSString *source, NSString *message))
+{
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSDictionary *battery = settings_battery_props_local();
+        NSString *source = @"Cyanide";
+        NSString *message = nil;
+        if (!battery[@"CycleCount"]) {
+            battery = nil;
+            source = @"SpringBoard";
+            if (!settings_device_supported()) {
+                message = settings_unsupported_message();
+            } else if (!settings_try_claim_actions_lock("System Info", "[SYSINFO] Another action is already running.")) {
+                message = @"Another action is already running. Try again when it has finished.";
+            } else {
+                @try {
+                    if (settings_daemons_kernel_ready(allowFullExploit, &message)) {
+                        @synchronized (settings_rc_lock()) {
+                            BOOL opened = !g_springboard_rc_ready;
+                            if (!settings_ensure_springboard_remote_call_locked()) {
+                                message = @"SpringBoard could not be reached.";
+                            } else {
+                                battery = settings_battery_props_springboard_locked();
+                                if (!battery) message = @"The battery information could not be read. Check the log.";
+                                if (opened && !settings_has_persistent_springboard_remote_call_user() && g_springboard_rc_ready)
+                                    settings_destroy_springboard_remote_call_locked_internal_ex("battery info", YES, YES);
+                            }
+                        }
+                    }
+                } @finally {
+                    settings_release_actions_lock();
+                }
+            }
+        }
+        printf("[SYSINFO] battery via %s: %s\n", source.UTF8String,
+               battery ? "ok" : (message ?: @"failed").UTF8String);
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(battery, battery ? source : nil, message); });
+    });
+}
+
+UIViewController *settings_make_system_info_viewer(void)
+{
+    return [[SystemInfoViewController alloc] init];
+}
+
 void settings_daemons_apply_async(NSDictionary<NSString *, NSNumber *> *changes, BOOL allowFullExploit,
                                   void (^completion)(BOOL ok, NSString *message))
 {
@@ -13846,6 +13973,7 @@ UIViewController *settings_make_daemons_viewer(void)
         @{ @"title": @"Process Viewer",    @"icon": @"list.bullet.rectangle.fill", @"color": [UIColor systemGrayColor], @"section": @(-1), @"custom": @"procmgr" },
         @{ @"title": @"File Browser",      @"icon": @"folder.fill", @"color": [UIColor systemBlueColor], @"section": @(-1), @"custom": @"filebrowser" },
         @{ @"title": @"Daemons",           @"icon": @"gearshape.2.fill", @"color": [UIColor systemTealColor], @"section": @(-1), @"custom": @"daemons" },
+        @{ @"title": @"System Info",       @"icon": @"info.circle.fill", @"color": [UIColor systemGreenColor], @"section": @(-1), @"custom": @"sysinfo" },
     ];
 }
 
@@ -18004,6 +18132,10 @@ void cyanide_present_contact(UIViewController *host)
                 if ([bundle[@"custom"] isEqualToString:@"procmgr"]) {
                     ProcessManagerViewController *pm = [[ProcessManagerViewController alloc] initWithStyle:UITableViewStylePlain];
                     [self.navigationController pushViewController:pm animated:YES];
+                    return;
+                }
+                if ([bundle[@"custom"] isEqualToString:@"sysinfo"]) {
+                    [self.navigationController pushViewController:settings_make_system_info_viewer() animated:YES];
                     return;
                 }
                 if ([bundle[@"custom"] isEqualToString:@"daemons"]) {

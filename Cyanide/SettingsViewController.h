@@ -269,6 +269,14 @@ void settings_daemons_apply_async(NSDictionary<NSString *, NSNumber *> *changes,
                                   void (^completion)(BOOL ok, NSString *message));
 // The Daemons screen, for pushing from Home's tools.
 UIViewController *settings_make_daemons_viewer(void);
+// System Info. Kernel access: @{ state: Active/Parked/None, detail, springboard: BOOL }.
+NSDictionary *settings_kernel_access_status(void);
+// AppleSmartBattery registry properties: read in Cyanide if the sandbox
+// allows, else inside SpringBoard (kernel access as for Daemons). `source`
+// says which; completion on main.
+void settings_battery_info_async(BOOL allowFullExploit,
+                                 void (^completion)(NSDictionary *battery, NSString *source, NSString *message));
+UIViewController *settings_make_system_info_viewer(void);
 // System-wide Location Services: desired 1 = on, 0 = off, -1 = toggle.
 // The result is posted as soon as it is confirmed; `completion` (optional)
 // runs on the main queue after cleanup, with how long ago that was.
