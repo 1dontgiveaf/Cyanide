@@ -1,3 +1,7 @@
+> **Supported:** iPhone / iPad on iOS/iPadOS `17.0 – 18.7.1` or `26.0 – 26.0.1`.
+> **Not supported:** iPhone 17 (A19 / A19 Pro) and M5 — Memory Integrity Enforcement.
+> Any other device on a supported version works. [Details](https://github.com/kolbicz/Cyanide#supported-devices)
+
 # Cyanide 1.7.0
 
 **New: Process Viewer.** A live look at everything running on your device — and the ability to end it.
