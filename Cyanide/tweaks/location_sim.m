@@ -11,6 +11,7 @@
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>
 #import <math.h>
+#import <pthread.h>
 #import <stdio.h>
 #import <stdlib.h>
 #import <string.h>
@@ -31,6 +32,104 @@ static const double kLocationSimPi = 3.14159265358979323846;
 static const double kLocationSimMetersPerDegreeLatitude = 111320.0;
 static const double kLocationSimRouteIntervalSeconds = 1.0;
 static const size_t kLocationSimRoutePointCount = 12;
+
+// Review F-11: remote ownership. Objects this file creates with alloc/init
+// (CLSimulationManager, CLLocationSourceInformation, CLLocation) are owned +1
+// by us in the host. They are released only when ownership is CONFIRMED:
+// every RemoteCall of the session so far got its reply (sticky
+// remote_call_current_success) and, for a hand-off, the call that passed the
+// object on completed. After any unknown outcome the object is leaked on
+// purpose — a release racing a call that may still be running, or a double
+// release, would crash the host; a leak only costs memory.
+static bool locationsim_session_clean(void)
+{
+    return remote_call_current_success();
+}
+
+static void locationsim_release_owned(uint64_t obj)
+{
+    if (!r_is_objc_ptr(obj) || !locationsim_session_clean()) return;
+    r_msg2(obj, "release", 0, 0, 0, 0);
+}
+
+// The manager that started a simulation is kept alive deliberately (its
+// deallocation might end the simulation it started), one per host, and
+// released on a confirmed stop or when a new apply replaces it in the SAME
+// process incarnation. The identity is (pid, RemoteCall process generation):
+// after the host died/respawned (or its pid was reused) the stored pointer is
+// forgotten locally and never messaged.
+#define LOCSIM_ACTIVE_MAX 8
+typedef struct {
+    char host[64];
+    int pid;
+    uint64_t gen;
+    uint64_t manager;
+} LocationSimActiveManager;
+static LocationSimActiveManager gLocSimActive[LOCSIM_ACTIVE_MAX];
+static pthread_mutex_t gLocSimActiveLock = PTHREAD_MUTEX_INITIALIZER;
+
+// Removes this host's stored manager from the table. Returns it only when it
+// belongs to the process the current session talks to; otherwise it is
+// dropped without being messaged.
+static uint64_t locationsim_take_active_manager(const char *host)
+{
+    if (!host) return 0;
+    int pid = remote_call_current_pid();
+    uint64_t gen = remote_call_current_process_generation();
+    uint64_t manager = 0;
+    pthread_mutex_lock(&gLocSimActiveLock);
+    for (int i = 0; i < LOCSIM_ACTIVE_MAX; i++) {
+        LocationSimActiveManager *e = &gLocSimActive[i];
+        if (!e->manager || strcmp(e->host, host) != 0) continue;
+        if (pid > 0 && gen && e->pid == pid && e->gen == gen) {
+            manager = e->manager;
+        } else {
+            printf("[LOCSIM] forgetting manager of a previous %s instance (pid %d)\n",
+                   host, e->pid);
+        }
+        memset(e, 0, sizeof(*e));
+    }
+    pthread_mutex_unlock(&gLocSimActiveLock);
+    return manager;
+}
+
+// Returns false when it couldn't be stored (identity unknown / table full):
+// the caller then leaks the manager, which keeps the simulation alive as before.
+static bool locationsim_store_active_manager(const char *host, uint64_t manager)
+{
+    int pid = remote_call_current_pid();
+    uint64_t gen = remote_call_current_process_generation();
+    if (!host || strlen(host) >= sizeof(gLocSimActive[0].host) ||
+        pid <= 0 || !gen || !r_is_objc_ptr(manager)) {
+        return false;
+    }
+    bool stored = false;
+    pthread_mutex_lock(&gLocSimActiveLock);
+    for (int i = 0; i < LOCSIM_ACTIVE_MAX && !stored; i++) {
+        LocationSimActiveManager *e = &gLocSimActive[i];
+        if (e->manager) continue;
+        strlcpy(e->host, host, sizeof(e->host));
+        e->pid = pid;
+        e->gen = gen;
+        e->manager = manager;
+        stored = true;
+    }
+    pthread_mutex_unlock(&gLocSimActiveLock);
+    return stored;
+}
+
+// Releases the manager of an earlier apply in this host incarnation, if any.
+static void locationsim_release_previous_manager(const char *host)
+{
+    uint64_t previous = locationsim_take_active_manager(host);
+    if (!previous) return;
+    if (locationsim_session_clean()) {
+        locationsim_release_owned(previous);
+        printf("[LOCSIM] released previous simulation manager host=%s\n", host);
+    } else {
+        printf("[LOCSIM] session not clean; leaking previous simulation manager host=%s\n", host);
+    }
+}
 
 static NSInteger locationsim_ios_major_version(void)
 {
@@ -345,6 +444,10 @@ static uint64_t locationsim_build_location(double latitude,
             "initWithCoordinate:altitude:horizontalAccuracy:verticalAccuracy:course:courseAccuracy:speed:speedAccuracy:timestamp:sourceInfo:",
             args,
             sizeof(args) / sizeof(args[0]));
+        // Our alloc/init +1 on the source information: the CLLocation retains
+        // what it keeps (the invocation's retainArguments retain is balanced by
+        // its release). Released only if every call so far completed.
+        locationsim_release_owned(sourceInfo);
         if (r_is_objc_ptr(locWithSource)) {
             if (logSourceInfo) {
                 printf("[LOCSIM] built CLLocation with non-simulated sourceInfo\n");
@@ -488,6 +591,9 @@ static size_t locationsim_append_loop_locations(uint64_t manager,
         if (!r_is_objc_ptr(location)) continue;
 
         r_msg2(manager, "appendSimulatedLocation:", location, 0, 0, 0);
+        // The manager retains what it keeps; drop our alloc/init +1 once the
+        // hand-off verifiably completed (otherwise leak: it may still run).
+        if (r_last_call_ok()) locationsim_release_owned(location);
         appended++;
     }
 
@@ -560,6 +666,9 @@ static bool locationsim_apply_to_host(const LocationSimConfig *config,
     uint64_t manager = locationsim_new_manager();
     bool ok = false;
     if (r_is_objc_ptr(manager)) {
+        // Replacement: the previous apply's manager goes first. Whatever its
+        // deallocation does, the stop sequence below does anyway.
+        locationsim_release_previous_manager(host);
         locationsim_stop_manager(manager);
         locationsim_configure_route_manager(manager);
 
@@ -582,6 +691,17 @@ static bool locationsim_apply_to_host(const LocationSimConfig *config,
                    radiusMeters);
         } else {
             printf("[LOCSIM] no loop locations appended host=%s\n", host);
+        }
+
+        if (ok) {
+            // Keep the running simulation's manager alive deliberately.
+            if (!locationsim_session_clean() ||
+                !locationsim_store_active_manager(host, manager)) {
+                printf("[LOCSIM] simulation manager kept alive untracked host=%s\n", host);
+            }
+        } else {
+            // Nothing was started with it: drop our +1 (only if confirmed).
+            locationsim_release_owned(manager);
         }
     }
 
@@ -666,6 +786,10 @@ static bool locationsim_stop_in_host(const char *hostProcess, bool launchHost, i
         locationsim_notify_timezone();
         ok = true;
         printf("[LOCSIM] stopped host=%s\n", host);
+        // Simulation stopped: the apply's manager (same host instance only)
+        // and this temporary one can go — each only if confirmed.
+        locationsim_release_previous_manager(host);
+        locationsim_release_owned(manager);
     }
 
     destroy_remote_call();

@@ -534,7 +534,17 @@ bool darksword_layout_home_scale_in_session(double scale)
     // during the run. Right after the SBCustomizer arrange, the first
     // main-thread hop below waits for SpringBoard to finish its grid relayout
     // and the icon re-render this triggers.
-    rc_set_icon_info_on(cfg, clsInv, &info, /*async=*/true);
+    // Review F-29: the setter's dispatch status decides whether the new size
+    // persists past the next relayout, so it is part of the result. A false
+    // here is never retried: the dispatch may have been sent (reply lost), and
+    // the eager resize below still runs either way.
+    bool cfgOK = rc_set_icon_info_on(cfg, clsInv, &info, /*async=*/true);
+    if (!cfgOK) {
+        printf("[HSSCALE] root layoutConfiguration setIconImageInfo: %s — "
+               "the scale may revert on the next relayout\n",
+               r_last_async_maybe_ran() ? "dispatch outcome unknown (may have run)"
+                                        : "not dispatched");
+    }
 
     enum { LV_CAP = 64, ICON_CAP = 1024 };
     uint64_t lvs[LV_CAP];
@@ -579,9 +589,10 @@ bool darksword_layout_home_scale_in_session(double scale)
 
     printf("[HSSCALE] resized %d of %d resizable icon view(s) on %d page(s)\n",
            resized, resizable, npages);
-    // Success means every resizable icon verifiably resized (0 of 0 is a
-    // no-op, not a failure); a single lost reply fails the step honestly.
-    return resized == resizable;
+    // Success means the configuration setter was dispatched and every
+    // resizable icon verifiably resized (0 of 0 is a no-op, not a failure); a
+    // single lost reply fails the step honestly.
+    return cfgOK && resized == resizable;
 }
 
 bool darksword_layout_dock_scale_in_session(double scale)
@@ -607,7 +618,16 @@ bool darksword_layout_dock_scale_in_session(double scale)
 
     // Set the dock's icon size on its layout config (async), then eagerly resize
     // the live dock icon views so it shows during the run.
-    if (dockCfg) rc_set_icon_info_on(dockCfg, clsInv, &info, /*async=*/true);
+    // Review F-29: as for the home screen, a setter that wasn't (verifiably)
+    // dispatched fails the step; never retried (it may have run).
+    bool cfgOK = dockCfg && rc_set_icon_info_on(dockCfg, clsInv, &info, /*async=*/true);
+    if (!cfgOK) {
+        printf("[DOCKSCALE] dock layoutConfiguration setIconImageInfo: %s — "
+               "the scale may revert on the next relayout\n",
+               !dockCfg ? "no layout configuration"
+               : r_last_async_maybe_ran() ? "dispatch outcome unknown (may have run)"
+                                          : "not dispatched");
+    }
 
     RCResizeCtx ctx;
     rc_resize_ctx_init(&ctx, clsInv, &info);
@@ -629,8 +649,9 @@ bool darksword_layout_dock_scale_in_session(double scale)
     rc_resize_ctx_destroy(&ctx);
     printf("[DOCKSCALE] resized %d of %d resizable dock icon view(s)\n", touched, total);
     // 0 of 0 (e.g. a dock holding only folders) is a no-op, not a failure;
-    // otherwise every resizable icon must have verifiably resized.
-    return touched == total;
+    // otherwise every resizable icon must have verifiably resized. The
+    // configuration setter must have been dispatched either way.
+    return cfgOK && touched == total;
 }
 
 // iOS 26: the (now-immutable) AMUIInfographIconListLayout doesn't have a

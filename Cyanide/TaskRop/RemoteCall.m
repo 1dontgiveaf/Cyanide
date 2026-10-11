@@ -764,6 +764,9 @@ typedef struct RemoteCallState {
     uint64_t pacKeyA;
     uint64_t pacKeyB;
     bool pacKeysCached;
+    // Review F-25: identity of the target process INCARNATION this session
+    // talks to (see remote_call_current_process_generation). 0 = no session.
+    uint64_t processGeneration;
 } RemoteCallState;
 
 static RemoteCallState g_RC_defaultState = { .success = true, .stableExceptionTimeoutFloorMS = 10000 };
@@ -831,6 +834,7 @@ static void *rc_current_owner(void)
 #define g_RC_pacKeyA                 (remote_call_current_state()->pacKeyA)
 #define g_RC_pacKeyB                 (remote_call_current_state()->pacKeyB)
 #define g_RC_pacKeysCached           (remote_call_current_state()->pacKeysCached)
+#define g_RC_processGeneration       (remote_call_current_state()->processGeneration)
 
 // Per-thread status of the last call; cleared on entry to every public call
 // and set only where a return value actually came back from the target.
@@ -3134,6 +3138,7 @@ void abandon_remote_call_internal(void) {
         g_RC_vphoneBridge = false;
         g_RC_success = false;
         g_RC_pid = 0;
+        g_RC_processGeneration = 0;
         g_RC_threadList = [NSMutableArray new];
         excport_teardown_bypass_end("abandon");
         return;
@@ -3192,6 +3197,7 @@ void abandon_remote_call_internal(void) {
     g_RC_trojanThreadAddr = 0;
     g_RC_pacKeysCached = false;
     g_RC_pid = 0;
+    g_RC_processGeneration = 0;
     g_RC_success = false;
     g_RC_creatingExtraThread = false;
     g_RC_vphoneBridge = false;
@@ -3218,6 +3224,7 @@ int destroy_remote_call_internal(void) {
     if (g_RC_vphoneBridge) {
         g_RC_vphoneBridge = false;
         g_RC_pid = 0;
+        g_RC_processGeneration = 0;
         g_RC_success = false;
         g_RC_threadList = [NSMutableArray new];
         excport_teardown_bypass_end("destroy");
@@ -3229,6 +3236,7 @@ int destroy_remote_call_internal(void) {
         (void)reap_dead_port_names("destroy_remote_call");
         rc_livearm_unregister_owner(rc_current_owner());   // round 20
         g_RC_success = false;
+        g_RC_processGeneration = 0;
         g_RC_threadList = [NSMutableArray new];
         excport_teardown_bypass_end("destroy");
         return 0;
@@ -3357,6 +3365,7 @@ int destroy_remote_call_internal(void) {
     g_RC_trojanThreadAddr = 0;
     g_RC_pacKeysCached = false;
     g_RC_pid = 0;
+    g_RC_processGeneration = 0;
     g_RC_success = false;
     g_RC_creatingExtraThread = false;
     g_RC_vphoneBridge = false;
@@ -3970,6 +3979,58 @@ static void *rc_init_watchdog_main(void *arg) {
     return NULL;
 }
 
+// Review F-25: process-incarnation generation. remote_objc caches remote
+// pointers (selectors/classes, retained NSInvocations, a scratch buffer, a
+// ring of retained return values) across sessions to the same process — that
+// reuse is what makes a second tweak apply cheap. Keying them by pid alone
+// assumed a pid is never reused; after a target dies and its pid is reused,
+// those pointers would be messaged inside an unrelated process. Each
+// successful init resolves (pid, kernel task address) to a generation: the
+// same live process keeps its generation across sessions, while a different
+// task behind the same pid (respawn / pid reuse) gets a new, strictly larger
+// one. Caches compare it and drop stale entries locally, never messaging them.
+// (vphone bridge sessions have no task address: pid-only, as before.)
+#define RC_PROCGEN_MAX 32
+static struct { int pid; uint64_t taskAddr; uint64_t gen; } g_rc_procgen[RC_PROCGEN_MAX];
+static int g_rc_procgen_next = 0;
+static uint64_t g_rc_procgen_counter = 0;
+static pthread_mutex_t g_rc_procgen_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t rc_process_generation_for(int pid, uint64_t taskAddr)
+{
+    if (pid <= 0) return 0;
+    uint64_t gen = 0;
+    pthread_mutex_lock(&g_rc_procgen_mutex);
+    int slot = -1;
+    for (int i = 0; i < RC_PROCGEN_MAX; i++) {
+        if (g_rc_procgen[i].gen && g_rc_procgen[i].pid == pid) { slot = i; break; }
+    }
+    if (slot >= 0 && g_rc_procgen[slot].taskAddr == taskAddr) {
+        gen = g_rc_procgen[slot].gen;
+    } else {
+        if (slot < 0) {
+            for (int i = 0; i < RC_PROCGEN_MAX; i++) {
+                if (!g_rc_procgen[i].gen) { slot = i; break; }
+            }
+        }
+        if (slot < 0) {
+            slot = g_rc_procgen_next;
+            g_rc_procgen_next = (g_rc_procgen_next + 1) % RC_PROCGEN_MAX;
+        }
+        gen = ++g_rc_procgen_counter;
+        g_rc_procgen[slot].pid = pid;
+        g_rc_procgen[slot].taskAddr = taskAddr;
+        g_rc_procgen[slot].gen = gen;
+    }
+    pthread_mutex_unlock(&g_rc_procgen_mutex);
+    return gen;
+}
+
+uint64_t remote_call_current_process_generation(void)
+{
+    return g_RC_processGeneration;
+}
+
 int init_remote_call(const char* process, bool useMigFilterBypass) {
     // Wedge latch: a previous init wedged uninterruptibly and was externally
     // aborted by the init watchdog. Its thread may still hold the init mutex,
@@ -4027,9 +4088,11 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         printf("[RemoteCall] INIT WATCHDOG: pthread_create failed — init runs "
                "WITHOUT the external abort net\n");
     }
+    g_RC_processGeneration = 0;
     int rc = init_remote_call_internal(process, useMigFilterBypass);
     atomic_fetch_add_explicit(&g_rc_init_watchdog_gen, 1, memory_order_acq_rel);
     if (rc == 0) {
+        g_RC_processGeneration = rc_process_generation_for(g_RC_pid, g_RC_taskAddr);
         // Round 22: reap dead sessions' leaked sentinel-parked threads
         // (launchd landmines — the initproc-exited/SIGBUS accumulator) BEFORE
         // registering this session's parked threads as live. Cold path only:

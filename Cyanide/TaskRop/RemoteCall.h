@@ -124,6 +124,12 @@ bool remote_call_last_call_ok(void);
 // Running count of temp/stable/stable_addr calls, for timing reports.
 uint64_t remote_call_total_calls(void);
 int remote_call_current_pid(void);
+// Review F-25: identity of the target process incarnation behind the current
+// session (non-zero only while a successfully initialised session is
+// current). Stable across sessions to the same live process; a different
+// process behind a reused pid gets a new, larger value. Use together with the
+// pid to key caches of remote pointers.
+uint64_t remote_call_current_process_generation(void);
 bool remote_call_uses_vphone_bridge(void);
 int remote_call_set_stable_timeout_floor_ms(int timeoutMS);
 RemoteCallInitFailure remote_call_last_init_failure(void);

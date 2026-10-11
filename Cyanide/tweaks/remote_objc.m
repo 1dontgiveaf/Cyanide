@@ -33,6 +33,12 @@ static useconds_t gSettleUS = 50000;
 //                       is nothing left to wait for.
 static int gSettleMode = 0;
 static bool gSettleOwed = false;
+// Review F-25: settle policy (mode/delay), the async settle debt and the
+// counters below are shared by every thread that sends remote messages.
+// gSettleLock makes each read-modify-write atomic (in particular the
+// read-and-clear of the debt, so concurrent callers can't both skip or both
+// lose it). The sleep itself happens outside the lock, as before.
+static pthread_mutex_t gSettleLock = PTHREAD_MUTEX_INITIALIZER;
 
 // Rough accounting so the cost is visible in the log instead of guessed at.
 static uint64_t gRemoteMsgCount = 0;
@@ -61,6 +67,7 @@ static void r_invoke_on_main_wait(uint64_t inv, uint64_t performSel, uint64_t in
 
 typedef struct {
     int pid;
+    uint64_t gen;   // remote_call_current_process_generation() (review F-25)
     char name[R_OBJC_CACHE_NAME_MAX];
     uint64_t value;
 } RemoteObjCCacheEntry;
@@ -77,14 +84,15 @@ static bool r_cacheable_name(const char *name)
     return name && name[0] && strlen(name) < R_OBJC_CACHE_NAME_MAX;
 }
 
-static uint64_t r_cache_lookup(RemoteObjCCacheEntry *cache, int pid, const char *name)
+static uint64_t r_cache_lookup(RemoteObjCCacheEntry *cache, int pid, uint64_t gen, const char *name)
 {
-    if (pid <= 0 || !r_cacheable_name(name)) return 0;
+    if (pid <= 0 || !gen || !r_cacheable_name(name)) return 0;
 
     uint64_t value = 0;
     pthread_mutex_lock(&gObjCCacheLock);
     for (int i = 0; i < R_OBJC_CACHE_CAP; i++) {
-        if (cache[i].pid == pid && cache[i].value && strcmp(cache[i].name, name) == 0) {
+        if (cache[i].pid == pid && cache[i].gen == gen && cache[i].value &&
+            strcmp(cache[i].name, name) == 0) {
             value = cache[i].value;
             break;
         }
@@ -93,13 +101,13 @@ static uint64_t r_cache_lookup(RemoteObjCCacheEntry *cache, int pid, const char 
     return value;
 }
 
-static void r_cache_store(RemoteObjCCacheEntry *cache, int *nextSlot, int pid, const char *name, uint64_t value)
+static void r_cache_store(RemoteObjCCacheEntry *cache, int *nextSlot, int pid, uint64_t gen, const char *name, uint64_t value)
 {
-    if (pid <= 0 || !value || !r_cacheable_name(name)) return;
+    if (pid <= 0 || !gen || !value || !r_cacheable_name(name)) return;
 
     pthread_mutex_lock(&gObjCCacheLock);
     for (int i = 0; i < R_OBJC_CACHE_CAP; i++) {
-        if (cache[i].pid == pid && strcmp(cache[i].name, name) == 0) {
+        if (cache[i].pid == pid && cache[i].gen == gen && strcmp(cache[i].name, name) == 0) {
             cache[i].value = value;
             pthread_mutex_unlock(&gObjCCacheLock);
             return;
@@ -108,7 +116,9 @@ static void r_cache_store(RemoteObjCCacheEntry *cache, int *nextSlot, int pid, c
 
     int slot = -1;
     for (int i = 0; i < R_OBJC_CACHE_CAP; i++) {
-        if (cache[i].pid == 0 || cache[i].value == 0) {
+        // An entry of an older incarnation of this pid is dead: reuse it.
+        if (cache[i].pid == 0 || cache[i].value == 0 ||
+            (cache[i].pid == pid && cache[i].gen != gen)) {
             slot = i;
             break;
         }
@@ -119,6 +129,7 @@ static void r_cache_store(RemoteObjCCacheEntry *cache, int *nextSlot, int pid, c
     }
 
     cache[slot].pid = pid;
+    cache[slot].gen = gen;
     strncpy(cache[slot].name, name, sizeof(cache[slot].name) - 1);
     cache[slot].name[sizeof(cache[slot].name) - 1] = '\0';
     cache[slot].value = value;
@@ -127,22 +138,38 @@ static void r_cache_store(RemoteObjCCacheEntry *cache, int *nextSlot, int pid, c
 
 static void r_settle(void)
 {
+    useconds_t sleepUS = 0;
+    bool report = false;
+    uint64_t msgs = 0, settles = 0, slept = 0;
+    pthread_mutex_lock(&gSettleLock);
     gRemoteMsgCount++;
+    msgs = gRemoteMsgCount;
+    // Async-only: pay the debt left by a fire-and-forget dispatch, nothing else.
+    bool skip = false;
     if (gSettleMode == 2) {
-        // Async-only: pay the debt left by a fire-and-forget dispatch, nothing else.
-        if (!gSettleOwed) return;
-        gSettleOwed = false;
+        if (!gSettleOwed) skip = true;
+        else gSettleOwed = false;
     }
-    if (gSettleUS) {
-        gSettleCount++;
-        gSettleSleptUS += gSettleUS;
-        usleep(gSettleUS);
+    if (!skip) {
+        if (gSettleUS) {
+            sleepUS = gSettleUS;
+            gSettleCount++;
+            gSettleSleptUS += gSettleUS;
+        }
+        // Periodic cost report — a tweak that feels slow can be checked
+        // against this instead of guessed at.
+        if ((gRemoteMsgCount % 250) == 0) {
+            report = true;
+            settles = gSettleCount;
+            slept = gSettleSleptUS;
+        }
     }
-    // Periodic cost report — a tweak that feels slow can be checked against
-    // this instead of guessed at.
-    if ((gRemoteMsgCount % 250) == 0) {
+    pthread_mutex_unlock(&gSettleLock);
+
+    if (sleepUS) usleep(sleepUS);
+    if (report) {
         printf("[R_OBJC] %llu remote messages, %llu settles, %llu ms slept in settles\n",
-               gRemoteMsgCount, gSettleCount, gSettleSleptUS / 1000);
+               msgs, settles, slept / 1000);
     }
 }
 
@@ -150,7 +177,9 @@ static void r_settle(void)
 // there is nothing for SpringBoard to settle after. Count them, never sleep.
 static void r_settle_query(void)
 {
+    pthread_mutex_lock(&gSettleLock);
     gRemoteMsgCount++;
+    pthread_mutex_unlock(&gSettleLock);
 }
 
 // Deliberately conservative allowlist of selectors that only read state.
@@ -201,29 +230,46 @@ static void r_settle_for(const char *selName)
 
 void r_perf_report(const char *label)
 {
+    pthread_mutex_lock(&gSettleLock);
+    uint64_t msgs = gRemoteMsgCount, settles = gSettleCount, slept = gSettleSleptUS;
+    pthread_mutex_unlock(&gSettleLock);
     printf("[R_OBJC] %s: %llu remote messages, %llu settles, %llu ms slept\n",
-           label ?: "totals", gRemoteMsgCount, gSettleCount, gSettleSleptUS / 1000);
+           label ?: "totals", msgs, settles, slept / 1000);
 }
 
 void r_settle_set_mode(int mode)
 {
     if (mode < 0 || mode > 2) mode = 0;
+    pthread_mutex_lock(&gSettleLock);
     gSettleMode = mode;
     gSettleUS = (mode == 1) ? 5000 : 50000;
     gSettleOwed = false;
+    useconds_t us = gSettleUS;
+    pthread_mutex_unlock(&gSettleLock);
     printf("[R_OBJC] settle mode=%d (%s), settle=%u us\n", mode,
            mode == 0 ? "compatible" : mode == 1 ? "fast" : "async-only",
-           (unsigned)gSettleUS);
+           (unsigned)us);
 }
 
 int r_settle_get_mode(void)
 {
-    return gSettleMode;
+    pthread_mutex_lock(&gSettleLock);
+    int mode = gSettleMode;
+    pthread_mutex_unlock(&gSettleLock);
+    return mode;
+}
+
+// Records the settle debt of a successful fire-and-forget dispatch.
+static void r_settle_owe(void)
+{
+    pthread_mutex_lock(&gSettleLock);
+    gSettleOwed = true;
+    pthread_mutex_unlock(&gSettleLock);
 }
 
 uint64_t r_perf_round_trips(void)
 {
-    return gRoundTripCount;
+    return __atomic_load_n(&gRoundTripCount, __ATOMIC_RELAXED);
 }
 
 void r_perf_snapshot(RPerfSnapshot *out)
@@ -232,14 +278,18 @@ void r_perf_snapshot(RPerfSnapshot *out)
     out->rcCalls = remote_call_total_calls();
     out->mainCalls = __atomic_load_n(&gMainCallCount, __ATOMIC_RELAXED);
     out->mainWaitUS = __atomic_load_n(&gMainWaitUS, __ATOMIC_RELAXED);
+    pthread_mutex_lock(&gSettleLock);
     out->settleSleptUS = gSettleSleptUS;
+    pthread_mutex_unlock(&gSettleLock);
 }
 
 void r_perf_reset(void)
 {
+    pthread_mutex_lock(&gSettleLock);
     gRemoteMsgCount = 0;
     gSettleCount = 0;
     gSettleSleptUS = 0;
+    pthread_mutex_unlock(&gSettleLock);
 }
 
 // Per-thread call status (see r_last_call_ok / r_last_main_ok).
@@ -260,7 +310,7 @@ static uint64_t r_call_stable(int timeout, const char *fnName,
                               uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
 {
     pthread_mutex_lock(&gRemoteCallLock);
-    gRoundTripCount++;
+    __atomic_fetch_add(&gRoundTripCount, 1, __ATOMIC_RELAXED);
     uint64_t ret = do_remote_call_stable(timeout, fnName,
                                          a0, a1, a2, a3,
                                          a4, a5, a6, a7);
@@ -271,8 +321,10 @@ static uint64_t r_call_stable(int timeout, const char *fnName,
 
 uint32_t r_settle_us(uint32_t usec)
 {
+    pthread_mutex_lock(&gSettleLock);
     uint32_t old = (uint32_t)gSettleUS;
     gSettleUS = (useconds_t)usec;
+    pthread_mutex_unlock(&gSettleLock);
     return old;
 }
 
@@ -306,28 +358,30 @@ void r_free(uint64_t ptr)
 uint64_t r_sel(const char *name)
 {
     int pid = remote_call_current_pid();
-    uint64_t cached = r_cache_lookup(gSelCache, pid, name);
+    uint64_t gen = remote_call_current_process_generation();
+    uint64_t cached = r_cache_lookup(gSelCache, pid, gen, name);
     if (cached) return cached;
 
     uint64_t s = r_alloc_str(name);
     if (!s) return 0;
     uint64_t sel = r_call_stable(R_TIMEOUT, "sel_registerName", s, 0, 0, 0, 0, 0, 0, 0);
     r_free(s);
-    r_cache_store(gSelCache, &gSelCacheNext, pid, name, sel);
+    r_cache_store(gSelCache, &gSelCacheNext, pid, gen, name, sel);
     return sel;
 }
 
 uint64_t r_class(const char *name)
 {
     int pid = remote_call_current_pid();
-    uint64_t cached = r_cache_lookup(gClassCache, pid, name);
+    uint64_t gen = remote_call_current_process_generation();
+    uint64_t cached = r_cache_lookup(gClassCache, pid, gen, name);
     if (cached) return cached;
 
     uint64_t s = r_alloc_str(name);
     if (!s) return 0;
     uint64_t c = r_call_stable(R_TIMEOUT, "objc_getClass", s, 0, 0, 0, 0, 0, 0, 0);
     r_free(s);
-    r_cache_store(gClassCache, &gClassCacheNext, pid, name, c);
+    r_cache_store(gClassCache, &gClassCacheNext, pid, gen, name, c);
     return c;
 }
 
@@ -478,6 +532,11 @@ static bool r_write_remote_arg(uint64_t remoteBuf, const void *arg, size_t argSi
 // (respring) has a new pid, so its entries never match. Anything unusual --
 // an argument larger than a slot, a return value larger than the return
 // slot, a failed build -- falls back to the slow path.
+//
+// Review F-25: "a new pid" is not enough — a pid can be reused by an
+// unrelated process. Every entry, the scratch buffer and the keep ring are
+// also tagged with remote_call_current_process_generation(); entries of an
+// older incarnation of the same pid are dropped locally and never messaged.
 #define R_INV_CACHE_CAP 128
 #define R_INV_ARG_SLOT  64
 #define R_INV_RET_SLOT  64
@@ -486,6 +545,7 @@ static bool r_write_remote_arg(uint64_t remoteBuf, const void *arg, size_t argSi
 
 typedef struct {
     int pid;
+    uint64_t gen;
     uint64_t cls;
     uint64_t sel;
     uint64_t inv;        // retained; 0 = this (class, selector) uses the slow path
@@ -499,8 +559,10 @@ static pthread_mutex_t gInvLock = PTHREAD_MUTEX_INITIALIZER;
 static RemoteInvocationEntry gInvCache[R_INV_CACHE_CAP];
 static uint64_t gInvClock = 0;
 static int gInvScratchPid = 0;
+static uint64_t gInvScratchGen = 0;
 static uint64_t gInvScratch = 0;   // 4 argument slots, then the return slot
 static int gInvKeepPid = 0;
+static uint64_t gInvKeepGen = 0;
 static uint64_t gInvKeep[R_INV_KEEP_CAP];
 static int gInvKeepNext = 0;
 
@@ -513,12 +575,13 @@ static void r_release_on_main_async(uint64_t obj)
           r_sel("release"), 0, 0, 0);
 }
 
-static void r_inv_keep(int pid, uint64_t obj)
+static void r_inv_keep(int pid, uint64_t gen, uint64_t obj)
 {
-    if (gInvKeepPid != pid) {   // new process: the old entries died with it
+    if (gInvKeepPid != pid || gInvKeepGen != gen) {   // new process: the old entries died with it
         memset(gInvKeep, 0, sizeof(gInvKeep));
         gInvKeepNext = 0;
         gInvKeepPid = pid;
+        gInvKeepGen = gen;
     }
     r_msg(obj, r_sel("retain"), 0, 0, 0, 0);
     uint64_t old = gInvKeep[gInvKeepNext];
@@ -527,12 +590,12 @@ static void r_inv_keep(int pid, uint64_t obj)
     r_release_on_main_async(old);
 }
 
-static RemoteInvocationEntry *r_inv_entry(int pid, uint64_t obj, uint64_t cls, uint64_t sel)
+static RemoteInvocationEntry *r_inv_entry(int pid, uint64_t gen, uint64_t obj, uint64_t cls, uint64_t sel)
 {
     RemoteInvocationEntry *victim = &gInvCache[0];
     for (int i = 0; i < R_INV_CACHE_CAP; i++) {
         RemoteInvocationEntry *e = &gInvCache[i];
-        if (e->pid == pid && e->cls == cls && e->sel == sel) {
+        if (e->pid == pid && e->gen == gen && e->cls == cls && e->sel == sel) {
             e->lastUse = ++gInvClock;
             return e;
         }
@@ -540,7 +603,7 @@ static RemoteInvocationEntry *r_inv_entry(int pid, uint64_t obj, uint64_t cls, u
         if (e->lastUse < victim->lastUse) victim = e;
     }
     // Evict (an invocation from a dead process is just dropped).
-    if (victim->pid == pid && victim->inv) r_release_on_main_async(victim->inv);
+    if (victim->pid == pid && victim->gen == gen && victim->inv) r_release_on_main_async(victim->inv);
     memset(victim, 0, sizeof(*victim));
 
     uint64_t inv = 0, numUserArgs = 0, retLen = 0;
@@ -593,6 +656,7 @@ static RemoteInvocationEntry *r_inv_entry(int pid, uint64_t obj, uint64_t cls, u
     }
 
     victim->pid = pid;
+    victim->gen = gen;
     victim->cls = cls;
     victim->sel = sel;
     victim->inv = inv;
@@ -617,20 +681,29 @@ static RCachedResult r_msg_main_cached(uint64_t obj, uint64_t sel,
                                        uint64_t *retOut)
 {
     int pid = remote_call_current_pid();
-    if (pid <= 0) return R_CACHED_NOT_DISPATCHED;
+    uint64_t gen = remote_call_current_process_generation();
+    if (pid <= 0 || !gen) return R_CACHED_NOT_DISPATCHED;
     for (int i = 0; i < 4; i++) if (sizes[i] > R_INV_ARG_SLOT) return R_CACHED_NOT_DISPATCHED;
 
     pthread_mutex_lock(&gInvLock);
+    // Entries of an older incarnation of this pid point into a dead process
+    // (or, after pid reuse, into an unrelated one): forget them locally.
+    for (int i = 0; i < R_INV_CACHE_CAP; i++) {
+        if (gInvCache[i].pid == pid && gInvCache[i].gen != gen) {
+            memset(&gInvCache[i], 0, sizeof(gInvCache[i]));
+        }
+    }
     RCachedResult result = R_CACHED_NOT_DISPATCHED;
     do {
-        if (gInvScratchPid != pid || !gInvScratch) {
+        if (gInvScratchPid != pid || gInvScratchGen != gen || !gInvScratch) {
             gInvScratch = r_call_stable(R_TIMEOUT, "calloc", 1, R_INV_SCRATCH, 0, 0, 0, 0, 0, 0);
             gInvScratchPid = gInvScratch ? pid : 0;
+            gInvScratchGen = gInvScratch ? gen : 0;
             if (!gInvScratch) break;
         }
         uint64_t cls = r_call_stable(R_TIMEOUT, "object_getClass", obj, 0, 0, 0, 0, 0, 0, 0);
         if (!r_is_objc_ptr(cls)) break;
-        RemoteInvocationEntry *e = r_inv_entry(pid, obj, cls, sel);
+        RemoteInvocationEntry *e = r_inv_entry(pid, gen, obj, cls, sel);
         if (!e->inv) break;
 
         if (e->numUserArgs) {
@@ -679,7 +752,7 @@ static RCachedResult r_msg_main_cached(uint64_t obj, uint64_t sel,
             // The invocation already holds it (retainArguments); this keeps it
             // alive past the next call on the same invocation, as the slow
             // path's leaked invocations did.
-            if (e->retIsObject && ret) r_inv_keep(pid, ret);
+            if (e->retIsObject && ret) r_inv_keep(pid, gen, ret);
         }
         *retOut = ret;
         result = R_CACHED_OK;
@@ -904,7 +977,7 @@ static bool r_msg2_main_async_args(uint64_t obj, const char *selName,
 
     // Fire-and-forget: the main thread may still be running this when we
     // return, so the next remote interaction owes a settle.
-    if (ok) gSettleOwed = true;
+    if (ok) r_settle_owe();
     return ok;
 }
 
