@@ -245,7 +245,24 @@ FBSaveResult filebrowser_save(NSString *path, NSData *data, FBFileIdentity expec
         if (message) *message = @"The new file is too large for a durable recovery preimage.";
         return FBSaveFailed;
     }
-    int fd = open(path.fileSystemRepresentation, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+    // Classify BEFORE opening (opening a device node can itself have side
+    // effects), like fb_open_regular_classified.  Symlinks are followed on
+    // purpose: editing a file through a symlink is supported (see
+    // fb_identity_path), so no O_NOFOLLOW.  O_NONBLOCK keeps a FIFO swapped
+    // in meanwhile from blocking the open; fstat then checks the object
+    // actually opened against the pre-stat identity.
+    const char *fsPath = path.fileSystemRepresentation;
+    struct stat pre;
+    if (!fsPath || stat(fsPath, &pre) != 0) {
+        int serr = fsPath ? errno : EINVAL;
+        if (message) *message = [NSString stringWithFormat:@"The file can't be opened for writing: %s.", strerror(serr)];
+        return FBSaveFailed;
+    }
+    if (!S_ISREG(pre.st_mode)) {
+        if (message) *message = @"Not a regular file.";
+        return FBSaveFailed;
+    }
+    int fd = open(fsPath, O_RDWR | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0) {
         if (message) *message = [NSString stringWithFormat:@"The file can't be opened for writing: %s.", strerror(errno)];
         return FBSaveFailed;
@@ -256,7 +273,18 @@ FBSaveResult filebrowser_save(NSString *path, NSData *data, FBFileIdentity expec
         if (message) *message = @"Not a regular file.";
         return FBSaveFailed;
     }
-    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
+    if (st.st_dev != pre.st_dev || st.st_ino != pre.st_ino) {
+        close(fd);
+        if (message) *message = @"The file was replaced while it was being opened. Nothing was changed; reload and try again.";
+        return FBSaveFailed;
+    }
+    int oflags = fcntl(fd, F_GETFL);
+    if (oflags < 0 || fcntl(fd, F_SETFL, oflags & ~O_NONBLOCK) < 0) {
+        int ferr = errno;
+        close(fd);
+        if (message) *message = [NSString stringWithFormat:@"The file can't be opened for writing: %s.", strerror(ferr)];
+        return FBSaveFailed;
+    }
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
         int lockError = errno;
         close(fd);
@@ -324,17 +352,34 @@ FBSaveResult filebrowser_save(NSString *path, NSData *data, FBFileIdentity expec
                 [NSFileManager.defaultManager removeItemAtPath:backupPath error:nil];
             } else if (fb_pwrite_all(fd, data)) {
                 FBFileIdentity afterWrite = filebrowser_identity_fd(fd);
+                FBFileIdentity visibleAfter = fb_identity_path(path);
                 BOOL postTooBig = NO;
                 int postError = 0;
                 NSData *postData = filebrowser_read_fd(fd, kFBMaxBackupBytes, &postTooBig, &postError);
-                BOOL postcondition = fb_same_object(afterWrite, fb_identity_path(path)) &&
+                BOOL postcondition = fb_same_object(afterWrite, visibleAfter) &&
                                      !postTooBig && postData && [postData isEqualToData:data];
+                // Positive evidence that another writer won: the path now
+                // names a different object, or our descriptor reads back
+                // contents that are not ours.  A failed fstat/stat/read is
+                // NOT evidence of anything -- the disk state is unknown.
+                BOOL replaced = !postcondition &&
+                                ((afterWrite.valid && visibleAfter.valid && !fb_same_object(afterWrite, visibleAfter)) ||
+                                 postTooBig || (postData && ![postData isEqualToData:data]));
                 filebrowser_note_filesystem_changed();
                 if (postcondition) {
                     [NSFileManager.defaultManager removeItemAtPath:backup error:nil];
                     [NSFileManager.defaultManager removeItemAtPath:backupPath error:nil];
                     if (newIdentity) *newIdentity = afterWrite;
                     result = FBSaveOK;
+                } else if (!replaced) {
+                    // The write itself succeeded, but the result could not be
+                    // checked. Keep the backup (and its sidecar): it is the
+                    // only copy of the previous contents if the file is now
+                    // new, partial or unknown.
+                    result = FBSaveUncertain;
+                    msg = [NSString stringWithFormat:@"Your edit was written, but the result couldn't be verified (%s). "
+                                                     @"Reload the file to check it. A backup of its previous contents was kept at:\n%@",
+                                                     postError ? strerror(postError) : "the file could not be re-checked", backup];
                 } else {
                     // Someone else wrote to (or replaced) the file during our
                     // write. Writing our old contents back would overwrite
@@ -536,7 +581,10 @@ static BOOL fb_import_add_item(NSUInteger *items, NSString **failure)
 static BOOL fb_import_copy_regular(NSString *source, NSString *target, const struct stat *sourceStat,
                                    unsigned long long *totalBytes, NSString **failure)
 {
-    int in = open(source.fileSystemRepresentation, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    // The source was classified with lstat as a regular file (symlinks are
+    // copied as links, never followed), so open it no-follow: a symlink
+    // swapped in since then fails here instead of importing its target.
+    int in = open(source.fileSystemRepresentation, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
     if (in < 0) {
         if (failure) *failure = [NSString stringWithFormat:@"Couldn't open %@: %s", source.lastPathComponent, strerror(errno)];
         return NO;
@@ -545,6 +593,13 @@ static BOOL fb_import_copy_regular(NSString *source, NSString *target, const str
     if (fstat(in, &opened) != 0 || !S_ISREG(opened.st_mode)) {
         close(in);
         if (failure) *failure = [NSString stringWithFormat:@"%@ is no longer a regular file.", source.lastPathComponent];
+        return NO;
+    }
+    // Must still be the object that was inspected, not a different regular
+    // file renamed into place meanwhile.
+    if (opened.st_dev != sourceStat->st_dev || opened.st_ino != sourceStat->st_ino) {
+        close(in);
+        if (failure) *failure = [NSString stringWithFormat:@"%@ was replaced while it was being imported.", source.lastPathComponent];
         return NO;
     }
     int out = open(target.fileSystemRepresentation, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
@@ -1116,6 +1171,13 @@ static const NSUInteger kFBMaxHexBytes = 64 * 1024;
                 fb_alert(self, @"Not Saved", message ?: @"The file could not be written.");
                 return;
             }
+            if (r == FBSaveUncertain) {
+                // Written but unverified: keep the edit open and the old
+                // identity, so a later plain save reports a conflict instead
+                // of silently trusting an unknown file.
+                fb_alert(self, @"Save Not Verified", message ?: @"The file was written, but the result couldn't be verified.");
+                return;
+            }
             self.identity = newIdent;
             self.data = out;
             self.entry.size = (off_t)out.length;
@@ -1618,7 +1680,18 @@ static const NSUInteger kFBMaxShareBytes = 64 * 1024 * 1024;
 - (void)performForEntry:(FBEntry *)entry operation:(BOOL (^)(NSError **err))op
            failureTitle:(NSString *)title
 {
+    // An entry readable only through launchd root is view-only, even in a
+    // folder mobile can list: root access is read-only.
+    if (entry.viaRoot) {
+        fb_alert(self, title, @"This item is only readable as root, and root access is read-only.");
+        return;
+    }
     [self perform:^BOOL(NSError **err) {
+        if (entry.viaRoot) {   // re-checked in the worker
+            if (err) *err = [NSError errorWithDomain:NSPOSIXErrorDomain code:EPERM
+                                   userInfo:@{ NSLocalizedDescriptionKey: @"This item is only readable as root, and root access is read-only." }];
+            return NO;
+        }
         if (!fb_entry_still_matches(entry, err)) return NO;
         return op(err);
     } failureTitle:title];
@@ -2107,6 +2180,7 @@ static const NSUInteger kFBMaxShareBytes = 64 * 1024 * 1024;
 {
     if (!filebrowser_write_enabled() || self.loadedViaRoot || !self.shown.count) return nil;
     FBEntry *e = self.shown[indexPath.row];
+    if (e.viaRoot) return nil;   // root-only item: view-only
     UIContextualAction *del = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive
                                                                       title:@"Delete"
                                                                     handler:^(UIContextualAction *a, UIView *v, void (^done)(BOOL)) {
@@ -2148,7 +2222,7 @@ static const NSUInteger kFBMaxShareBytes = 64 * 1024 * 1024;
         }];
         NSMutableArray<UIMenuElement *> *items = [NSMutableArray arrayWithObject:copy];
         if (!e.isDirectory) [items addObject:info];
-        if (filebrowser_write_enabled() && !self.loadedViaRoot) {
+        if (filebrowser_write_enabled() && !self.loadedViaRoot && !e.viaRoot) {
             UIAction *ren = [UIAction actionWithTitle:@"Rename" image:[UIImage systemImageNamed:@"pencil"]
                                            identifier:nil handler:^(UIAction *a) { [self promptRename:e]; }];
             UIAction *dup = [UIAction actionWithTitle:@"Duplicate" image:[UIImage systemImageNamed:@"plus.square.on.square"]

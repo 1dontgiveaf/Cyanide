@@ -35,7 +35,10 @@ NSData *filebrowser_read_fd(int fd, NSUInteger maxBytes, BOOL *truncated, int *e
 // Conflict-checked save over the file opened as `expected` with contents
 // `loaded`; backs up the current contents first and restores them if the
 // write fails. Runs file I/O: call off the main thread.
-typedef NS_ENUM(NSInteger, FBSaveResult) { FBSaveOK, FBSaveConflict, FBSaveFailed };
+// FBSaveUncertain: the new bytes were written but the result could not be
+// verified (post-write read/stat failed); the backup is kept and `message`
+// names it. Do not treat it as saved, and do not offer a blind overwrite.
+typedef NS_ENUM(NSInteger, FBSaveResult) { FBSaveOK, FBSaveConflict, FBSaveFailed, FBSaveUncertain };
 FBSaveResult filebrowser_save(NSString *path, NSData *data, FBFileIdentity expected, NSData *loaded,
                               BOOL force, FBFileIdentity *newIdentity, NSString **message);
 

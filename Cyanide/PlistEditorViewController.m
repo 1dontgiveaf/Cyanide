@@ -572,6 +572,13 @@ static const NSUInteger kPLMaxDataEditBytes = 64 * 1024;
                 [self presentViewController:ac animated:YES completion:nil];
                 return;
             }
+            if (r == FBSaveUncertain) {
+                // Written but unverified: keep the document dirty with its old
+                // identity, so a later plain save reports a conflict.
+                [self showMessage:msg ?: @"The file was written, but the result couldn't be verified."
+                            title:@"Save Not Verified"];
+                return;
+            }
             [self showMessage:msg ?: @"The file could not be written." title:@"Not Saved"];
         });
     });
