@@ -15350,7 +15350,9 @@ didFinishPicking:(NSArray<PHPickerResult *> *)results
             if (png.length == 0) {
                 UIAlertController *ac = [UIAlertController
                     alertControllerWithTitle:@"Import Failed"
-                                     message:(error.localizedDescription ?: @"The selected photo could not be read.")
+                                     message:(error.localizedDescription ?:
+                                              (image ? @"The selected photo is too wide or too large for keypad art. Crop it closer to the digit and try again."
+                                                     : @"The selected photo could not be read."))
                               preferredStyle:UIAlertControllerStyleAlert];
                 [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
                 [strongSelf presentViewController:ac animated:YES completion:nil];

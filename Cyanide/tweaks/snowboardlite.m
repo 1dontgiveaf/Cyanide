@@ -9,6 +9,7 @@
 #import "../LogTextView.h"
 #import "../SettingsViewController.h"
 #import "../map_app.h"
+#import "../SBLArchiveExtractor.h"
 
 NSString * const kSnowBoardLiteThemeBuiltinIOS6 = @"builtin-ios6";
 
@@ -330,7 +331,10 @@ BOOL settings_sbl_import_folder_theme_named(NSURL *url,
     NSUInteger aliasMapped = 0;
     NSUInteger duplicates = 0;
     NSUInteger skipped = 0;
+    uint64_t importedBytes = 0;
+    NSString *budgetFailure = nil;
     for (NSURL *iconDirURL in iconDirs) {
+        if (budgetFailure) break;
         NSArray<NSURL *> *files = [fm contentsOfDirectoryAtURL:iconDirURL
                                     includingPropertiesForKeys:nil
                                                        options:0
@@ -338,6 +342,22 @@ BOOL settings_sbl_import_folder_theme_named(NSURL *url,
         for (NSURL *fileURL in files) {
             if (![fileURL.pathExtension.lowercaseString isEqualToString:@"png"]) continue;
             discovered++;
+            // Same count/byte/pixel budget an archive import gets: past the
+            // count or aggregate cap the whole import fails; a single oversized
+            // or non-regular file is skipped like an unmapped one.
+            if (discovered > SBLMaxImportFileCount) {
+                budgetFailure = @"This theme has too many icons to import.";
+                break;
+            }
+            uint64_t fileBytes = 0;
+            if (!SBLImageFilePassesPreflight(fileURL.path, SBLMaxImageFileBytes, &fileBytes)) {
+                skipped++;
+                if (skippedSamples.count < 8) {
+                    [skippedSamples addObject:[NSString stringWithFormat:@"%@ (too large or unreadable)",
+                                               fileURL.lastPathComponent ?: @"unknown.png"]];
+                }
+                continue;
+            }
             BOOL usedAlias = NO;
             NSArray<NSString *> *bundleIDs = CNDMappedIOSBundleIDsForIconName(fileURL.lastPathComponent,
                                                                               &usedAlias);
@@ -363,9 +383,14 @@ BOOL settings_sbl_import_folder_theme_named(NSURL *url,
                     }
                     continue;
                 }
+                if (importedBytes + fileBytes > SBLMaxImportTotalBytes) {
+                    budgetFailure = @"This theme's icons are larger than 256 MB in total.";
+                    break;
+                }
                 NSString *dstName = [bundleID stringByAppendingPathExtension:@"png"];
                 NSString *dst = [iconsDir stringByAppendingPathComponent:dstName];
                 if ([fm copyItemAtURL:fileURL toURL:[NSURL fileURLWithPath:dst] error:nil]) {
+                    importedBytes += fileBytes;
                     [seen addObject:bundleID];
                     copiedAny = YES;
                     imported++;
@@ -378,8 +403,19 @@ BOOL settings_sbl_import_folder_theme_named(NSURL *url,
                     }
                 }
             }
+            if (budgetFailure) break;
             if (!copiedAny && fileTargets.count == 0) skipped++;
         }
+    }
+
+    if (budgetFailure) {
+        [fm removeItemAtPath:themeDir error:nil];
+        if (error) {
+            *error = [NSError errorWithDomain:@"SnowBoardLite"
+                                         code:3
+                                     userInfo:@{NSLocalizedDescriptionKey: budgetFailure}];
+        }
+        return NO;
     }
 
     if (imported == 0) {
@@ -412,7 +448,18 @@ BOOL settings_sbl_import_folder_theme_named(NSURL *url,
     };
     NSMutableArray *manifest = [settings_sbl_load_manifest() mutableCopy];
     [manifest insertObject:record atIndex:0];
-    if (!settings_sbl_save_manifest(manifest)) return NO;
+    if (!settings_sbl_save_manifest(manifest)) {
+        // The manifest is written atomically, so the previous one (and the
+        // selection, untouched so far) still stands; drop only this import's
+        // directory so it is not left on disk untracked.
+        [fm removeItemAtPath:themeDir error:nil];
+        if (error) {
+            *error = [NSError errorWithDomain:@"SnowBoardLite"
+                                         code:4
+                                     userInfo:@{NSLocalizedDescriptionKey: @"The theme list could not be saved, so the theme was not imported."}];
+        }
+        return NO;
+    }
 
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
     [d setObject:themeID forKey:kSettingsSnowBoardLiteSelectedThemeID];

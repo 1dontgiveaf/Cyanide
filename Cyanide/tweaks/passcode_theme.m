@@ -16,6 +16,7 @@
 #import "passcode_theme.h"
 
 #import "../LogTextView.h"
+#import "../SBLArchiveExtractor.h"
 #import "../kexploit/kexploit_opa334.h"
 #import "../kexploit/persistence.h"
 #import "../kexploit/vnode.h"
@@ -802,6 +803,7 @@ NSUInteger settings_passcode_import_backup_items(NSArray<NSURL *> *items,
     NSUInteger failed = 0;
     NSUInteger unusable = 0;
     unsigned long long bytes = 0;
+    NSUInteger considered = 0;
     for (NSURL *src in sources) {
         NSString *name = src.lastPathComponent;
         if (name.length == 0) continue;
@@ -818,6 +820,26 @@ NSUInteger settings_passcode_import_backup_items(NSArray<NSURL *> *items,
             continue;
         }
         [fm removeItemAtPath:dst error:nil];   // clear a zero-byte leftover
+
+        // Preflight before anything is copied: only a regular, non-empty file
+        // within the keypad-art cap, and only while the whole import stays
+        // inside the shared count/byte budget. A directory or oversized file
+        // named *.orig would otherwise be copied into Application Support first.
+        struct stat srcStat = {0};
+        if (lstat(src.path.fileSystemRepresentation, &srcStat) != 0 || !S_ISREG(srcStat.st_mode) ||
+            srcStat.st_size <= 0 || (unsigned long long)srcStat.st_size > kPTMaxDigitBytes) {
+            log_user("[PASSCODE] Skipping %s: not a regular file of at most %lu bytes.\n",
+                     name.UTF8String, (unsigned long)kPTMaxDigitBytes);
+            failed++;
+            continue;
+        }
+        if (++considered > SBLMaxImportFileCount ||
+            bytes + (unsigned long long)srcStat.st_size > SBLMaxImportTotalBytes) {
+            log_user("[PASSCODE] Skipping %s: the import exceeds its file count or size budget.\n",
+                     name.UTF8String);
+            failed++;
+            continue;
+        }
 
         // Copy to a sidecar first and move it into place only after the size is
         // verified: a copy that dies halfway would otherwise leave a partial
@@ -840,6 +862,7 @@ NSUInteger settings_passcode_import_backup_items(NSArray<NSURL *> *items,
         BOOL sizeMatches = (stat(src.path.UTF8String, &sourceStat) == 0) &&
                            (stat(partial.UTF8String, &partialStat) == 0) &&
                            sourceStat.st_size > 0 &&
+                           (unsigned long long)sourceStat.st_size <= kPTMaxDigitBytes &&
                            partialStat.st_size == sourceStat.st_size;
         if (!sizeMatches) {
             log_user("[PASSCODE] Import of %s did not verify; discarded.\n", name.UTF8String);
@@ -1678,7 +1701,9 @@ static BOOL pt_png_is_renderable(NSData *data)
 // original bytes, but only once it has been proven renderable.
 static NSData *pt_normalized_png_data(NSData *data)
 {
-    if (data.length < 8) return nil;
+    if (data.length < 8 || data.length > kPTMaxDigitBytes) return nil;
+    // Header-only dimension check: a small file can still claim a huge canvas.
+    if (!SBLImageDataPassesPixelPreflight(data)) return nil;
 
     static const uint8_t pngMagic[8] = { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
     if (memcmp(data.bytes, pngMagic, sizeof(pngMagic)) == 0) {
@@ -1689,12 +1714,25 @@ static NSData *pt_normalized_png_data(NSData *data)
     return image ? UIImagePNGRepresentation(image) : nil;
 }
 
+// Library digit art, read only when it is a regular file within the cap: the
+// preview and the applier load these on every build.
+static NSData *pt_read_style_digit(NSString *path)
+{
+    struct stat st;
+    if (lstat(path.fileSystemRepresentation, &st) != 0 || !S_ISREG(st.st_mode) ||
+        st.st_size <= 0 || (unsigned long long)st.st_size > kPTMaxDigitBytes) {
+        return nil;
+    }
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    return data.length <= kPTMaxDigitBytes ? data : nil;
+}
+
 static NSDictionary<NSString *, NSData *> *pt_scan_theme_images(NSString *dir)
 {
     NSMutableDictionary<NSString *, NSData *> *out = [NSMutableDictionary dictionary];
     for (NSInteger value = 0; value <= 9; value++) {
         NSString *digit = [NSString stringWithFormat:@"%ld", (long)value];
-        NSData *data = [NSData dataWithContentsOfFile:pt_digit_path_in_dir(dir, digit)];
+        NSData *data = pt_read_style_digit(pt_digit_path_in_dir(dir, digit));
         if (data.length > 0) out[digit] = data;
     }
     return out;
@@ -1751,7 +1789,7 @@ static PTPasscodeStyleState pt_compute_style_state(void)
         NSArray<NSString *> *paths = targets[digit];
         if (paths.count == 0) continue;
 
-        NSData *wanted = [NSData dataWithContentsOfFile:pt_digit_path_in_dir(themeDir, digit)];
+        NSData *wanted = pt_read_style_digit(pt_digit_path_in_dir(themeDir, digit));
         if (wanted.length == 0) continue;
 
         NSData *installed = pt_read_file(paths.firstObject);
@@ -1837,6 +1875,15 @@ BOOL settings_passcode_theme_set_digit_image(NSDictionary *theme,
         }
         return NO;
     }
+    // Same byte and pixel bounds as a folder or archive import.
+    if (pngData.length > kPTMaxDigitBytes || !SBLImageDataPassesPixelPreflight(pngData)) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"PasscodeTheme" code:6 userInfo:@{
+                NSLocalizedDescriptionKey: @"The digit image is too large. Use an image of at most 8 MB and 4096 × 4096 pixels."
+            }];
+        }
+        return NO;
+    }
 
     // A non-dictionary theme means no style folder, exactly as when the folder
     // lookup still rejected the parameter itself.
@@ -1916,6 +1963,14 @@ BOOL settings_passcode_import_folder_named(NSURL *url,
         // loop below just reads it back.
         NSString *digit = settings_passcode_digit_for_filename(relative);
         if (digit.length == 0) continue;
+        if (candidates.count >= SBLMaxImportFileCount) {
+            if (error) {
+                *error = [NSError errorWithDomain:@"PasscodeTheme" code:7 userInfo:@{
+                    NSLocalizedDescriptionKey: @"The selected folder holds too many images to import. The previous style is unchanged."
+                }];
+            }
+            return NO;
+        }
         NSArray<NSString *> *pair = @[ relative, digit ];
         [candidates addObject:pair];
     }
@@ -1926,13 +1981,35 @@ BOOL settings_passcode_import_folder_named(NSURL *url,
     }];
 
     NSMutableDictionary<NSString *, NSData *> *matched = [NSMutableDictionary dictionary];
+    uint64_t bytesRead = 0;
     for (NSArray<NSString *> *pair in candidates) {
         NSString *relative = pair.firstObject;
         NSString *digit = pair.lastObject;
         if (matched[digit]) continue;
 
-        NSData *data = [NSData dataWithContentsOfFile:
-                        [url.path stringByAppendingPathComponent:relative]];
+        // Preflight (regular file, byte cap, header pixel size) before the file
+        // is read or decoded, and keep the bytes read inside the import budget.
+        NSString *srcPath = [url.path stringByAppendingPathComponent:relative];
+        uint64_t srcSize = 0;
+        if (!SBLImageFilePassesPreflight(srcPath, kPTMaxDigitBytes, &srcSize)) {
+            if ([fm fileExistsAtPath:srcPath]) {
+                log_user("[PASSCODE] Skipping image %s: not a regular file within %lu bytes and %lu x %lu pixels.\n",
+                         relative.UTF8String, (unsigned long)kPTMaxDigitBytes,
+                         (unsigned long)SBLMaxImagePixelSide, (unsigned long)SBLMaxImagePixelSide);
+            }
+            continue;
+        }
+        if (bytesRead + srcSize > SBLMaxImportTotalBytes) {
+            if (error) {
+                *error = [NSError errorWithDomain:@"PasscodeTheme" code:7 userInfo:@{
+                    NSLocalizedDescriptionKey: @"The selected folder's images are too large to import. The previous style is unchanged."
+                }];
+            }
+            return NO;
+        }
+        bytesRead += srcSize;
+
+        NSData *data = [NSData dataWithContentsOfFile:srcPath];
         if (data.length == 0) continue;
         if (data.length > kPTMaxDigitBytes) {
             log_user("[PASSCODE] Skipping oversized image %s (%lu bytes).\n",
@@ -2074,11 +2151,21 @@ NSData *settings_passcode_png_data_for_image(UIImage *image)
 
     CGFloat scale = kPTKeypadArtHeight / image.size.height;
     CGSize size = CGSizeMake(MAX(image.size.width * scale, 1.0), kPTKeypadArtHeight);
+    // The height is fixed, so only an extreme aspect ratio can blow the output
+    // up: refuse a canvas wider than an imported image may be, before it is
+    // allocated.
+    CGFloat pixelScale = UIGraphicsImageRendererFormat.preferredFormat.scale;
+    if (size.width * MAX(pixelScale, 1.0) > (CGFloat)SBLMaxImagePixelSide) {
+        log_user("[PASSCODE] Picked photo is too wide for keypad art (%.0f points).\n",
+                 (double)size.width);
+        return nil;
+    }
 
     UIGraphicsImageRenderer *renderer =
         [[UIGraphicsImageRenderer alloc] initWithSize:size];
     UIImage *resized = [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
         [image drawInRect:CGRectMake(0.0, 0.0, size.width, size.height)];
     }];
-    return UIImagePNGRepresentation(resized);
+    NSData *png = UIImagePNGRepresentation(resized);
+    return png.length <= kPTMaxDigitBytes ? png : nil;
 }

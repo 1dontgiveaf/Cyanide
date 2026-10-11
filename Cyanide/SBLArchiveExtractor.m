@@ -7,6 +7,8 @@
 #import "SBLArchiveExtractor.h"
 
 #import <dlfcn.h>
+#import <ImageIO/ImageIO.h>
+#import <sys/stat.h>
 #import <zlib.h>
 
 static NSString * const SBLArchiveErrorDomain = @"SnowBoardLiteArchive";
@@ -17,6 +19,52 @@ static const uint64_t kSBLMaxEntryBytes = 64ull * 1024 * 1024;    // per extract
 static const uint64_t kSBLMaxTotalBytes = 256ull * 1024 * 1024;   // whole archive / decompressed tar
 // liblzma decoder memory limit (dictionary etc., not output). xz -9 needs ~65 MiB.
 static const uint64_t kSBLXZMemLimit    = 128ull * 1024 * 1024;
+// inflate() runs in slices of this size (input and output) so a cancel is seen
+// between calls instead of only after a whole entry.
+static const NSUInteger kSBLInflateChunk = 1024 * 1024;
+
+const uint64_t SBLMaxArchiveInputBytes = kSBLMaxTotalBytes;
+const uint64_t SBLMaxImportTotalBytes  = kSBLMaxTotalBytes;
+const NSUInteger SBLMaxImportFileCount = UINT16_MAX - 1;          // a non-ZIP64 archive's entry cap
+const uint64_t SBLMaxImageFileBytes    = 8ull * 1024 * 1024;
+const NSUInteger SBLMaxImagePixelSide  = 4096;
+
+static BOOL sbl_image_source_within_pixel_cap(CGImageSourceRef source)
+{
+    if (!source) return NO;
+    CFDictionaryRef props = CGImageSourceCopyPropertiesAtIndex(source, 0, NULL);
+    if (!props) return NO;
+    NSDictionary *p = (__bridge_transfer NSDictionary *)props;
+    NSNumber *w = p[(__bridge NSString *)kCGImagePropertyPixelWidth];
+    NSNumber *h = p[(__bridge NSString *)kCGImagePropertyPixelHeight];
+    if (![w isKindOfClass:NSNumber.class] || ![h isKindOfClass:NSNumber.class]) return NO;
+    return w.unsignedLongLongValue > 0 && h.unsignedLongLongValue > 0 &&
+           w.unsignedLongLongValue <= SBLMaxImagePixelSide &&
+           h.unsignedLongLongValue <= SBLMaxImagePixelSide;
+}
+
+BOOL SBLImageFilePassesPreflight(NSString *path, uint64_t maxBytes, uint64_t *sizeOut)
+{
+    if (sizeOut) *sizeOut = 0;
+    struct stat st;
+    if (path.length == 0 || lstat(path.fileSystemRepresentation, &st) != 0) return NO;
+    if (!S_ISREG(st.st_mode) || st.st_size <= 0 || (uint64_t)st.st_size > maxBytes) return NO;
+    if (sizeOut) *sizeOut = (uint64_t)st.st_size;
+
+    CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:path], NULL);
+    BOOL ok = sbl_image_source_within_pixel_cap(source);
+    if (source) CFRelease(source);
+    return ok;
+}
+
+BOOL SBLImageDataPassesPixelPreflight(NSData *data)
+{
+    if (data.length == 0) return NO;
+    CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
+    BOOL ok = sbl_image_source_within_pixel_cap(source);
+    if (source) CFRelease(source);
+    return ok;
+}
 
 typedef int (*sbl_inflateInit2_)(z_streamp strm, int windowBits, const char *version, int stream_size);
 typedef int (*sbl_inflate)(z_streamp strm, int flush);
@@ -122,12 +170,12 @@ static NSData *sbl_inflate_data(NSData *input, NSUInteger outputSize, int window
     }
 
     NSMutableData *out = [NSMutableData dataWithLength:outputSize];
+    const Bytef *inBase = input.bytes;
+    Bytef *outBase = out.mutableBytes;
     z_stream stream;
     memset(&stream, 0, sizeof(stream));
-    stream.next_in = (Bytef *)input.bytes;
-    stream.avail_in = (uInt)MIN(input.length, UINT32_MAX);
-    stream.next_out = out.mutableBytes;
-    stream.avail_out = (uInt)MIN(outputSize, UINT32_MAX);
+    stream.next_in = (Bytef *)inBase;
+    stream.next_out = outBase;
 
     int rc = pInit(&stream, windowBits, ZLIB_VERSION, (int)sizeof(stream));
     if (rc != Z_OK) {
@@ -135,7 +183,23 @@ static NSData *sbl_inflate_data(NSData *input, NSUInteger outputSize, int window
         sbl_set_error(error, 12, @"Could not initialize zlib.");
         return nil;
     }
-    rc = pInflate(&stream, Z_FINISH);
+    // Bounded slices, cancellation checked between them. Every Z_OK made
+    // progress on a finite input/output, so the loop ends; Z_BUF_ERROR (no
+    // progress possible: truncated input or more output than declared) and any
+    // other code fail exactly as the old one-shot Z_FINISH call did.
+    for (;;) {
+        if (sbl_cancelled(progress, error)) {
+            pEnd(&stream);
+            dlclose(libz);
+            return nil;
+        }
+        NSUInteger consumed = (NSUInteger)(stream.next_in - inBase);
+        NSUInteger produced = (NSUInteger)(stream.next_out - outBase);
+        stream.avail_in = (uInt)MIN(input.length - consumed, kSBLInflateChunk);
+        stream.avail_out = (uInt)MIN(outputSize - produced, kSBLInflateChunk);
+        rc = pInflate(&stream, Z_NO_FLUSH);
+        if (rc != Z_OK) break;
+    }
     pEnd(&stream);
     dlclose(libz);
 
@@ -380,6 +444,8 @@ static BOOL sbl_extract_zip(NSData *zip, NSString *destination, NSProgress *prog
             fileData = sbl_inflate_data(payload, uncompSize, -MAX_WBITS, progress, error);
             if (!fileData) return NO;
         }
+        // A cancel that arrived during inflate must not still write this entry.
+        if (sbl_cancelled(progress, error)) return NO;
         if (!sbl_write_file(fileData, outPath, error)) return NO;
         extracted++;
     }
@@ -443,6 +509,7 @@ static BOOL sbl_extract_tar(NSData *tar, NSString *destination, NSProgress *prog
                 return NO;
             }
             NSData *data = [NSData dataWithBytes:b + dataOff length:size];
+            if (sbl_cancelled(progress, error)) return NO;
             if (!sbl_write_file(data, outPath, error)) return NO;
             extracted++;
         } else if (type == '5') {
@@ -537,8 +604,29 @@ BOOL SBLExtractArchiveToDirectoryWithProgress(NSURL *url, NSString *destination,
                                               NSProgress *progress, NSError **error)
 {
     if (sbl_cancelled(progress, error)) return NO;
+    // Size the input before materializing it: the decompressed and entry
+    // bounds below only apply once the whole archive is already in memory.
+    NSNumber *isRegular = nil;
+    NSNumber *fileSize = nil;
+    if (url.isFileURL) {
+        [url getResourceValue:&isRegular forKey:NSURLIsRegularFileKey error:nil];
+        [url getResourceValue:&fileSize forKey:NSURLFileSizeKey error:nil];
+        if (isRegular && !isRegular.boolValue) {
+            sbl_set_error(error, 51, @"The selected item is not a regular archive file.");
+            return NO;
+        }
+        if (fileSize.unsignedLongLongValue > SBLMaxArchiveInputBytes) {
+            sbl_set_error(error, 52, @"The archive is larger than 256 MB.");
+            return NO;
+        }
+    }
     NSData *data = [NSData dataWithContentsOfURL:url options:0 error:error];
     if (!data) return NO;
+    // The file may have grown since it was sized.
+    if (data.length > SBLMaxArchiveInputBytes) {
+        sbl_set_error(error, 52, @"The archive is larger than 256 MB.");
+        return NO;
+    }
 
     NSFileManager *fm = NSFileManager.defaultManager;
     [fm removeItemAtPath:destination error:nil];

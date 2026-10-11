@@ -21,4 +21,21 @@ BOOL SBLExtractArchiveToDirectoryWithProgress(NSURL *url,
                                               NSProgress * _Nullable progress,
                                               NSError **error);
 
+// Budgets shared by archive extraction and the folder imports that consume its
+// output (or a picked folder directly), so one asset is bounded the same way
+// whichever path it arrives by.
+extern const uint64_t SBLMaxArchiveInputBytes;   // compressed archive file
+extern const uint64_t SBLMaxImportTotalBytes;    // all files of one import
+extern const NSUInteger SBLMaxImportFileCount;   // candidate files of one import
+extern const uint64_t SBLMaxImageFileBytes;      // one image file
+extern const NSUInteger SBLMaxImagePixelSide;    // pixels per side of one image
+
+// Image preflight: a regular file (symlinks are not followed), non-empty, at
+// most `maxBytes`, whose ImageIO header reports pixel dimensions within
+// SBLMaxImagePixelSide. Nothing is decoded. *sizeOut receives the byte size.
+BOOL SBLImageFilePassesPreflight(NSString *path, uint64_t maxBytes,
+                                 uint64_t * _Nullable sizeOut);
+// The same pixel check for bytes already in memory.
+BOOL SBLImageDataPassesPixelPreflight(NSData *data);
+
 NS_ASSUME_NONNULL_END

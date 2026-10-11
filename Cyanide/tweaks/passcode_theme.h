@@ -47,7 +47,7 @@ PTPasscodeStyleState settings_passcode_style_state(void);
 // can call it without loading the images.
 NSSet<NSString *> *settings_passcode_theme_digit_presence(NSDictionary *theme);
 // Stores one digit's art inside the theme folder, replacing any previous art
-// for that digit.
+// for that digit. Art over 8 MB or 4096 pixels per side is refused.
 BOOL settings_passcode_theme_set_digit_image(NSDictionary *theme,
                                              NSString *digit,
                                              NSData *pngData,
@@ -60,7 +60,8 @@ NSUInteger settings_passcode_theme_backup_count(void);
 NSUInteger settings_passcode_backup_digit_count(void);
 
 // Resizes a picked photo to the keypad art geometry (202 points tall) and
-// returns PNG data, or nil when it cannot be encoded.
+// returns PNG data, or nil when it cannot be encoded or would be wider than
+// 4096 pixels or larger than 8 MB.
 NSData *settings_passcode_png_data_for_image(UIImage *image);
 
 // ---------------------------------------------------------------------------
