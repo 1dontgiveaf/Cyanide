@@ -53,10 +53,14 @@ static void daemons_note_change(NSArray<NSString *> *labels)
 @interface DaemonsViewController ()
 @property (nonatomic, copy) NSDictionary *disabled;   // nil until loaded
 @property (nonatomic, copy) NSDictionary *running;    // label -> @{ name, pid? }; nil if unknown
+// Switch changes not saved yet: label -> @YES (disable) / @NO (enable), only
+// where that differs from disabled.plist. Written on Save.
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *staged;
 @property (nonatomic, copy) NSString *status;          // shown while not loaded / on error
 @property (nonatomic, assign) BOOL busy;
 - (void)setLabels:(NSArray<NSString *> *)labels disabled:(BOOL)disable from:(UIViewController *)presenter;
 - (BOOL)isLabelDisabled:(NSString *)label;
+- (BOOL)willBeDisabled:(NSString *)label;
 - (BOOL)warningAccepted;
 - (NSString *)statusForLabel:(NSString *)label warning:(BOOL *)warning;
 @end
@@ -86,7 +90,7 @@ static void daemons_note_change(NSArray<NSString *> *labels)
 {
     NSString *s = self.group.summary;
     if (self.group.caution) s = [s stringByAppendingFormat:@"\n\n⚠️ %@", self.group.caution];
-    return [s stringByAppendingString:@"\n\nSwitched on means the daemon may run. Changes take effect after a restart. "
+    return [s stringByAppendingString:@"\n\nSwitched on means the daemon may run. Changes are written when you tap Save and take effect after a restart. "
                                       @"Most daemons only run while something needs them, so “not running” doesn't mean disabled. "
                                       @"Pull down on the Daemons list to refresh."];
 }
@@ -109,7 +113,7 @@ static void daemons_note_change(NSArray<NSString *> *labels)
     cell.contentConfiguration = c;
     cell.selectionStyle = UITableViewCellSelectionStyleNone;
     UISwitch *sw = [UISwitch new];
-    sw.on = ![self.owner isLabelDisabled:label];
+    sw.on = ![self.owner willBeDisabled:label];
     sw.enabled = self.owner.disabled && !self.owner.busy;
     __weak typeof(self) weakSelf = self;
     [sw addAction:[UIAction actionWithHandler:^(UIAction *a) {
@@ -137,9 +141,10 @@ static void daemons_note_change(NSArray<NSString *> *labels)
     [super viewDidLoad];
     self.title = @"Daemons";
     self.navigationItem.largeTitleDisplayMode = UINavigationItemLargeTitleDisplayModeAlways;
+    self.staged = [NSMutableDictionary dictionary];
     self.navigationItem.rightBarButtonItem =
-        [[UIBarButtonItem alloc] initWithTitle:@"Turn All On" style:UIBarButtonItemStylePlain
-                                        target:self action:@selector(confirmEnableAll)];
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemSave
+                                                      target:self action:@selector(confirmSave)];
     self.refreshControl = [UIRefreshControl new];
     [self.refreshControl addTarget:self action:@selector(pullToRefresh) forControlEvents:UIControlEventValueChanged];
     self.status = @"Reading disabled daemons…";
@@ -200,11 +205,26 @@ static void daemons_note_change(NSArray<NSString *> *labels)
     return [self.disabled[label] boolValue];
 }
 
+// What the switch shows: the saved state, or the unsaved change.
+- (BOOL)willBeDisabled:(NSString *)label
+{
+    NSNumber *v = self.staged[label];
+    return v ? v.boolValue : [self isLabelDisabled:label];
+}
+
 // "tipsd · Running · PID 412", plus what to expect: a daemon disabled in an
 // earlier boot that still runs means the disable didn't take effect.
 - (NSString *)statusForLabel:(NSString *)label warning:(BOOL *)warning
 {
     *warning = NO;
+    NSString *status = [self runningStatusForLabel:label warning:warning];
+    NSNumber *v = self.staged[label];
+    if (v) status = [status stringByAppendingString:v.boolValue ? @" · disabled when you save" : @" · enabled when you save"];
+    return status;
+}
+
+- (NSString *)runningStatusForLabel:(NSString *)label warning:(BOOL *)warning
+{
     NSDictionary *info = self.running[label];
     NSString *name = info[@"name"] ?: daemon_catalog_executable_guess(label);
     if (!self.running) return [name stringByAppendingString:@" · status unknown"];
@@ -225,7 +245,15 @@ static void daemons_note_change(NSArray<NSString *> *labels)
 
 - (void)refreshUI
 {
-    self.navigationItem.rightBarButtonItem.enabled = self.disabled && !self.busy;
+    BOOL dirty = self.staged.count > 0;
+    self.navigationItem.rightBarButtonItem.enabled = self.disabled && !self.busy && dirty;
+    // Unsaved changes: Discard replaces Back, so they aren't lost by accident.
+    self.navigationItem.hidesBackButton = dirty;
+    self.navigationItem.leftBarButtonItem = dirty
+        ? [[UIBarButtonItem alloc] initWithTitle:@"Discard" style:UIBarButtonItemStylePlain
+                                          target:self action:@selector(discardChanges)]
+        : nil;
+    self.navigationItem.leftBarButtonItem.enabled = !self.busy;
     [self.tableView reloadData];
     for (UIViewController *vc in self.navigationController.viewControllers)
         if ([vc isKindOfClass:DaemonGroupViewController.class]) [((UITableViewController *)vc).tableView reloadData];
@@ -258,31 +286,51 @@ static void daemons_note_change(NSArray<NSString *> *labels)
 - (void)setLabels:(NSArray<NSString *> *)labels disabled:(BOOL)disable from:(UIViewController *)presenter
 {
     if (disable && !self.warningAccepted) { [self refreshUI]; [self showWarningIfNeeded]; return; }
-    CYDaemonGroup *group = nil;
-    for (CYDaemonGroup *g in daemon_catalog_groups())
-        if ([g.labels containsObject:labels.firstObject]) { group = g; break; }
-    if (disable && group.caution) {
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"Disable %@?", group.title]
-                                                                    message:group.caution
-                                                             preferredStyle:UIAlertControllerStyleAlert];
-        [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
-            [self refreshUI];   // flip the switch back
-        }]];
-        [ac addAction:[UIAlertAction actionWithTitle:@"Disable" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
-            [self applyLabels:labels disabled:YES allowFullExploit:NO from:presenter];
-        }]];
-        [presenter presentViewController:ac animated:YES completion:nil];
-        return;
+    if (self.busy || !self.disabled) { [self refreshUI]; return; }
+    for (NSString *label in labels) {
+        if (disable == [self isLabelDisabled:label]) [self.staged removeObjectForKey:label];
+        else self.staged[label] = @(disable);
     }
-    [self applyLabels:labels disabled:disable allowFullExploit:NO from:presenter];
+    [self refreshUI];
 }
 
-- (void)applyLabels:(NSArray<NSString *> *)labels disabled:(BOOL)disable allowFullExploit:(BOOL)allowFullExploit
-               from:(UIViewController *)presenter
+- (void)discardChanges
 {
-    if (self.busy || !self.disabled) { [self refreshUI]; return; }
-    NSMutableDictionary *changes = [NSMutableDictionary dictionary];
-    for (NSString *label in labels) changes[label] = @(disable);
+    [self.staged removeAllObjects];
+    [self refreshUI];
+}
+
+// One confirmation for everything: what changes, and the warning of every
+// group with one that gets disabled.
+- (void)confirmSave
+{
+    if (!self.staged.count || self.busy) return;
+    NSUInteger off = 0, on = 0;
+    NSMutableArray<NSString *> *cautions = [NSMutableArray array];
+    for (NSString *label in self.staged) self.staged[label].boolValue ? off++ : on++;
+    for (CYDaemonGroup *g in daemon_catalog_groups()) {
+        if (!g.caution) continue;
+        for (NSString *label in g.labels) {
+            if ([self.staged[label] boolValue]) { [cautions addObject:[NSString stringWithFormat:@"%@: %@", g.title, g.caution]]; break; }
+        }
+    }
+    NSMutableArray *parts = [NSMutableArray array];
+    if (off) [parts addObject:[NSString stringWithFormat:@"%lu daemon%@ will be disabled", (unsigned long)off, off == 1 ? @"" : @"s"]];
+    if (on) [parts addObject:[NSString stringWithFormat:@"%lu will be enabled", (unsigned long)on]];
+    NSString *message = [[parts componentsJoinedByString:@", "] stringByAppendingString:@" after the next restart."];
+    if (cautions.count) message = [message stringByAppendingFormat:@"\n\n⚠️ %@", [cautions componentsJoinedByString:@"\n\n⚠️ "]];
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Save Changes?" message:message
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Save" style:off ? UIAlertActionStyleDestructive : UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) { [self saveAllowingFullExploit:NO]; }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)saveAllowingFullExploit:(BOOL)allowFullExploit
+{
+    if (self.busy || !self.disabled || !self.staged.count) { [self refreshUI]; return; }
+    NSDictionary<NSString *, NSNumber *> *changes = [self.staged copy];
     self.busy = YES;
     [self refreshUI];
     __weak typeof(self) weakSelf = self;
@@ -292,17 +340,18 @@ static void daemons_note_change(NSArray<NSString *> *labels)
         me.busy = NO;
         if (ok) {
             NSMutableDictionary *d = [me.disabled mutableCopy];
-            for (NSString *label in labels) {
-                if (disable) d[label] = @YES;
+            for (NSString *label in changes) {
+                if (changes[label].boolValue) d[label] = @YES;
                 else [d removeObjectForKey:label];
             }
             me.disabled = d;
-            daemons_note_change(labels);
+            daemons_note_change(changes.allKeys);
+            // Only what was saved; a switch flipped meanwhile stays staged.
+            for (NSString *label in changes)
+                if ([me.staged[label] isEqual:changes[label]]) [me.staged removeObjectForKey:label];
         }
         [me refreshUI];
-        if (!ok) [me handleFailure:message retry:^{
-            [weakSelf applyLabels:labels disabled:disable allowFullExploit:YES from:presenter];
-        } from:presenter];
+        if (!ok) [me handleFailure:message retry:^{ [weakSelf saveAllowingFullExploit:YES]; } from:me];
     });
 }
 
@@ -327,23 +376,6 @@ static void daemons_note_change(NSArray<NSString *> *labels)
     [presenter presentViewController:ac animated:YES completion:nil];
 }
 
-- (void)confirmEnableAll
-{
-    NSMutableArray *labels = [NSMutableArray array];
-    for (CYDaemonGroup *g in daemon_catalog_groups())
-        for (NSString *label in g.labels)
-            if ([self isLabelDisabled:label]) [labels addObject:label];
-    if (!labels.count) return;
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Turn All On?"
-                                                                message:[NSString stringWithFormat:@"Lets all %lu disabled daemons from this list run again after the next restart.", (unsigned long)labels.count]
-                                                         preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"Turn All On" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        [self applyLabels:labels disabled:NO allowFullExploit:NO from:self];
-    }]];
-    [self presentViewController:ac animated:YES completion:nil];
-}
-
 #pragma mark Table
 
 // Section 0: everyday groups. Section 1: the "Show Advanced" switch, then the
@@ -361,7 +393,7 @@ static void daemons_note_change(NSArray<NSString *> *labels)
         if (section == 0 && !g.advanced) [out addObject:g];
         if (section == 1 && g.advanced) {
             BOOL anyOff = NO;
-            for (NSString *label in g.labels) anyOff |= [self isLabelDisabled:label];
+            for (NSString *label in g.labels) anyOff |= [self isLabelDisabled:label] || self.staged[label] != nil;
             if (self.showAdvanced || anyOff) [out addObject:g];
         }
     }
@@ -389,14 +421,18 @@ static void daemons_note_change(NSArray<NSString *> *labels)
 {
     if (section == 1) return @"Advanced";
     if (self.status) return self.status;
+    if (self.staged.count)
+        return [NSString stringWithFormat:@"%lu unsaved change%@ — tap Save to apply", (unsigned long)self.staged.count,
+                self.staged.count == 1 ? @"" : @"s"];
     return daemons_restart_pending() ? @"Restart the device to apply your changes" : nil;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section
 {
     if (section == 0)
-        return @"Switched on means the service runs. Turning one off writes it to launchd's disabled.plist; "
-               @"it stops after the next restart. If something you need stops working, switch it back on and restart.";
+        return @"Switched on means the service may run. Tap Save to write your changes to launchd's disabled.plist; "
+               @"they take effect after the next restart. If something you need stops working, switch it back on, "
+               @"save and restart.";
     return @"Services other parts of iOS rely on. Disabling them is more likely to cause problems.\n\n"
            @"⚠️ Disabling system daemons is at your own risk. If iOS can't finish starting, only a restore "
            @"fixes it: it erases the device unless you have a backup and installs the newest iOS, which Cyanide "
@@ -450,8 +486,11 @@ static void daemons_note_change(NSArray<NSString *> *labels)
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"group"];
     if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"group"];
     CYDaemonGroup *g = [self groupAtIndexPath:indexPath];
-    NSUInteger off = 0;
-    for (NSString *label in g.labels) off += [self isLabelDisabled:label];
+    NSUInteger off = 0, unsaved = 0;
+    for (NSString *label in g.labels) {
+        off += [self willBeDisabled:label];
+        unsaved += self.staged[label] != nil;
+    }
 
     UIListContentConfiguration *c = [UIListContentConfiguration subtitleCellConfiguration];
     c.image = [UIImage systemImageNamed:g.symbol] ?: [UIImage systemImageNamed:@"gearshape"];
@@ -471,6 +510,7 @@ static void daemons_note_change(NSArray<NSString *> *labels)
     if (self.running)
         [facts addObject:running ? [NSString stringWithFormat:@"%lu running", (unsigned long)running] : @"not running"];
     if (anyWarning) [facts addObject:@"still running although disabled"];
+    if (unsaved) [facts insertObject:@"unsaved" atIndex:0];
     [facts addObject:g.summary];
     c.secondaryText = [facts componentsJoinedByString:@" · "];
     c.secondaryTextProperties.color = anyWarning ? UIColor.systemOrangeColor : UIColor.secondaryLabelColor;
