@@ -121,7 +121,23 @@ static bool ota_begin_launchd_dir_redirect(OTADirRedirect *redir)
         return false;
     }
 
+    // kwrite64 has no result: read back, and never treat app-directory I/O
+    // as a launchd edit unless the redirect is really in place.
     kwrite64(localVnode + off_vnode_v_data, targetVData);
+    uint64_t readBack = kread64(localVnode + off_vnode_v_data);
+    if (readBack != targetVData) {
+        printf("[OTA] redirect write not verified want=0x%llx got=0x%llx\n",
+               targetVData, readBack);
+        if (readBack != originalVData) {
+            kwrite64(localVnode + off_vnode_v_data, originalVData);
+            uint64_t restored = kread64(localVnode + off_vnode_v_data);
+            if (restored != originalVData) {
+                printf("[OTA] !!! redirect dir v_data NOT restored want=0x%llx got=0x%llx\n",
+                       originalVData, restored);
+            }
+        }
+        return false;
+    }
     redir->localDir = dir;
     redir->localVnode = localVnode;
     redir->originalVData = originalVData;
@@ -130,49 +146,26 @@ static bool ota_begin_launchd_dir_redirect(OTADirRedirect *redir)
     return true;
 }
 
-static void ota_end_launchd_dir_redirect(OTADirRedirect *redir)
+// Returns false if the original v_data can't be verified back in place;
+// callers must then report failure (the app dir may still alias launchd's).
+static bool ota_end_launchd_dir_redirect(OTADirRedirect *redir)
 {
-    if (!redir || !redir->active) return;
+    if (!redir || !redir->active) return true;
     kwrite64(redir->localVnode + off_vnode_v_data, redir->originalVData);
+    uint64_t readBack = kread64(redir->localVnode + off_vnode_v_data);
+    if (readBack != redir->originalVData) {
+        printf("[OTA] !!! redirect dir %s NOT restored want=0x%llx got=0x%llx\n",
+               redir->localDir.UTF8String, redir->originalVData, readBack);
+        return false;
+    }
     redir->active = false;
     printf("[OTA] restored redirect dir %s\n", redir->localDir.UTF8String);
+    return true;
 }
 
-static NSMutableDictionary *ota_read_disabled_plist(NSString *plistPath)
-{
-    NSError *readError = nil;
-    NSData *data = [NSData dataWithContentsOfFile:plistPath
-                                          options:0
-                                            error:&readError];
-    if (data.length == 0) {
-        NSString *errorDesc = readError ? readError.description : @"empty";
-        printf("[OTA] disabled.plist missing/unreadable; creating fresh dictionary error=%s\n",
-               errorDesc.UTF8String);
-        return [NSMutableDictionary dictionary];
-    }
-
-    if (data.length > kOTABufferSize) {
-        printf("[OTA] disabled.plist too large len=%lu\n", (unsigned long)data.length);
-        return [NSMutableDictionary dictionary];
-    }
-
-    NSError *plistError = nil;
-    NSMutableDictionary *plist = [[NSPropertyListSerialization
-        propertyListWithData:data
-                     options:NSPropertyListMutableContainersAndLeaves
-                      format:nil
-                       error:&plistError] mutableCopy];
-    if (![plist isKindOfClass:NSMutableDictionary.class]) {
-        NSString *errorDesc = plistError ? plistError.description : @"not a dictionary";
-        printf("[OTA] disabled.plist parse failed error=%s\n", errorDesc.UTF8String);
-        return [NSMutableDictionary dictionary];
-    }
-    return plist;
-}
-
-// For the Daemons screen: like ota_read_disabled_plist, but a plist that
-// exists and can't be read or parsed is an error (nil), never an empty
-// dictionary -- writing that back would drop every other entry.
+// A plist that exists and can't be read or parsed is an error (nil), never
+// an empty dictionary -- writing that back would drop every other entry, and
+// reporting it would show corrupt state as "enabled".
 static NSMutableDictionary *ota_read_disabled_plist_strict(NSString *plistPath)
 {
     if (access(plistPath.fileSystemRepresentation, F_OK) != 0 && errno == ENOENT)
@@ -309,15 +302,30 @@ static bool ota_write_disabled_plist(NSDictionary *plist, NSString *plistPath, N
     if (!ok) {
         unlink(tempPath.UTF8String);
     }
-    if (dirModeChanged) {
-        ota_vnode_chmod(dirPath.UTF8String, dirStat.st_mode, "disabled.plist dir restore");
+    // A launchd dir left world-writable is a failure even if the rename landed.
+    if (dirModeChanged &&
+        !ota_vnode_chmod(dirPath.UTF8String, dirStat.st_mode, "disabled.plist dir restore")) {
+        printf("[OTA] !!! disabled.plist dir mode NOT restored (still %o, want %o)\n",
+               writableDirMode, dirStat.st_mode);
+        ok = false;
     }
     return ok;
 }
 
 static NSMutableDictionary *ota_read_local_preference(NSString *path)
 {
-    NSData *data = [NSData dataWithContentsOfFile:path];
+    // Only a missing file starts empty; one that exists but can't be read
+    // is skipped (nil) so its other settings are never overwritten.
+    if (access(path.fileSystemRepresentation, F_OK) != 0 && errno == ENOENT)
+        return [NSMutableDictionary dictionary];
+    NSError *readError = nil;
+    NSData *data = [NSData dataWithContentsOfFile:path options:0 error:&readError];
+    if (!data) {
+        NSString *errorDesc = readError ? readError.description : @"none";
+        printf("[OTA] customer catalog pref exists but can't be read: %s error=%s\n",
+               path.UTF8String, errorDesc.UTF8String);
+        return nil;
+    }
     if (data.length == 0) return [NSMutableDictionary dictionary];
 
     NSError *plistError = nil;
@@ -445,25 +453,26 @@ static long ota_find_mobilegestalt_cachedata_offset(const char *mgKey)
     return -1;
 }
 
-static bool ota_zero_mobilegestalt_cachedata_key(NSMutableData *cacheData, const char *key)
+// 1 = zeroed, 0 = already zero, -1 = slot couldn't be located.
+static int ota_zero_mobilegestalt_cachedata_key(NSMutableData *cacheData, const char *key)
 {
     long offset = ota_find_mobilegestalt_cachedata_offset(key);
-    if (offset < 0) return false;
+    if (offset < 0) return -1;
     if ((NSUInteger)offset + sizeof(uint64_t) > cacheData.length) {
         printf("[OTA][MG] CacheData offset out of range key=%s offset=%ld len=%lu\n",
                key, offset, (unsigned long)cacheData.length);
-        return false;
+        return -1;
     }
 
     uint64_t oldValue = 0;
     memcpy(&oldValue, (const uint8_t *)cacheData.bytes + offset, sizeof(oldValue));
-    if (oldValue == 0) return false;
+    if (oldValue == 0) return 0;
 
     uint64_t zero = 0;
     memcpy((uint8_t *)cacheData.mutableBytes + offset, &zero, sizeof(zero));
     printf("[OTA][MG] zeroed CacheData key=%s offset=%ld old=0x%llx\n",
            key, offset, (unsigned long long)oldValue);
-    return true;
+    return 1;
 }
 
 static bool ota_clear_internal_mobilegestalt_flags(void)
@@ -505,20 +514,29 @@ static bool ota_clear_internal_mobilegestalt_flags(void)
         @"Oji6HRoPi7rH7HPdWVakuw",
     ];
 
+    bool allCleared = true;
     for (NSString *key in internalKeys) {
-        if (cacheExtra[key]) {
-            [cacheExtra removeObjectForKey:key];
-            changed = true;
-        }
+        // CacheData first: only drop the CacheExtra copy once its CacheData
+        // slot is known clear, so a failure never leaves a half-cleared key.
+        int zeroed = ota_zero_mobilegestalt_cachedata_key(cacheData, key.UTF8String);
+        if (zeroed > 0) changed = true;
 
-        if (ota_zero_mobilegestalt_cachedata_key(cacheData, key.UTF8String)) {
+        if (cacheExtra[key]) {
+            if (zeroed < 0) {
+                printf("[OTA][MG] keeping CacheExtra key=%s: CacheData slot not cleared\n",
+                       key.UTF8String);
+                allCleared = false;
+                continue;
+            }
+            [cacheExtra removeObjectForKey:key];
             changed = true;
         }
     }
 
     if (!changed) {
-        printf("[OTA][MG] internal flags already clear\n");
-        return true;
+        printf("[OTA][MG] internal flags %s\n",
+               allCleared ? "already clear" : "not cleared");
+        return allCleared;
     }
 
     NSError *writeError = nil;
@@ -534,9 +552,10 @@ static bool ota_clear_internal_mobilegestalt_flags(void)
 
     BOOL ok = [outData writeToFile:kOTAMobileGestaltPath atomically:YES];
     if (ok) chmod(kOTAMobileGestaltPath.UTF8String, 0644);
-    printf("[OTA][MG] internal flag cleanup %s bytes=%lu\n",
-           ok ? "ok" : "failed", (unsigned long)outData.length);
-    return ok;
+    printf("[OTA][MG] internal flag cleanup %s bytes=%lu%s\n",
+           ok ? "ok" : "failed", (unsigned long)outData.length,
+           allCleared ? "" : " (incomplete)");
+    return ok && allCleared;
 }
 
 static bool ota_run_enable_cleanup(void)
@@ -615,13 +634,17 @@ static int ota_apply_labels(NSMutableDictionary *plist, bool disabled)
     return changed;
 }
 
-static bool ota_set_local_with_launchd_krw(bool disabled)
+// *noRootAccess (optional) is set when /private/var rw couldn't be prepared,
+// i.e. nothing was attempted and the redirect route is still worth trying.
+static bool ota_set_local_with_launchd_krw(bool disabled, bool *noRootAccess)
 {
+    if (noRootAccess) *noRootAccess = false;
     printf("[OTA] live KRW active; %s OTA without launchd RemoteCall\n",
            disabled ? "disabling" : "enabling");
 
     if (!ota_prepare_local_root_rw()) {
         printf("[OTA] unable to get local /private/var rw access\n");
+        if (noRootAccess) *noRootAccess = true;
         return false;
     }
 
@@ -652,7 +675,12 @@ int darksword_ota_read_disabled(void)
         return -1;
     }
 
-    NSMutableDictionary *plist = ota_read_disabled_plist(@(kOTAOriginalPlistPath));
+    // Strict: unreadable/corrupt is unknown (-1), never "enabled (stock)".
+    NSMutableDictionary *plist = ota_read_disabled_plist_strict(@(kOTAOriginalPlistPath));
+    if (!plist) {
+        printf("[OTA] status read: disabled.plist unreadable/corrupt\n");
+        return -1;
+    }
     int total = 0, blocked = 0;
     for (NSString *label in ota_daemon_labels()) {
         total++;
@@ -730,7 +758,7 @@ bool launchd_disabled_apply(NSDictionary<NSString *, NSNumber *> *changes)
     NSMutableDictionary *plist = ota_read_disabled_plist_strict(plistPath);
     bool ok = plist && (mutate(plist) == 0 ||
                         ota_write_disabled_plist(plist, plistPath, tempPath, redir.localDir));
-    ota_end_launchd_dir_redirect(&redir);
+    if (!ota_end_launchd_dir_redirect(&redir)) ok = false;
     printf("[DAEMONS] redirected disabled.plist write result=%d\n", ok);
     return ok;
 }
@@ -744,15 +772,19 @@ bool darksword_ota_set_disabled(bool disabled)
     }
 
     if (disabled && kexploit_krw_ready()) {
-        bool ok = ota_set_local_with_launchd_krw(disabled);
-        printf("[OTA] === DISABLE OTA result=%d reboot/userspace restart required ===\n", ok);
-        return ok;
-    }
-
-    if (krw_persistence_launchd_holds_krw()) {
-        bool ok = ota_set_local_with_launchd_krw(disabled);
-        if (!disabled) {
-            ok = ota_run_enable_cleanup() && ok;
+        bool noRootAccess = false;
+        bool ok = ota_set_local_with_launchd_krw(disabled, &noRootAccess);
+        if (ok || !noRootAccess) {
+            printf("[OTA] === DISABLE OTA result=%d reboot/userspace restart required ===\n", ok);
+            return ok;
+        }
+        // Direct root access unavailable: fall back to the redirect route below.
+        printf("[OTA] direct root access unavailable; trying launchd dir redirect\n");
+    } else if (krw_persistence_launchd_holds_krw()) {
+        bool ok = ota_set_local_with_launchd_krw(disabled, NULL);
+        // Ancillary cleanup only once the primary plist edit is known good.
+        if (!disabled && ok) {
+            ok = ota_run_enable_cleanup();
         }
         printf("[OTA] === %s OTA result=%d reboot/userspace restart required ===\n",
                disabled ? "DISABLE" : "ENABLE", ok);
@@ -786,10 +818,14 @@ bool darksword_ota_set_disabled(bool disabled)
         ok = ota_write_disabled_plist(plist, plistPath, tempPath, redir.localDir);
     } while (0);
 
-    ota_end_launchd_dir_redirect(&redir);
+    if (!ota_end_launchd_dir_redirect(&redir)) {
+        printf("[OTA] launchd plist dir redirect restore failed\n");
+        ok = false;
+    }
 
-    if (!disabled) {
-        ok = ota_run_enable_cleanup() && ok;
+    // Ancillary cleanup only once the primary plist edit is known good.
+    if (!disabled && ok) {
+        ok = ota_run_enable_cleanup();
     }
 
     printf("[OTA] === %s OTA result=%d reboot/userspace restart required ===\n",

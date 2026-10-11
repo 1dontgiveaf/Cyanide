@@ -219,7 +219,7 @@ static void daemons_note_change(NSArray<NSString *> *labels)
 - (BOOL)willBeDisabled:(NSString *)label
 {
     NSNumber *v = self.staged[label];
-    return v ? v.boolValue : [self isLabelDisabled:label];
+    return v != nil ? v.boolValue : [self isLabelDisabled:label];
 }
 
 // "tipsd · Running · PID 412", plus what to expect: a daemon disabled in an
@@ -229,7 +229,7 @@ static void daemons_note_change(NSArray<NSString *> *labels)
     *warning = NO;
     NSString *status = [self runningStatusForLabel:label warning:warning];
     NSNumber *v = self.staged[label];
-    if (v) status = [status stringByAppendingString:v.boolValue ? @" · disabled when you save" : @" · enabled when you save"];
+    if (v != nil) status = [status stringByAppendingString:v.boolValue ? @" · disabled when you save" : @" · enabled when you save"];
     return status;
 }
 
@@ -247,13 +247,13 @@ static void daemons_note_change(NSArray<NSString *> *labels)
         return pid != nil ? [NSString stringWithFormat:@"%@ · Running · PID %@ · shared by %@ jobs", name, pid, shared]
                           : [NSString stringWithFormat:@"%@ · Not running · shared by %@ jobs", name, shared];
     BOOL changed = [daemons_changed_this_boot() containsObject:label];
-    if (pid && off && changed)
+    if (pid != nil && off && changed)
         return [NSString stringWithFormat:@"%@ · Running · PID %@ · stops after restart", name, pid];
-    if (pid && off) {
+    if (pid != nil && off) {
         *warning = YES;
         return [NSString stringWithFormat:@"%@ · Running · PID %@ · still running although disabled", name, pid];
     }
-    if (pid) return [NSString stringWithFormat:@"%@ · Running · PID %@", name, pid];
+    if (pid != nil) return [NSString stringWithFormat:@"%@ · Running · PID %@", name, pid];
     if (off) return [name stringByAppendingString:@" · Not running"];
     if (changed) return [name stringByAppendingString:@" · Not running · can start again after restart"];
     return [name stringByAppendingString:@" · Not running (starts when needed)"];
