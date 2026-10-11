@@ -210,26 +210,26 @@ static NSArray<SIApp *> *si_scan_apps(void)
         return [v isKindOfClass:NSNumber.class] ? v : nil;
     };
     NSNumber *cycles = num(@"CycleCount");
-    if (cycles) [rows addObject:@[ @"Cycle count", cycles.stringValue ]];
+    if (cycles != nil) [rows addObject:@[ @"Cycle count", cycles.stringValue ]];
     NSNumber *design = num(@"DesignCapacity");
     NSNumber *full = num(@"NominalChargeCapacity") ?: num(@"AppleRawMaxCapacity");
     NSNumber *applePct = num(@"MaximumCapacityPercent");
-    if (applePct) [rows addObject:@[ @"Maximum capacity", [NSString stringWithFormat:@"%@%%", applePct] ]];
-    if (design.doubleValue > 0 && full) {
-        [rows addObject:@[ applePct ? @"Measured capacity" : @"Maximum capacity",
+    if (applePct != nil) [rows addObject:@[ @"Maximum capacity", [NSString stringWithFormat:@"%@%%", applePct] ]];
+    if (design.doubleValue > 0 && full != nil) {
+        [rows addObject:@[ applePct != nil ? @"Measured capacity" : @"Maximum capacity",
                            [NSString stringWithFormat:@"%.1f%% (%@ of %@ mAh)",
                             100.0 * full.doubleValue / design.doubleValue, full, design] ]];
     }
     NSNumber *charge = num(@"CurrentCapacity");
-    if (charge) [rows addObject:@[ @"Charge", [NSString stringWithFormat:@"%@%%", charge] ]];
+    if (charge != nil) [rows addObject:@[ @"Charge", [NSString stringWithFormat:@"%@%%", charge] ]];
     NSNumber *temp = num(@"Temperature");
-    if (temp) [rows addObject:@[ @"Temperature", [NSString stringWithFormat:@"%.1f °C", temp.doubleValue / 100.0] ]];
+    if (temp != nil) [rows addObject:@[ @"Temperature", [NSString stringWithFormat:@"%.1f °C", temp.doubleValue / 100.0] ]];
     NSNumber *voltage = num(@"Voltage");
-    if (voltage) [rows addObject:@[ @"Voltage", [NSString stringWithFormat:@"%.2f V", voltage.doubleValue / 1000.0] ]];
+    if (voltage != nil) [rows addObject:@[ @"Voltage", [NSString stringWithFormat:@"%.2f V", voltage.doubleValue / 1000.0] ]];
     NSNumber *amps = num(@"InstantAmperage") ?: num(@"Amperage");
-    if (amps) [rows addObject:@[ @"Current", [NSString stringWithFormat:@"%d mA", amps.intValue] ]];
+    if (amps != nil) [rows addObject:@[ @"Current", [NSString stringWithFormat:@"%d mA", amps.intValue] ]];
     NSNumber *charging = num(@"IsCharging"), *external = num(@"ExternalConnected");
-    if (charging || external)
+    if (charging != nil || external != nil)
         [rows addObject:@[ @"Power", charging.boolValue ? @"Charging" : external.boolValue ? @"Connected, not charging" : @"On battery" ]];
     self.batteryRows = rows;
     self.batteryStatus = rows.count ? [NSString stringWithFormat:@"Read from AppleSmartBattery in %@.", source]

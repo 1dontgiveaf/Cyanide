@@ -6987,7 +6987,7 @@ static NSDictionary *settings_daemons_running(void)
     for (int i = 0; i < n; i++) {
         buf[i].name[sizeof(buf[i].name) - 1] = 0;
         NSString *name = [NSString stringWithUTF8String:buf[i].name];
-        if (name.length && !pids[name]) pids[name] = @(buf[i].pid);
+        if (name.length && pids[name] == nil) pids[name] = @(buf[i].pid);
     }
     free(buf);
     NSDictionary *programs = settings_launchd_job_programs();
@@ -6998,7 +6998,7 @@ static NSDictionary *settings_daemons_running(void)
             // The kernel keeps at most 31 characters of the name.
             NSString *key = exe.length > sizeof(buf->name) - 1 ? [exe substringToIndex:sizeof(buf->name) - 1] : exe;
             NSNumber *pid = pids[key];
-            out[label] = pid ? @{ @"name": exe, @"pid": pid } : @{ @"name": exe };
+            out[label] = pid != nil ? @{ @"name": exe, @"pid": pid } : @{ @"name": exe };
         }
     }
     return out;
@@ -7120,7 +7120,7 @@ void settings_battery_info_async(BOOL allowFullExploit,
         NSDictionary *battery = settings_battery_props_local();
         NSString *source = @"Cyanide";
         NSString *message = nil;
-        if (!battery[@"CycleCount"]) {
+        if (battery[@"CycleCount"] == nil) {
             battery = nil;
             source = @"SpringBoard";
             if (!settings_device_supported()) {
