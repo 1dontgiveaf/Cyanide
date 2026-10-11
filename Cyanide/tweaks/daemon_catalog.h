@@ -19,6 +19,9 @@
 // Set for groups whose loss is easy to notice (Wallet, Siri, Location, …):
 // shown in the list and confirmed before disabling.
 @property (nonatomic, readonly, copy) NSString *caution;
+// Services other parts of iOS rely on: hidden unless the user turns on
+// "Show Advanced" (the riskier ones to disable).
+@property (nonatomic, readonly) BOOL advanced;
 @end
 
 NSArray<CYDaemonGroup *> *daemon_catalog_groups(void);

@@ -14,6 +14,8 @@ static NSString * const kDaemonsChangedBootKey = @"DaemonsChangedBootUUID";
 
 // Set once the user has acknowledged the brick warning.
 static NSString * const kDaemonsWarningAcceptedKey = @"DaemonsWarningAccepted";
+// Shows the advanced groups (services other parts of iOS rely on).
+static NSString * const kDaemonsShowAdvancedKey = @"DaemonsShowAdvanced";
 
 static BOOL daemons_restart_pending(void)
 {
@@ -140,8 +142,9 @@ static void daemons_note_change(void)
         alertControllerWithTitle:@"Disabling Daemons Can Brick Your Device"
                          message:@"Turning off system daemons changes how iOS starts, at every boot. The services listed here are "
                                  @"widely disabled without problems, but that isn't guaranteed for every iOS version and device.\n\n"
-                                 @"If iOS can't finish starting, Cyanide can't undo the change, and only restoring the device "
-                                 @"fixes it, which erases it unless you have a backup.\n\n"
+                                 @"If iOS can't finish starting, Cyanide can't undo the change. Only a restore fixes it: it "
+                                 @"erases the device unless you have a backup, and it installs the newest iOS, which Cyanide "
+                                 @"most likely doesn't support.\n\n"
                                  @"Back up first, change one thing at a time and restart to check it before the next."
                   preferredStyle:UIAlertControllerStyleAlert];
     __weak typeof(self) weakSelf = self;
@@ -293,42 +296,116 @@ static void daemons_note_change(void)
 
 #pragma mark Table
 
+// Section 0: everyday groups. Section 1: the "Show Advanced" switch, then the
+// advanced groups when it's on -- and always any advanced group that is
+// (partly) disabled, so it can be switched back on.
+- (BOOL)showAdvanced
+{
+    return [NSUserDefaults.standardUserDefaults boolForKey:kDaemonsShowAdvancedKey];
+}
+
+- (NSArray<CYDaemonGroup *> *)groupsInSection:(NSInteger)section
+{
+    NSMutableArray *out = [NSMutableArray array];
+    for (CYDaemonGroup *g in daemon_catalog_groups()) {
+        if (section == 0 && !g.advanced) [out addObject:g];
+        if (section == 1 && g.advanced) {
+            BOOL anyOff = NO;
+            for (NSString *label in g.labels) anyOff |= [self isLabelDisabled:label];
+            if (self.showAdvanced || anyOff) [out addObject:g];
+        }
+    }
+    return out;
+}
+
+- (CYDaemonGroup *)groupAtIndexPath:(NSIndexPath *)indexPath
+{
+    NSInteger row = indexPath.row - (indexPath.section == 1 ? 1 : 0);
+    NSArray *groups = [self groupsInSection:indexPath.section];
+    return row >= 0 && row < (NSInteger)groups.count ? groups[(NSUInteger)row] : nil;
+}
+
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView
 {
-    return 1;
+    return 2;
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
 {
-    return (NSInteger)daemon_catalog_groups().count;
+    return (NSInteger)[self groupsInSection:section].count + (section == 1 ? 1 : 0);
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section
 {
+    if (section == 1) return @"Advanced";
     if (self.status) return self.status;
     return daemons_restart_pending() ? @"Restart the device to apply your changes" : nil;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section
 {
-    return @"Switched on means the service runs. Turning one off writes it to launchd's disabled.plist; "
-           @"it stops after the next restart. The daemons offered here are widely disabled on iOS 17 and 18 "
-           @"without problems. If something you need stops working, switch it back on and restart.\n\n"
+    if (section == 0)
+        return @"Switched on means the service runs. Turning one off writes it to launchd's disabled.plist; "
+               @"it stops after the next restart. If something you need stops working, switch it back on and restart.";
+    return @"Services other parts of iOS rely on. Disabling them is more likely to cause problems.\n\n"
            @"⚠️ Disabling system daemons is at your own risk. If iOS can't finish starting, only a restore "
-           @"fixes it, which erases the device unless you have a backup. Change one thing at a time.";
+           @"fixes it: it erases the device unless you have a backup and installs the newest iOS, which Cyanide "
+           @"most likely doesn't support. Change one thing at a time.";
+}
+
+- (UITableViewCell *)advancedSwitchCell
+{
+    UITableViewCell *cell = [self.tableView dequeueReusableCellWithIdentifier:@"advanced"];
+    if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"advanced"];
+    UIListContentConfiguration *c = cell.defaultContentConfiguration;
+    c.text = @"Show Advanced";
+    cell.contentConfiguration = c;
+    cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    UISwitch *sw = [UISwitch new];
+    sw.on = self.showAdvanced;
+    __weak typeof(self) weakSelf = self;
+    [sw addAction:[UIAction actionWithHandler:^(UIAction *a) {
+        [weakSelf setShowAdvanced:((UISwitch *)a.sender).isOn];
+    }] forControlEvents:UIControlEventValueChanged];
+    cell.accessoryView = sw;
+    return cell;
+}
+
+- (void)setShowAdvanced:(BOOL)show
+{
+    if (!show) {
+        [NSUserDefaults.standardUserDefaults setBool:NO forKey:kDaemonsShowAdvancedKey];
+        [self refreshUI];
+        return;
+    }
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"Show Advanced Daemons?"
+                         message:@"These services are used by other parts of iOS. Disabling them is more likely to break "
+                                 @"things or, in the worst case, stop the device from starting. A restore would then "
+                                 @"install the newest iOS, which Cyanide most likely doesn't support."
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
+        [self refreshUI];
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Show" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        [NSUserDefaults.standardUserDefaults setBool:YES forKey:kDaemonsShowAdvancedKey];
+        [self refreshUI];
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
 {
+    if (indexPath.section == 1 && indexPath.row == 0) return [self advancedSwitchCell];
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"group"];
     if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"group"];
-    CYDaemonGroup *g = daemon_catalog_groups()[(NSUInteger)indexPath.row];
+    CYDaemonGroup *g = [self groupAtIndexPath:indexPath];
     NSUInteger off = 0;
     for (NSString *label in g.labels) off += [self isLabelDisabled:label];
 
     UIListContentConfiguration *c = [UIListContentConfiguration subtitleCellConfiguration];
     c.image = [UIImage systemImageNamed:g.symbol] ?: [UIImage systemImageNamed:@"gearshape"];
-    c.imageProperties.tintColor = g.caution ? UIColor.systemOrangeColor : UIColor.systemBlueColor;
+    c.imageProperties.tintColor = (g.caution || g.advanced) ? UIColor.systemOrangeColor : UIColor.systemBlueColor;
     c.text = g.title;
     NSString *detail = g.summary;
     if (off > 0 && off < g.labels.count)
@@ -355,8 +432,10 @@ static void daemons_note_change(void)
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath
 {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    CYDaemonGroup *g = [self groupAtIndexPath:indexPath];
+    if (!g) return;
     DaemonGroupViewController *vc = [[DaemonGroupViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
-    vc.group = daemon_catalog_groups()[(NSUInteger)indexPath.row];
+    vc.group = g;
     vc.owner = self;
     [self.navigationController pushViewController:vc animated:YES];
 }

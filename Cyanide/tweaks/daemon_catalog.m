@@ -11,6 +11,7 @@
 @property (nonatomic, copy) NSString *symbol;
 @property (nonatomic, copy) NSArray<NSString *> *labels;
 @property (nonatomic, copy) NSString *caution;
+@property (nonatomic) BOOL advanced;
 @end
 
 @implementation CYDaemonGroup
@@ -26,6 +27,14 @@ static CYDaemonGroup *group(NSString *identifier, NSString *title, NSString *sym
     g.summary = summary;
     g.caution = caution;
     g.labels = labels;
+    return g;
+}
+
+static CYDaemonGroup *advanced(NSString *identifier, NSString *title, NSString *symbol, NSString *summary,
+                               NSString *caution, NSArray<NSString *> *labels)
+{
+    CYDaemonGroup *g = group(identifier, title, symbol, summary, caution, labels);
+    g.advanced = YES;
     return g;
 }
 
@@ -79,13 +88,13 @@ NSArray<CYDaemonGroup *> *daemon_catalog_groups(void)
             group(@"musiccloud", @"Music Cloud Library", @"music.note",
                   @"Apple Music / iTunes cloud library sync stops.", nil,
                   @[ @"com.apple.itunescloudd" ]),
-            group(@"diagnostics", @"Diagnostics", @"stethoscope",
+            advanced(@"diagnostics", @"Diagnostics", @"stethoscope",
                   @"Hardware and performance diagnostics stop, including sysdiagnose.", nil,
                   @[ @"com.apple.diagnosticd", @"com.apple.diagnosticextensionsd",
                      @"com.apple.diagnosticservicesd", @"com.apple.diagnosticspushd",
                      @"com.apple.symptomsd-diag", @"com.apple.sysdiagnose",
                      @"com.apple.sysdiagnose.darwinos", @"com.apple.sysdiagnose_helper" ]),
-            group(@"crashreports", @"Logs & Crash Reports", @"doc.text.magnifyingglass",
+            advanced(@"crashreports", @"Logs & Crash Reports", @"doc.text.magnifyingglass",
                   @"System logging and crash reports stop.",
                   @"Panic and crash logs are no longer saved, so a reboot from a failed run can't be diagnosed. Turn this back on before reporting a bug.",
                   @[ @"com.apple.ReportCrash", @"com.apple.ReportCrash.Jetsam",
@@ -101,29 +110,29 @@ NSArray<CYDaemonGroup *> *daemon_catalog_groups(void)
                      @"com.apple.syslogd", @"com.apple.signpost.signpost_reporter",
                      @"com.apple.pluginkit.pkreporter", @"com.apple.ProxiedCrashCopier",
                      @"com.apple.ProxiedCrashCopier.ProxyingDevice", @"com.apple.ReportSystemMemory" ]),
-            group(@"spotlight", @"Spotlight", @"magnifyingglass",
+            advanced(@"spotlight", @"Spotlight", @"magnifyingglass",
                   @"Searching from the Home Screen and in apps stops working.",
                   @"Spotlight search, app search and Siri Suggestions stop working.",
                   @[ @"com.apple.searchd", @"com.apple.corespotlightservice",
                      @"com.apple.spotlightknowledged", @"com.apple.spotlightknowledged.updater",
                      @"com.apple.spotlight.IndexAgent" ]),
-            group(@"siri", @"Siri & Dictation", @"waveform",
+            advanced(@"siri", @"Siri & Dictation", @"waveform",
                   @"Siri, Voice Control and dictation stop working.",
                   @"Siri, “Hey Siri”, Voice Control and keyboard dictation stop working.",
                   @[ @"com.apple.assistant_service", @"com.apple.assistantd", @"com.apple.voiced" ]),
-            group(@"health", @"HealthKit", @"heart",
+            advanced(@"health", @"HealthKit", @"heart",
                   @"The Health app and apps that use health data stop getting updates.",
                   @"Health data stops being recorded and synced, including from Apple Watch.",
                   @[ @"com.apple.healthd" ]),
-            group(@"wallet", @"Wallet", @"wallet.pass",
+            advanced(@"wallet", @"Wallet", @"wallet.pass",
                   @"Wallet passes and Apple Pay stop working.",
                   @"Apple Pay, transit cards, car keys and all Wallet passes stop working.",
                   @[ @"com.apple.passd" ]),
-            group(@"location", @"Location Services", @"location",
+            advanced(@"location", @"Location Services", @"location",
                   @"GPS and everything that needs your location stops working.",
                   @"Maps, Find My, Weather, location-based reminders and Cyanide's Location Services toggle stop working.",
                   @[ @"com.apple.locationd" ]),
-            group(@"thermal", @"Thermal Monitor", @"thermometer.medium",
+            advanced(@"thermal", @"Thermal Monitor", @"thermometer.medium",
                   @"iOS stops lowering performance when the device gets warm.",
                   @"Without thermalmonitord iOS no longer throttles when hot. The device can get very warm under load; the hardware still shuts down at critical temperatures.",
                   @[ @"com.apple.thermalmonitord" ]),
