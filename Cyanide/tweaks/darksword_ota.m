@@ -11,6 +11,7 @@
 #import "../kexploit/offsets.h"
 #import "../kexploit/vnode.h"
 #import "../utils/sandbox.h"
+#import "daemon_catalog.h"
 #import <Foundation/Foundation.h>
 #import <dlfcn.h>
 #import <errno.h>
@@ -165,6 +166,34 @@ static NSMutableDictionary *ota_read_disabled_plist(NSString *plistPath)
         NSString *errorDesc = plistError ? plistError.description : @"not a dictionary";
         printf("[OTA] disabled.plist parse failed error=%s\n", errorDesc.UTF8String);
         return [NSMutableDictionary dictionary];
+    }
+    return plist;
+}
+
+// For the Daemons screen: like ota_read_disabled_plist, but a plist that
+// exists and can't be read or parsed is an error (nil), never an empty
+// dictionary -- writing that back would drop every other entry.
+static NSMutableDictionary *ota_read_disabled_plist_strict(NSString *plistPath)
+{
+    if (access(plistPath.fileSystemRepresentation, F_OK) != 0 && errno == ENOENT)
+        return [NSMutableDictionary dictionary];
+    NSData *data = [NSData dataWithContentsOfFile:plistPath];
+    if (!data) {
+        printf("[DAEMONS] disabled.plist exists but can't be read\n");
+        return nil;
+    }
+    if (data.length == 0) return [NSMutableDictionary dictionary];
+    if (data.length > kOTABufferSize) {
+        printf("[DAEMONS] disabled.plist too large len=%lu\n", (unsigned long)data.length);
+        return nil;
+    }
+    id plist = [NSPropertyListSerialization propertyListWithData:data
+                                                         options:NSPropertyListMutableContainersAndLeaves
+                                                          format:nil
+                                                           error:nil];
+    if (![plist isKindOfClass:NSMutableDictionary.class]) {
+        printf("[DAEMONS] disabled.plist is not a dictionary\n");
+        return nil;
     }
     return plist;
 }
@@ -599,7 +628,8 @@ static bool ota_set_local_with_launchd_krw(bool disabled)
     NSString *dirPath = @(kOTAPlistDirPath);
     NSString *plistPath = [dirPath stringByAppendingPathComponent:@(kOTAPlistFileName)];
     NSString *tempPath = [dirPath stringByAppendingPathComponent:@(kOTAPlistTempFileName)];
-    NSMutableDictionary *plist = ota_read_disabled_plist(plistPath);
+    NSMutableDictionary *plist = ota_read_disabled_plist_strict(plistPath);
+    if (!plist) return false;   // never rewrite a plist we couldn't read
 
     int changed = ota_apply_labels(plist, disabled);
 
@@ -632,6 +662,77 @@ int darksword_ota_read_disabled(void)
     if (blocked == 0) return 0;
     if (blocked == total) return 1;
     return 2;
+}
+
+NSDictionary<NSString *, id> *launchd_disabled_read(void)
+{
+    if (!kexploit_krw_ready()) {
+        printf("[DAEMONS] refusing read: KRW is not active/recovered\n");
+        return nil;
+    }
+    if (!ota_prepare_local_root_rw()) {
+        printf("[DAEMONS] read: no /private/var read access\n");
+        return nil;
+    }
+    return ota_read_disabled_plist_strict(@(kOTAOriginalPlistPath));
+}
+
+// Same write paths as the OTA switch: a local edit when /private/var is
+// writable, otherwise through the launchd directory redirect.
+bool launchd_disabled_apply(NSDictionary<NSString *, NSNumber *> *changes)
+{
+    if (!kexploit_krw_ready()) {
+        printf("[DAEMONS] refusing plist edit: KRW is not active/recovered\n");
+        return false;
+    }
+    for (NSString *label in changes) {
+        if (!daemon_catalog_contains_label(label) || ![changes[label] isKindOfClass:NSNumber.class]) {
+            printf("[DAEMONS] refusing plist edit: %s is not in the catalog\n", label.description.UTF8String);
+            return false;
+        }
+    }
+    int (^mutate)(NSMutableDictionary *) = ^int(NSMutableDictionary *plist) {
+        int changed = 0;
+        for (NSString *label in changes) {
+            BOOL disable = changes[label].boolValue;
+            if (disable && ![plist[label] boolValue]) {
+                plist[label] = @YES;
+                changed++;
+                printf("[DAEMONS] disabling %s\n", label.UTF8String);
+            } else if (!disable && plist[label]) {
+                [plist removeObjectForKey:label];
+                changed++;
+                printf("[DAEMONS] enabling %s\n", label.UTF8String);
+            }
+        }
+        return changed;
+    };
+
+    if (ota_prepare_local_root_rw()) {
+        NSString *dirPath = @(kOTAPlistDirPath);
+        NSString *plistPath = [dirPath stringByAppendingPathComponent:@(kOTAPlistFileName)];
+        NSString *tempPath = [dirPath stringByAppendingPathComponent:@(kOTAPlistTempFileName)];
+        NSMutableDictionary *plist = ota_read_disabled_plist_strict(plistPath);
+        if (!plist) return false;
+        if (mutate(plist) == 0) return true;
+        bool ok = ota_write_disabled_plist(plist, plistPath, tempPath, dirPath);
+        printf("[DAEMONS] local disabled.plist write result=%d\n", ok);
+        return ok;
+    }
+
+    OTADirRedirect redir = {0};
+    if (!ota_begin_launchd_dir_redirect(&redir)) {
+        printf("[DAEMONS] launchd plist dir redirect failed\n");
+        return false;
+    }
+    NSString *plistPath = [redir.localDir stringByAppendingPathComponent:@(kOTAPlistFileName)];
+    NSString *tempPath = [redir.localDir stringByAppendingPathComponent:@(kOTAPlistTempFileName)];
+    NSMutableDictionary *plist = ota_read_disabled_plist_strict(plistPath);
+    bool ok = plist && (mutate(plist) == 0 ||
+                        ota_write_disabled_plist(plist, plistPath, tempPath, redir.localDir));
+    ota_end_launchd_dir_redirect(&redir);
+    printf("[DAEMONS] redirected disabled.plist write result=%d\n", ok);
+    return ok;
 }
 
 bool darksword_ota_set_disabled(bool disabled)
@@ -672,7 +773,8 @@ bool darksword_ota_set_disabled(bool disabled)
     bool ok = false;
 
     do {
-        NSMutableDictionary *plist = ota_read_disabled_plist(plistPath);
+        NSMutableDictionary *plist = ota_read_disabled_plist_strict(plistPath);
+        if (!plist) break;   // never rewrite a plist we couldn't read
         int changed = ota_apply_labels(plist, disabled);
 
         if (changed == 0) {

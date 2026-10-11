@@ -257,6 +257,15 @@ extern NSString * const kSettingsFullExploitRequiredMessage;
 extern NSString * const kSettingsLocationServicesLinksEnabled;
 void settings_unlock_filesystem_async(BOOL allowFullExploit,
                                       void (^completion)(BOOL ok, NSString *message));
+// Daemons screen (launchd disabled.plist). `disabled` maps label -> value as
+// stored (nil on failure, with `message`); changes map label -> @YES to
+// disable / @NO to enable. allowFullExploit as above. Completions on main.
+void settings_daemons_read_async(BOOL allowFullExploit,
+                                 void (^completion)(NSDictionary *disabled, NSString *message));
+void settings_daemons_apply_async(NSDictionary<NSString *, NSNumber *> *changes, BOOL allowFullExploit,
+                                  void (^completion)(BOOL ok, NSString *message));
+// The Daemons screen, for pushing from Home's tools.
+UIViewController *settings_make_daemons_viewer(void);
 // System-wide Location Services: desired 1 = on, 0 = off, -1 = toggle.
 // The result is posted as soon as it is confirmed; `completion` (optional)
 // runs on the main queue after cleanup, with how long ago that was.

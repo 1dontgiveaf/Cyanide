@@ -5,6 +5,7 @@
 
 #import "SettingsViewController.h"
 #import "FileBrowserViewController.h"
+#import "DaemonsViewController.h"
 #import <dirent.h>
 #import <fcntl.h>
 #import <sys/stat.h>
@@ -6845,6 +6846,78 @@ void settings_unlock_filesystem_async(BOOL allowFullExploit,
     });
 }
 
+// Daemons screen: launchd's disabled.plist. Like the File Browser, only a
+// live or parked kernel session is used unless the user confirmed a full run.
+static BOOL settings_daemons_kernel_ready(BOOL allowFullExploit, NSString **message)
+{
+    if (settings_ensure_kexploit_for_read()) return YES;
+    if (!allowFullExploit) { *message = kSettingsFullExploitRequiredMessage; return NO; }
+    if (settings_ensure_kexploit()) return YES;
+    *message = @"Kernel access could not be acquired. Run the chain, then try again.";
+    return NO;
+}
+
+void settings_daemons_read_async(BOOL allowFullExploit,
+                                 void (^completion)(NSDictionary *disabled, NSString *message))
+{
+    if (!settings_device_supported()) {
+        NSString *m = settings_unsupported_message();
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(nil, m); });
+        return;
+    }
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        NSDictionary *disabled = nil;
+        NSString *message = nil;
+        if (!settings_try_claim_actions_lock("Daemons", "[DAEMONS] Another action is already running.")) {
+            message = @"Another action is already running. Try again when it has finished.";
+        } else {
+            @try {
+                if (settings_daemons_kernel_ready(allowFullExploit, &message)) {
+                    disabled = launchd_disabled_read();
+                    if (!disabled) message = @"The list of disabled daemons could not be read. Check the log.";
+                }
+            } @finally {
+                settings_release_actions_lock();
+            }
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(disabled, message); });
+    });
+}
+
+void settings_daemons_apply_async(NSDictionary<NSString *, NSNumber *> *changes, BOOL allowFullExploit,
+                                  void (^completion)(BOOL ok, NSString *message))
+{
+    if (!settings_device_supported()) {
+        NSString *m = settings_unsupported_message();
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(NO, m); });
+        return;
+    }
+    NSDictionary *snapshot = [changes copy];
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        BOOL ok = NO;
+        NSString *message = nil;
+        if (!settings_try_claim_actions_lock("Daemons", "[DAEMONS] Another action is already running.")) {
+            message = @"Another action is already running. Try again when it has finished.";
+        } else {
+            @try {
+                if (settings_daemons_kernel_ready(allowFullExploit, &message)) {
+                    NSUInteger off = 0;
+                    for (NSNumber *v in snapshot.allValues) off += v.boolValue;
+                    log_user("[DAEMONS] Disabling %lu, enabling %lu daemon(s)…\n",
+                             (unsigned long)off, (unsigned long)(snapshot.count - off));
+                    ok = launchd_disabled_apply(snapshot);
+                    message = ok ? @"Saved. Restart the device to apply."
+                                 : @"disabled.plist could not be written. Check the log.";
+                    log_user("%s %s\n", ok ? "[OK]" : "[FAIL]", message.UTF8String);
+                }
+            } @finally {
+                settings_release_actions_lock();
+            }
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(ok, message); });
+    });
+}
+
 void settings_application_did_become_active(void)
 {
     // Round 31: same reorder as will_enter_foreground — the gate re-open must
@@ -13610,6 +13683,11 @@ UIViewController *settings_make_file_browser(void)
     return [[FileBrowserViewController alloc] initWithPath:@"/"];
 }
 
+UIViewController *settings_make_daemons_viewer(void)
+{
+    return [[DaemonsViewController alloc] init];
+}
+
 - (NSArray<NSDictionary *> *)allSystemBundleRows
 {
     return @[
@@ -13620,6 +13698,7 @@ UIViewController *settings_make_file_browser(void)
         // drains) — no longer WIP.
         @{ @"title": @"Process Viewer",    @"icon": @"list.bullet.rectangle.fill", @"color": [UIColor systemGrayColor], @"section": @(-1), @"custom": @"procmgr" },
         @{ @"title": @"File Browser",      @"icon": @"folder.fill", @"color": [UIColor systemBlueColor], @"section": @(-1), @"custom": @"filebrowser" },
+        @{ @"title": @"Daemons",           @"icon": @"gearshape.2.fill", @"color": [UIColor systemTealColor], @"section": @(-1), @"custom": @"daemons" },
     ];
 }
 
@@ -17778,6 +17857,10 @@ void cyanide_present_contact(UIViewController *host)
                 if ([bundle[@"custom"] isEqualToString:@"procmgr"]) {
                     ProcessManagerViewController *pm = [[ProcessManagerViewController alloc] initWithStyle:UITableViewStylePlain];
                     [self.navigationController pushViewController:pm animated:YES];
+                    return;
+                }
+                if ([bundle[@"custom"] isEqualToString:@"daemons"]) {
+                    [self.navigationController pushViewController:settings_make_daemons_viewer() animated:YES];
                     return;
                 }
                 if ([bundle[@"custom"] isEqualToString:@"filebrowser"]) {

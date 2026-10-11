@@ -16,4 +16,15 @@ bool darksword_ota_set_disabled(bool disabled);
 //    2 = partially disabled (some but not all)
 int darksword_ota_read_disabled(void);
 
+#ifdef __OBJC__
+#import <Foundation/Foundation.h>
+// launchd's disabled.plist for any Daemons-catalog label (daemon_catalog.h).
+// Both need live kernel access. Changes take effect after a restart.
+// Returns the plist's contents, or nil if it couldn't be read.
+NSDictionary<NSString *, id> *launchd_disabled_read(void);
+// changes: label -> @YES (disable) / @NO (enable, i.e. remove the entry).
+// Labels outside the catalog are refused.
+bool launchd_disabled_apply(NSDictionary<NSString *, NSNumber *> *changes);
+#endif
+
 #endif

@@ -391,6 +391,11 @@ static const CGFloat kMargin = 20.0;
                                          icon:@"folder.fill"
                                         color:UIColor.systemBlueColor
                                           sel:@selector(openFileBrowser)]];
+    [s addArrangedSubview:[self bigActionButton:@"Daemons"
+                                          sub:@"Turn system services off and on"
+                                         icon:@"gearshape.2.fill"
+                                        color:UIColor.systemTealColor
+                                          sel:@selector(openDaemons)]];
     return card;
 }
 
@@ -721,6 +726,11 @@ static const CGFloat kMargin = 20.0;
 - (void)openProcessViewer
 {
     [self.navigationController pushViewController:settings_make_process_viewer() animated:YES];
+}
+
+- (void)openDaemons
+{
+    [self.navigationController pushViewController:settings_make_daemons_viewer() animated:YES];
 }
 
 - (void)openFileBrowser
