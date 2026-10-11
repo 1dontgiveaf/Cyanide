@@ -25,6 +25,7 @@ typedef NS_ENUM(NSInteger, SISection) {
 @property (nonatomic, copy) NSString *name;
 @property (nonatomic) unsigned long long appBytes;
 @property (nonatomic) unsigned long long dataBytes;
+@property (nonatomic, strong) UIImage *icon;
 @end
 @implementation SIApp
 @end
@@ -75,6 +76,42 @@ static unsigned long long si_tree_bytes(NSString *path)
     return total;
 }
 
+// The app's home screen icon at row size: the largest AppIcon PNG in the
+// bundle (most apps still ship them next to the asset catalog), else what
+// iOS hands out for the bundle ID (may be a generic icon in the sandbox).
+static UIImage *si_app_icon(NSString *appDir, NSDictionary *info, NSString *bundleID)
+{
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    NSArray *files = info[@"CFBundleIcons"][@"CFBundlePrimaryIcon"][@"CFBundleIconFiles"];
+    if ([files isKindOfClass:NSArray.class]) [names addObjectsFromArray:files];
+    NSString *iconName = info[@"CFBundleIcons"][@"CFBundlePrimaryIcon"][@"CFBundleIconName"];
+    if ([iconName isKindOfClass:NSString.class]) [names addObject:iconName];
+    UIImage *best = nil;
+    for (NSString *file in [NSFileManager.defaultManager contentsOfDirectoryAtPath:appDir error:nil]) {
+        if (![file.pathExtension.lowercaseString isEqualToString:@"png"]) continue;
+        BOOL match = [file hasPrefix:@"AppIcon"] || [file hasPrefix:@"Icon"];
+        for (NSString *n in names) if ([n isKindOfClass:NSString.class] && [file hasPrefix:n]) match = YES;
+        if (!match) continue;
+        UIImage *img = [UIImage imageWithContentsOfFile:[appDir stringByAppendingPathComponent:file]];
+        if (img && img.size.width * img.scale > best.size.width * best.scale) best = img;
+    }
+    if (!best) {
+        SEL sel = NSSelectorFromString(@"_applicationIconImageForBundleIdentifier:format:scale:");
+        if ([UIImage respondsToSelector:sel]) {
+            UIImage *(*fn)(id, SEL, NSString *, int, CGFloat) = (void *)[UIImage methodForSelector:sel];
+            best = fn(UIImage.class, sel, bundleID, 2 /* home screen size */, UIScreen.mainScreen.scale);
+        }
+    }
+    if (!best) return nil;
+    // Pre-render small and rounded, off the main thread.
+    CGFloat side = 36;
+    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(side, side)];
+    return [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        [[UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, side, side) cornerRadius:side * 0.225] addClip];
+        [best drawInRect:CGRectMake(0, 0, side, side)];
+    }];
+}
+
 static NSString *si_container_identifier(NSString *container)
 {
     NSDictionary *meta = [NSDictionary dictionaryWithContentsOfFile:
@@ -104,6 +141,7 @@ static NSArray<SIApp *> *si_scan_apps(void)
         NSString *name = info[@"CFBundleDisplayName"] ?: info[@"CFBundleName"];
         app.name = [name isKindOfClass:NSString.class] && name.length ? name : (appDir.lastPathComponent.stringByDeletingPathExtension ?: bid);
         app.appBytes = si_tree_bytes(container);
+        if (appDir) app.icon = si_app_icon(appDir, info, bid);
         apps[bid] = app;
     }
     NSString *data = @"/var/mobile/Containers/Data/Application";
@@ -128,7 +166,11 @@ static NSArray<SIApp *> *si_scan_apps(void)
 @property (nonatomic, copy) NSString *appsStatus;
 @property (nonatomic) BOOL readingBattery;
 @property (nonatomic) BOOL scanningApps;
+@property (nonatomic) NSInteger appSort;   // SIAppSort
 @end
+
+typedef NS_ENUM(NSInteger, SIAppSort) { SIAppSortTotal, SIAppSortApp, SIAppSortData, SIAppSortName };
+static NSString * const kSIAppSortKey = @"SystemInfoAppSort";
 
 @implementation SystemInfoViewController
 
@@ -145,6 +187,8 @@ static NSArray<SIApp *> *si_scan_apps(void)
     self.refreshControl = [UIRefreshControl new];
     [self.refreshControl addTarget:self action:@selector(pullToRefresh) forControlEvents:UIControlEventValueChanged];
     self.appsStatus = @"Tap to calculate";
+    self.appSort = [NSUserDefaults.standardUserDefaults integerForKey:kSIAppSortKey];
+    [self updateSortMenu];
     [self refreshLocal];
     [self readBatteryAllowingFullExploit:NO];
 }
@@ -154,6 +198,45 @@ static NSArray<SIApp *> *si_scan_apps(void)
     [self.refreshControl endRefreshing];
     [self refreshLocal];
     [self readBatteryAllowingFullExploit:NO];
+}
+
+#pragma mark Sorting
+
+- (void)updateSortMenu
+{
+    NSArray *titles = @[ @"Total Size", @"App Size", @"Data Size", @"Name" ];
+    NSMutableArray *actions = [NSMutableArray array];
+    __weak typeof(self) weakSelf = self;
+    for (NSInteger i = 0; i < (NSInteger)titles.count; i++) {
+        UIAction *a = [UIAction actionWithTitle:titles[(NSUInteger)i] image:nil identifier:nil handler:^(UIAction *x) {
+            typeof(self) me = weakSelf;
+            me.appSort = i;
+            [NSUserDefaults.standardUserDefaults setInteger:i forKey:kSIAppSortKey];
+            me.apps = [me sortedApps:me.apps];
+            [me updateSortMenu];
+            [me.tableView reloadSections:[NSIndexSet indexSetWithIndex:SISectionApps]
+                        withRowAnimation:UITableViewRowAnimationAutomatic];
+        }];
+        a.state = i == self.appSort ? UIMenuElementStateOn : UIMenuElementStateOff;
+        [actions addObject:a];
+    }
+    UIBarButtonItem *item = [[UIBarButtonItem alloc]
+        initWithImage:[UIImage systemImageNamed:@"arrow.up.arrow.down"]
+                 menu:[UIMenu menuWithTitle:@"Sort Apps By" children:actions]];
+    item.enabled = self.apps.count > 0;
+    self.navigationItem.rightBarButtonItem = item;
+}
+
+- (NSArray<SIApp *> *)sortedApps:(NSArray<SIApp *> *)apps
+{
+    SIAppSort sort = (SIAppSort)self.appSort;
+    return [apps sortedArrayUsingComparator:^NSComparisonResult(SIApp *a, SIApp *b) {
+        if (sort == SIAppSortName) return [a.name localizedCaseInsensitiveCompare:b.name];
+        unsigned long long va = sort == SIAppSortApp ? a.appBytes : sort == SIAppSortData ? a.dataBytes : a.appBytes + a.dataBytes;
+        unsigned long long vb = sort == SIAppSortApp ? b.appBytes : sort == SIAppSortData ? b.dataBytes : b.appBytes + b.dataBytes;
+        if (va != vb) return va > vb ? NSOrderedAscending : NSOrderedDescending;   // largest first
+        return [a.name localizedCaseInsensitiveCompare:b.name];
+    }];
 }
 
 #pragma mark Data
@@ -269,8 +352,9 @@ static NSArray<SIApp *> *si_scan_apps(void)
                 typeof(self) me = weakSelf;
                 if (!me) return;
                 me.scanningApps = NO;
-                me.apps = apps;
+                me.apps = [me sortedApps:apps];
                 me.appsStatus = apps.count ? nil : @"No apps found. Tap to try again.";
+                [me updateSortMenu];
                 [me.tableView reloadData];
             });
         });
@@ -313,7 +397,7 @@ static NSArray<SIApp *> *si_scan_apps(void)
         case SISectionKernel:  return @"Kernel Access";
         case SISectionBattery: return @"Battery";
         case SISectionStorage: return @"Storage";
-        case SISectionApps:    return @"Apps by Size";
+        case SISectionApps:    return self.apps.count ? [NSString stringWithFormat:@"%lu Apps", (unsigned long)self.apps.count] : @"Apps";
         default: return nil;
     }
 }
@@ -395,11 +479,28 @@ static NSArray<SIApp *> *si_scan_apps(void)
             UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"app"];
             if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"app"];
             UIListContentConfiguration *c = [UIListContentConfiguration subtitleCellConfiguration];
-            c.text = [NSString stringWithFormat:@"%@ — %@", app.name, si_bytes(app.appBytes + app.dataBytes)];
-            c.secondaryText = [NSString stringWithFormat:@"App %@ · Data %@ · %@", si_bytes(app.appBytes),
-                               si_bytes(app.dataBytes), app.bundleID];
+            c.image = app.icon ?: [UIImage systemImageNamed:@"app.dashed"];
+            c.imageProperties.maximumSize = CGSizeMake(36, 36);
+            c.imageProperties.reservedLayoutSize = CGSizeMake(36, 36);
+            c.imageProperties.tintColor = UIColor.tertiaryLabelColor;
+            c.text = app.name;
+            c.textProperties.numberOfLines = 1;
+            c.secondaryText = [NSString stringWithFormat:@"App %@ · Data %@", si_bytes(app.appBytes), si_bytes(app.dataBytes)];
             c.secondaryTextProperties.color = UIColor.secondaryLabelColor;
+            c.secondaryTextProperties.numberOfLines = 1;
             cell.contentConfiguration = c;
+            // The sorted-by value, right-aligned in its own column.
+            SIAppSort sort = (SIAppSort)self.appSort;
+            unsigned long long shown = sort == SIAppSortApp ? app.appBytes
+                                     : sort == SIAppSortData ? app.dataBytes : app.appBytes + app.dataBytes;
+            UILabel *total = [UILabel new];
+            total.text = si_bytes(shown);
+            total.font = [UIFont monospacedDigitSystemFontOfSize:15 weight:UIFontWeightSemibold];
+            total.textColor = UIColor.labelColor;
+            total.textAlignment = NSTextAlignmentRight;
+            [total sizeToFit];
+            total.frame = CGRectMake(0, 0, MAX(78, total.bounds.size.width), total.bounds.size.height);
+            cell.accessoryView = total;
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
             return cell;
         }
