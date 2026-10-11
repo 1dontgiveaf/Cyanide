@@ -7055,20 +7055,25 @@ void settings_daemons_read_async(BOOL allowFullExploit,
 
 // ---- System Info ----
 
+// Display only: never base a decision on it. The flags are taken once, up
+// front, so the rows describe one moment (they can change right after).
 NSDictionary *settings_kernel_access_status(void)
 {
+    BOOL live = g_kexploit_done && kexploit_krw_session_active();
+    BOOL parked = krw_persistence_launchd_holds_krw() || krw_persistence_has_saved_recovery();
+    BOOL springboard = g_springboard_rc_ready != 0;
     NSString *state, *detail;
-    if (g_kexploit_done && kexploit_krw_session_active()) {
+    if (live) {
         state = @"Active";
         detail = @"Kernel access is live in Cyanide.";
-    } else if (krw_persistence_launchd_holds_krw() || krw_persistence_has_saved_recovery()) {
+    } else if (parked) {
         state = @"Parked";
         detail = @"Saved in launchd for this boot; restored without a full exploit run.";
     } else {
         state = @"None";
         detail = @"No saved kernel access for this boot; the next use needs a full exploit run.";
     }
-    return @{ @"state": state, @"detail": detail, @"springboard": @(g_springboard_rc_ready != 0) };
+    return @{ @"state": state, @"detail": detail, @"springboard": @(springboard) };
 }
 
 // AppleSmartBattery's registry properties read in this process. The app
