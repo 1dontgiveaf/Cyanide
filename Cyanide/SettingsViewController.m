@@ -2460,9 +2460,6 @@ static void settings_stop_disabled_applied_springboard_tweaks_locked(NSUserDefau
 
 static void settings_handle_springboard_restart(void)
 {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [NSNotificationCenter.defaultCenter postNotificationName:kSettingsSpringBoardRestartedNotification object:nil];
-    });
     // SpringBoard just (re)started. Every pointer we cached from the previous
     // SB incarnation — class addresses, selector slots, retained objects,
     // ivar offsets, the trojan thread, our shmem map — is stale. Calling
@@ -2489,6 +2486,11 @@ static void settings_handle_springboard_restart(void)
             log_user("[APP] SpringBoard restarted; tweak sessions cleared. Hit Run to rebuild.\n");
         }
         settings_notify_remote_call_state_changed();
+        // Only now, with the old session dropped: the respring cover waits
+        // for this, so nothing can reuse stale SpringBoard state meanwhile.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [NSNotificationCenter.defaultCenter postNotificationName:kSettingsSpringBoardRestartedNotification object:nil];
+        });
     });
 }
 
@@ -2874,7 +2876,8 @@ static BOOL settings_has_persistent_springboard_remote_call_user(void)
     return active;
 }
 
-static void settings_wait_live_loops_stopped_for_switch(const char *reason)
+// Returns whether every live loop stopped (NO after the 2 s timeout).
+static BOOL settings_wait_live_loops_stopped_for_switch(const char *reason)
 {
     uint64_t startUS = settings_now_us();
     BOOL logged = NO;
@@ -2895,10 +2898,12 @@ static void settings_wait_live_loops_stopped_for_switch(const char *reason)
         }
         usleep(50000);
     }
-    if (logged && !settings_any_registered_live_loop_running()) {
+    BOOL stopped = !settings_any_registered_live_loop_running();
+    if (logged && stopped) {
         printf("[SETTINGS] live RemoteCall loops stopped%s%s\n",
                reason ? ": " : "", reason ?: "");
     }
+    return stopped;
 }
 
 static void settings_live_loop_sleep_interruptible(uint64_t targetUS,
@@ -3544,7 +3549,7 @@ static void settings_prepare_for_respring_sync(void)
     printf("[SETTINGS] preparing for respring cleanup rcReady=%d\n", g_springboard_rc_ready);
     settings_request_all_live_loops_stop("pre-respring cleanup");
     settings_end_statbar_background_task_async("pre-respring cleanup");
-    settings_wait_live_loops_stopped_for_switch("pre-respring cleanup");
+    BOOL loopsStopped = settings_wait_live_loops_stopped_for_switch("pre-respring cleanup");
 
     g_respring_scheduled = 0;
     uint64_t scheduledNs = 0;
@@ -3560,7 +3565,11 @@ static void settings_prepare_for_respring_sync(void)
             // SB is about to restart, so cleanup uses the fast variant for
             // tweaks where full remote restoration is wasted.
             settings_stop_springboard_tweaks_locked("pre-respring cleanup", YES);
-            if (respring_schedule_in_session(kRespringDelay) != ASRemovalNotScheduled) {
+            // A live loop that didn't stop could still be working when the
+            // relaunch fires: then the WebKit fallback below instead.
+            if (!loopsStopped) {
+                log_user("[RESPRING] A live tweak loop didn't stop in time; using the fallback respring.\n");
+            } else if (respring_schedule_in_session(kRespringDelay) != ASRemovalNotScheduled) {
                 g_respring_scheduled = 1;
                 scheduledNs = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
             }
@@ -6991,6 +7000,11 @@ static NSDictionary *settings_daemons_running(void)
     }
     free(buf);
     NSDictionary *programs = settings_launchd_job_programs();
+    // Labels sharing one executable (the logd jobs) can't be told apart by
+    // process: their rows say "shared" instead of claiming the pid.
+    NSCountedSet *exeUse = [NSCountedSet set];
+    for (CYDaemonGroup *g in daemon_catalog_groups())
+        for (NSString *label in g.labels) [exeUse addObject:programs[label] ?: daemon_catalog_executable_guess(label)];
     NSMutableDictionary *out = [NSMutableDictionary dictionary];
     for (CYDaemonGroup *g in daemon_catalog_groups()) {
         for (NSString *label in g.labels) {
@@ -6998,7 +7012,13 @@ static NSDictionary *settings_daemons_running(void)
             // The kernel keeps at most 31 characters of the name.
             NSString *key = exe.length > sizeof(buf->name) - 1 ? [exe substringToIndex:sizeof(buf->name) - 1] : exe;
             NSNumber *pid = pids[key];
-            out[label] = pid != nil ? @{ @"name": exe, @"pid": pid } : @{ @"name": exe };
+            NSMutableDictionary *info = [NSMutableDictionary dictionaryWithObject:exe forKey:@"name"];
+            if (pid != nil) info[@"pid"] = pid;
+            if ([exeUse countForObject:exe] > 1) info[@"shared"] = @([exeUse countForObject:exe]);
+            // With the job cache read, a label it doesn't list isn't a job
+            // on this iOS version.
+            if (programs && !programs[label]) info[@"missing"] = @YES;
+            out[label] = info;
         }
     }
     return out;
@@ -7120,7 +7140,8 @@ void settings_battery_info_async(BOOL allowFullExploit,
         NSDictionary *battery = settings_battery_props_local();
         NSString *source = @"Cyanide";
         NSString *message = nil;
-        if (battery[@"CycleCount"] == nil) {
+        // Usable when it has the cycle count, at the top level or nested.
+        if (battery[@"CycleCount"] == nil && battery[@"BatteryData"][@"CycleCount"] == nil) {
             battery = nil;
             source = @"SpringBoard";
             if (!settings_device_supported()) {

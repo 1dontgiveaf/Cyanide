@@ -46,6 +46,9 @@ bool     r_msg2_main_raw_async(uint64_t obj, const char *selName,
 // may not have run; never blindly retry a mutator on false.
 bool     r_last_call_ok(void);
 bool     r_last_main_ok(void);
+// After a failed r_msg_main_raw: true when the call reached the main-thread
+// dispatch (it may have run), false when it failed during setup (it didn't).
+bool     r_last_main_sent(void);
 uint64_t r_msg_main_raw(uint64_t obj, uint64_t sel,
                         const void *a0, size_t a0Size,
                         const void *a1, size_t a1Size,

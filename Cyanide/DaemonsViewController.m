@@ -12,8 +12,10 @@
 // the screen reminds the user that changes are pending.
 static NSString * const kDaemonsChangedBootKey = @"DaemonsChangedBootUUID";
 
-// Set once the user has acknowledged the brick warning.
-static NSString * const kDaemonsWarningAcceptedKey = @"DaemonsWarningAccepted";
+// The catalog version whose brick warning the user acknowledged. Bump
+// kDaemonsWarningVersion when the list gets riskier, to warn again.
+static NSString * const kDaemonsWarningAcceptedKey = @"DaemonsWarningAcceptedVersion";
+static const NSInteger kDaemonsWarningVersion = 1;
 // Shows the advanced groups (services other parts of iOS rely on).
 static NSString * const kDaemonsShowAdvancedKey = @"DaemonsShowAdvanced";
 
@@ -61,6 +63,7 @@ static void daemons_note_change(NSArray<NSString *> *labels)
 - (void)setLabels:(NSArray<NSString *> *)labels disabled:(BOOL)disable from:(UIViewController *)presenter;
 - (BOOL)isLabelDisabled:(NSString *)label;
 - (BOOL)willBeDisabled:(NSString *)label;
+- (BOOL)isLabelMissing:(NSString *)label;
 - (BOOL)warningAccepted;
 - (NSString *)statusForLabel:(NSString *)label warning:(BOOL *)warning;
 @end
@@ -114,7 +117,8 @@ static void daemons_note_change(NSArray<NSString *> *labels)
     cell.selectionStyle = UITableViewCellSelectionStyleNone;
     UISwitch *sw = [UISwitch new];
     sw.on = ![self.owner willBeDisabled:label];
-    sw.enabled = self.owner.disabled && !self.owner.busy;
+    sw.enabled = self.owner.disabled && !self.owner.busy &&
+                 !([self.owner isLabelMissing:label] && ![self.owner isLabelDisabled:label]);
     __weak typeof(self) weakSelf = self;
     [sw addAction:[UIAction actionWithHandler:^(UIAction *a) {
         typeof(self) me = weakSelf;
@@ -167,7 +171,7 @@ static void daemons_note_change(NSArray<NSString *> *labels)
 // and one that stops iOS from booting can't be undone from Cyanide.
 - (void)showWarningIfNeeded
 {
-    if ([NSUserDefaults.standardUserDefaults boolForKey:kDaemonsWarningAcceptedKey]) return;
+    if (self.warningAccepted) return;
     if (self.presentedViewController) return;
     UIAlertController *ac = [UIAlertController
         alertControllerWithTitle:@"Disabling Daemons Can Brick Your Device"
@@ -183,7 +187,7 @@ static void daemons_note_change(NSArray<NSString *> *labels)
         [weakSelf.navigationController popViewControllerAnimated:YES];
     }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"I Understand" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
-        [NSUserDefaults.standardUserDefaults setBool:YES forKey:kDaemonsWarningAcceptedKey];
+        [NSUserDefaults.standardUserDefaults setInteger:kDaemonsWarningVersion forKey:kDaemonsWarningAcceptedKey];
         [weakSelf refreshUI];
     }]];
     [self presentViewController:ac animated:YES completion:nil];
@@ -191,7 +195,13 @@ static void daemons_note_change(NSArray<NSString *> *labels)
 
 - (BOOL)warningAccepted
 {
-    return [NSUserDefaults.standardUserDefaults boolForKey:kDaemonsWarningAcceptedKey];
+    return [NSUserDefaults.standardUserDefaults integerForKey:kDaemonsWarningAcceptedKey] >= kDaemonsWarningVersion;
+}
+
+// Not a launchd job on this iOS version (only known when the job cache was read).
+- (BOOL)isLabelMissing:(NSString *)label
+{
+    return [self.running[label][@"missing"] boolValue];
 }
 
 - (void)pullToRefresh
@@ -228,8 +238,14 @@ static void daemons_note_change(NSArray<NSString *> *labels)
     NSDictionary *info = self.running[label];
     NSString *name = info[@"name"] ?: daemon_catalog_executable_guess(label);
     if (!self.running) return [name stringByAppendingString:@" · status unknown"];
+    if ([info[@"missing"] boolValue]) return [name stringByAppendingString:@" · not a job on this iOS version"];
     NSNumber *pid = info[@"pid"];
+    NSNumber *shared = info[@"shared"];
     BOOL off = [self isLabelDisabled:label];
+    // One process for several jobs: which job runs it is unknown.
+    if (shared != nil)
+        return pid != nil ? [NSString stringWithFormat:@"%@ · Running · PID %@ · shared by %@ jobs", name, pid, shared]
+                          : [NSString stringWithFormat:@"%@ · Not running · shared by %@ jobs", name, shared];
     BOOL changed = [daemons_changed_this_boot() containsObject:label];
     if (pid && off && changed)
         return [NSString stringWithFormat:@"%@ · Running · PID %@ · stops after restart", name, pid];
@@ -288,6 +304,7 @@ static void daemons_note_change(NSArray<NSString *> *labels)
     if (disable && !self.warningAccepted) { [self refreshUI]; [self showWarningIfNeeded]; return; }
     if (self.busy || !self.disabled) { [self refreshUI]; return; }
     for (NSString *label in labels) {
+        if (disable && [self isLabelMissing:label] && ![self isLabelDisabled:label]) continue;   // nothing to disable
         if (disable == [self isLabelDisabled:label]) [self.staged removeObjectForKey:label];
         else self.staged[label] = @(disable);
     }
@@ -519,7 +536,9 @@ static void daemons_note_change(NSArray<NSString *> *labels)
 
     UISwitch *sw = [UISwitch new];
     sw.on = off == 0;   // partly disabled shows as off
-    sw.enabled = self.disabled && !self.busy;
+    BOOL anyUsable = NO;
+    for (NSString *label in g.labels) anyUsable |= ![self isLabelMissing:label] || [self isLabelDisabled:label];
+    sw.enabled = self.disabled && !self.busy && anyUsable;
     __weak typeof(self) weakSelf = self;
     NSArray *labels = g.labels;
     [sw addAction:[UIAction actionWithHandler:^(UIAction *a) {

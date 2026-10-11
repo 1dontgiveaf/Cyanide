@@ -26,6 +26,7 @@ typedef NS_ENUM(NSInteger, SISection) {
 @property (nonatomic) unsigned long long appBytes;
 @property (nonatomic) unsigned long long dataBytes;
 @property (nonatomic, strong) UIImage *icon;
+@property (nonatomic) BOOL incomplete;   // a size couldn't be read fully: at least this much
 @end
 @implementation SIApp
 @end
@@ -52,18 +53,19 @@ static NSString *si_duration(NSTimeInterval t)
     return [NSString stringWithFormat:@"%ldm", m];
 }
 
-// Allocated size of a directory tree (hard links counted once).
-static unsigned long long si_tree_bytes(NSString *path)
+// Allocated size of a directory tree (hard links counted once). *complete
+// is cleared when part of it couldn't be read: the size is then a minimum.
+static unsigned long long si_tree_bytes(NSString *path, BOOL *complete)
 {
     char *paths[] = { (char *)path.fileSystemRepresentation, NULL };
     FTS *fts = fts_open(paths, FTS_PHYSICAL | FTS_NOCHDIR | FTS_XDEV, NULL);
-    if (!fts) return 0;
+    if (!fts) { *complete = NO; return 0; }
     unsigned long long total = 0;
     NSMutableSet<NSString *> *links = [NSMutableSet set];
     FTSENT *e;
     while ((e = fts_read(fts))) {
+        if (e->fts_info == FTS_DNR || e->fts_info == FTS_ERR || e->fts_info == FTS_NS) { *complete = NO; continue; }
         if (e->fts_info == FTS_DP || !e->fts_statp) continue;
-        if (e->fts_info == FTS_DNR || e->fts_info == FTS_ERR || e->fts_info == FTS_NS) continue;
         struct stat *st = e->fts_statp;
         if (!S_ISDIR(st->st_mode) && st->st_nlink > 1) {
             NSString *key = [NSString stringWithFormat:@"%d:%llu", st->st_dev, (unsigned long long)st->st_ino];
@@ -140,7 +142,9 @@ static NSArray<SIApp *> *si_scan_apps(void)
         app.bundleID = bid;
         NSString *name = info[@"CFBundleDisplayName"] ?: info[@"CFBundleName"];
         app.name = [name isKindOfClass:NSString.class] && name.length ? name : (appDir.lastPathComponent.stringByDeletingPathExtension ?: bid);
-        app.appBytes = si_tree_bytes(container);
+        BOOL complete = YES;
+        app.appBytes = si_tree_bytes(container, &complete);
+        if (!complete) app.incomplete = YES;
         if (appDir) app.icon = si_app_icon(appDir, info, bid);
         apps[bid] = app;
     }
@@ -148,7 +152,10 @@ static NSArray<SIApp *> *si_scan_apps(void)
     for (NSString *uuid in [fm contentsOfDirectoryAtPath:data error:nil]) {
         NSString *container = [data stringByAppendingPathComponent:uuid];
         SIApp *app = apps[si_container_identifier(container) ?: @""];
-        if (app) app.dataBytes += si_tree_bytes(container);   // system apps' data is skipped
+        if (!app) continue;   // system apps' data, or metadata that couldn't be read
+        BOOL complete = YES;
+        app.dataBytes += si_tree_bytes(container, &complete);
+        if (!complete) app.incomplete = YES;
     }
     return [apps.allValues sortedArrayUsingComparator:^NSComparisonResult(SIApp *a, SIApp *b) {
         unsigned long long ta = a.appBytes + a.dataBytes, tb = b.appBytes + b.dataBytes;
@@ -198,6 +205,7 @@ static NSString * const kSIAppSortKey = @"SystemInfoAppSort";
     [self.refreshControl endRefreshing];
     [self refreshLocal];
     [self readBatteryAllowingFullExploit:NO];
+    if (self.apps.count) [self scanAppsAllowingFullExploit:NO];   // only once calculated
 }
 
 #pragma mark Sorting
@@ -330,10 +338,14 @@ static NSString * const kSIAppSortKey = @"SystemInfoAppSort";
         typeof(self) me = weakSelf;
         if (!me) return;
         me.readingBattery = NO;
-        if (battery) [me applyBattery:battery source:source];
-        else if ([message isEqualToString:kSettingsFullExploitRequiredMessage])
-            me.batteryStatus = @"Needs kernel access, and there is no saved session. Tap to run the full exploit.";
-        else me.batteryStatus = message ?: @"Unavailable.";
+        if (battery) {
+            [me applyBattery:battery source:source];
+        } else {
+            me.batteryRows = nil;   // never show an old reading as current
+            me.batteryStatus = [message isEqualToString:kSettingsFullExploitRequiredMessage]
+                ? @"Needs kernel access, and there is no saved session. Tap to run the full exploit."
+                : (message ?: @"Unavailable.");
+        }
         [me refreshLocal];   // kernel state may have changed too
     });
 }
@@ -353,7 +365,7 @@ static NSString * const kSIAppSortKey = @"SystemInfoAppSort";
                 if (!me) return;
                 me.scanningApps = NO;
                 me.apps = [me sortedApps:apps];
-                me.appsStatus = apps.count ? nil : @"No apps found. Tap to try again.";
+                me.appsStatus = apps.count ? nil : @"No apps could be read. Tap to try again.";
                 [me updateSortMenu];
                 [me.tableView reloadData];
             });
@@ -407,7 +419,8 @@ static NSString * const kSIAppSortKey = @"SystemInfoAppSort";
     if (section == SISectionBattery) return self.batteryStatus;
     if (section == SISectionApps)
         return @"Installed apps only, app bundle plus data container. Shared App Group data and system apps are not "
-               @"included, so iOS Settings can show larger numbers.";
+               @"included, so iOS Settings can show larger numbers. “≥” marks an app whose folders couldn't all be read. "
+               @"Pull down to recalculate.";
     return nil;
 }
 
@@ -485,7 +498,8 @@ static NSString * const kSIAppSortKey = @"SystemInfoAppSort";
             c.imageProperties.tintColor = UIColor.tertiaryLabelColor;
             c.text = app.name;
             c.textProperties.numberOfLines = 1;
-            c.secondaryText = [NSString stringWithFormat:@"App %@ · Data %@", si_bytes(app.appBytes), si_bytes(app.dataBytes)];
+            c.secondaryText = [NSString stringWithFormat:@"App %@ · Data %@%@", si_bytes(app.appBytes), si_bytes(app.dataBytes),
+                               app.incomplete ? @" · partly unreadable" : @""];
             c.secondaryTextProperties.color = UIColor.secondaryLabelColor;
             c.secondaryTextProperties.numberOfLines = 1;
             cell.contentConfiguration = c;
@@ -494,7 +508,7 @@ static NSString * const kSIAppSortKey = @"SystemInfoAppSort";
             unsigned long long shown = sort == SIAppSortApp ? app.appBytes
                                      : sort == SIAppSortData ? app.dataBytes : app.appBytes + app.dataBytes;
             UILabel *total = [UILabel new];
-            total.text = si_bytes(shown);
+            total.text = app.incomplete ? [@"≥ " stringByAppendingString:si_bytes(shown)] : si_bytes(shown);
             total.font = [UIFont monospacedDigitSystemFontOfSize:15 weight:UIFontWeightSemibold];
             total.textColor = UIColor.labelColor;
             total.textAlignment = NSTextAlignmentRight;

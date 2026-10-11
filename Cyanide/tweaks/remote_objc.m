@@ -248,6 +248,10 @@ static __thread bool t_r_main_ok = false;
 
 bool r_last_call_ok(void) { return t_r_last_ok; }
 bool r_last_main_ok(void) { return t_r_main_ok; }
+// Whether the last r_msg_main_raw got as far as handing the call to the main
+// thread: false means it failed during setup and nothing can have run.
+static __thread bool t_r_main_sent = false;
+bool r_last_main_sent(void) { return t_r_main_sent; }
 static __thread bool t_r_async_maybe_ran = false;
 bool r_last_async_maybe_ran(void) { return t_r_async_maybe_ran; }
 
@@ -690,6 +694,7 @@ uint64_t r_msg_main_raw(uint64_t obj, uint64_t sel,
                         const void *a2, size_t a2Size,
                         const void *a3, size_t a3Size)
 {
+    t_r_main_sent = false;
     if (!r_is_objc_ptr(obj) || !sel) { t_r_main_ok = false; return 0; }
 
     const void *const cachedArgs[4] = { a0, a1, a2, a3 };
@@ -697,6 +702,7 @@ uint64_t r_msg_main_raw(uint64_t obj, uint64_t sel,
     uint64_t cachedRet = 0;
     RCachedResult cached = r_msg_main_cached(obj, sel, cachedArgs, cachedSizes, &cachedRet);
     if (cached != R_CACHED_NOT_DISPATCHED) {
+        t_r_main_sent = true;   // FAILED is only reported once the dispatch started
         t_r_main_ok = (cached == R_CACHED_OK);
         return cachedRet;
     }
@@ -761,6 +767,7 @@ uint64_t r_msg_main_raw(uint64_t obj, uint64_t sel,
         r_msg2(inv, "release", 0, 0, 0, 0);
         return 0;
     }
+    t_r_main_sent = true;
     r_invoke_on_main_wait(inv, performSel, invokeSel);
     if (!t_r_last_ok) {
         // The selector may or may not have run; report failure, don't retry.
@@ -1074,7 +1081,8 @@ int r_invoke_after_delay(uint64_t obj, const char *selName, const void *a0, size
         r_msg2_main_raw(inv, "performSelector:withObject:afterDelay:",
                         &invokeSel, sizeof(invokeSel), &nilObject, sizeof(nilObject),
                         &delay, sizeof(delay), NULL, 0);
-        result = r_last_main_ok() ? R_DELAY_SCHEDULED : R_DELAY_UNKNOWN;
+        // A setup failure before the dispatch means no timer exists.
+        result = r_last_main_ok() ? R_DELAY_SCHEDULED : r_last_main_sent() ? R_DELAY_UNKNOWN : R_DELAY_NOT_SCHEDULED;
     }
 out:
     if (inv) r_msg2(inv, "release", 0, 0, 0, 0);
