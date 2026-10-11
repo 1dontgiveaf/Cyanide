@@ -25,6 +25,8 @@ static const NSTimeInterval kAutoCheckMinInterval = 24 * 60 * 60; // 24h
 // a long-resident process re-checks after the throttle window elapses.
 @property (nonatomic, assign) BOOL didCompleteAutoCheckThisProcess;
 @property (nonatomic, assign) BOOL autoCheckInFlight;
+// A manual check owns the screen: no automatic check or prompt meanwhile.
+@property (nonatomic, assign) BOOL manualCheckInFlight;
 @end
 
 @implementation UpdateChecker
@@ -77,7 +79,7 @@ static NSString *update_http_failure(NSURLResponse *response)
 - (void)checkForUpdatesIfNeededFrom:(UIViewController *)presenter
 {
     if (!presenter) return;
-    if (self.autoCheckInFlight) return;
+    if (self.autoCheckInFlight || self.manualCheckInFlight) return;
 
     // Two-gate policy: fire when EITHER this process hasn't completed an
     // auto-check yet, OR the persisted throttle window has elapsed. The
@@ -178,6 +180,13 @@ static NSString *update_http_failure(NSURLResponse *response)
                latest.UTF8String, current.UTF8String);
 
         dispatch_async(dispatch_get_main_queue(), ^{
+            // Not over a manual check, not from a screen that went away, and
+            // not on top of another alert.
+            if (strongSelf.manualCheckInFlight || !presenter.view.window ||
+                UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return;
+            UIViewController *top = presenter;
+            while (top.presentedViewController) top = top.presentedViewController;
+            if ([top isKindOfClass:UIAlertController.class]) return;
             [strongSelf presentUpdateAlertFrom:presenter
                                         latest:latest
                                        current:current
@@ -192,6 +201,8 @@ static NSString *update_http_failure(NSURLResponse *response)
 {
     if (!presenter) return;
 
+    if (self.manualCheckInFlight) return;
+    self.manualCheckInFlight = YES;
     printf("[UPDATE] manual check requested (current=%s)\n",
            self.currentVersion.UTF8String);
 
@@ -257,6 +268,7 @@ static NSString *update_http_failure(NSURLResponse *response)
         }
 
         dispatch_async(dispatch_get_main_queue(), ^{
+            weakSelf.manualCheckInFlight = NO;
             [checking dismissViewControllerAnimated:YES completion:^{
                 if (failureReason) {
                     printf("[UPDATE] manual check failed: %s\n", failureReason.UTF8String);

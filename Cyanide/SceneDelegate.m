@@ -341,7 +341,14 @@ static BOOL scene_parse_location_url(NSURL *url, int *desiredOut, BOOL *keepCard
         return NO;
     }
     BOOL keep = NO, showLog = NO;
+    NSMutableSet<NSString *> *seen = [NSMutableSet set];
     for (NSURLQueryItem *item in c.queryItems) {
+        // An option given twice has no clear meaning: refuse it.
+        if ([seen containsObject:item.name]) {
+            *error = [NSString stringWithFormat:@"Option \"%@\" is given more than once.", item.name];
+            return NO;
+        }
+        [seen addObject:item.name ?: @""];
         BOOL value;
         if (!scene_parse_bool(item.value, &value)) {
             *error = [NSString stringWithFormat:@"%@ must be 1 or 0, not \"%@\".", item.name, item.value ?: @""];
