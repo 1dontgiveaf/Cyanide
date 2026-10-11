@@ -788,8 +788,13 @@ static NSArray<NSDictionary *> *settings_repotweaks_tweaks_for_url(NSString *rep
 }
 @end
 
+// Posted on the main queue when SpringBoard has restarted (the respring
+// overlay waits for it).
+static NSString * const kSettingsSpringBoardRestartedNotification = @"CYSpringBoardRestarted";
+
 @interface DSRespringOverlayView : UIView
 @property (nonatomic, assign) BOOL direct;   // SpringBoard relaunch scheduled: no WebKit payload
+@property (nonatomic, strong) id restartObserver;
 @property (nonatomic, strong) WKWebView *webView;
 @property (nonatomic, assign) BOOL didLoadPayload;
 @end
@@ -849,6 +854,12 @@ static NSArray<NSDictionary *> *settings_repotweaks_tweaks_for_url(NSString *rep
     if (self.window) [self loadRespringPayload];
 }
 
+- (void)removeFromSuperview {
+    if (self.restartObserver) [NSNotificationCenter.defaultCenter removeObserver:self.restartObserver];
+    self.restartObserver = nil;
+    [super removeFromSuperview];
+}
+
 - (void)layoutSubviews {
     [super layoutSubviews];
     self.webView.frame = self.bounds;
@@ -859,6 +870,21 @@ static NSArray<NSDictionary *> *settings_repotweaks_tweaks_for_url(NSString *rep
     self.didLoadPayload = YES;
     if (self.direct) {
         printf("[RESPRING] waiting for SpringBoard to restart\n");
+        // Cyanide usually survives this respring: take the cover away once
+        // SpringBoard is back, or after a while if that isn't noticed.
+        __weak typeof(self) weakSelf = self;
+        id observer = [NSNotificationCenter.defaultCenter
+            addObserverForName:kSettingsSpringBoardRestartedNotification object:nil
+                         queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+            printf("[RESPRING] SpringBoard is back; removing the respring cover\n");
+            [weakSelf removeFromSuperview];
+        }];
+        self.restartObserver = observer;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (!weakSelf.superview) return;
+            printf("[RESPRING] no SpringBoard restart seen after 15 s; removing the respring cover\n");
+            [weakSelf removeFromSuperview];
+        });
         UIActivityIndicatorView *spinner =
             [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
         spinner.color = UIColor.whiteColor;
@@ -2432,6 +2458,9 @@ static void settings_stop_disabled_applied_springboard_tweaks_locked(NSUserDefau
 
 static void settings_handle_springboard_restart(void)
 {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [NSNotificationCenter.defaultCenter postNotificationName:kSettingsSpringBoardRestartedNotification object:nil];
+    });
     // SpringBoard just (re)started. Every pointer we cached from the previous
     // SB incarnation — class addresses, selector slots, retained objects,
     // ivar offsets, the trojan thread, our shmem map — is stale. Calling
