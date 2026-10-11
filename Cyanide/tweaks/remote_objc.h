@@ -89,6 +89,10 @@ uint64_t r_perform_main(uint64_t obj, uint64_t sel, uint64_t object, bool wait);
 uint64_t r_cfstr(const char *s);
 uint64_t r_nsstr_retained(const char *s);
 bool     r_responds(uint64_t obj, const char *selName);
+// Schedules [obj selName:a0] on the target's main run loop after `delay`
+// seconds, with a0 (≤ 8 bytes, e.g. a BOOL) or no argument (a0 = NULL).
+enum { R_DELAY_NOT_SCHEDULED = 0, R_DELAY_SCHEDULED = 1, R_DELAY_UNKNOWN = 2 };
+int      r_invoke_after_delay(uint64_t obj, const char *selName, const void *a0, size_t a0Size, double delay);
 bool     r_responds_main(uint64_t obj, const char *selName);
 bool     r_is_objc_ptr(uint64_t ptr);
 uint64_t r_ivar_value(uint64_t obj, const char *ivarName);

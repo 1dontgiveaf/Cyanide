@@ -10,41 +10,57 @@
 #import <Foundation/Foundation.h>
 #import <stdio.h>
 
-// No-argument relaunch selectors on SpringBoard's application object, newest
-// first. Only selectors without arguments: performSelector:withObject:
-// afterDelay: passes an object, not a BOOL.
-static const char *const kRelaunchSelectors[] = {
+// Older no-argument relaunch selectors on SpringBoard's application object
+// (gone on iOS 18.5, kept as a fallback).
+static const char *const kAppRelaunchSelectors[] = {
     "_relaunchSpringBoardNow",
     "relaunchSpringBoard",
 };
 
+static ASRemovalResult respring_result(int r)
+{
+    return r == R_DELAY_SCHEDULED ? ASRemovalScheduled
+         : r == R_DELAY_UNKNOWN   ? ASRemovalUnknown
+                                  : ASRemovalNotScheduled;
+}
+
 ASRemovalResult respring_schedule_in_session(double delaySeconds)
 {
+    // FrontBoard's own restart: -[FBSystemService exitAndRelaunch:YES], as
+    // SpringBoard does for a settings change that needs a respring.
+    uint64_t fbs = r_class("FBSystemService");
+    if (r_is_objc_ptr(fbs) && r_responds(fbs, "sharedInstance")) {
+        uint64_t service = r_msg2_main(fbs, "sharedInstance", 0, 0, 0, 0);
+        if (r_is_objc_ptr(service) && r_responds(service, "exitAndRelaunch:")) {
+            BOOL relaunch = YES;
+            int r = r_invoke_after_delay(service, "exitAndRelaunch:", &relaunch, sizeof(relaunch), delaySeconds);
+            printf("[RESPRING] -[FBSystemService exitAndRelaunch:YES] %s (in %.2fs)\n",
+                   r == R_DELAY_SCHEDULED ? "scheduled" :
+                   r == R_DELAY_UNKNOWN ? "result UNKNOWN (treated as scheduled)" : "could not be scheduled",
+                   delaySeconds);
+            if (r != R_DELAY_NOT_SCHEDULED) return respring_result(r);
+        } else {
+            printf("[RESPRING] FBSystemService has no usable exitAndRelaunch:\n");
+        }
+    } else {
+        printf("[RESPRING] FBSystemService not found\n");
+    }
+
     uint64_t appClass = r_class("UIApplication");
-    if (!r_is_objc_ptr(appClass)) return ASRemovalNotScheduled;
-    uint64_t app = r_msg2_main(appClass, "sharedApplication", 0, 0, 0, 0);
+    uint64_t app = r_is_objc_ptr(appClass) ? r_msg2_main(appClass, "sharedApplication", 0, 0, 0, 0) : 0;
     if (!r_is_objc_ptr(app)) {
         printf("[RESPRING] SpringBoard's application object not found\n");
         return ASRemovalNotScheduled;
     }
-    const char *relaunch = NULL;
-    for (size_t i = 0; i < sizeof(kRelaunchSelectors) / sizeof(kRelaunchSelectors[0]); i++) {
-        if (r_responds(app, kRelaunchSelectors[i])) { relaunch = kRelaunchSelectors[i]; break; }
+    for (size_t i = 0; i < sizeof(kAppRelaunchSelectors) / sizeof(kAppRelaunchSelectors[0]); i++) {
+        if (!r_responds(app, kAppRelaunchSelectors[i])) continue;
+        int r = r_invoke_after_delay(app, kAppRelaunchSelectors[i], NULL, 0, delaySeconds);
+        printf("[RESPRING] -[SpringBoard %s] %s (in %.2fs)\n", kAppRelaunchSelectors[i],
+               r == R_DELAY_SCHEDULED ? "scheduled" :
+               r == R_DELAY_UNKNOWN ? "result UNKNOWN (treated as scheduled)" : "could not be scheduled",
+               delaySeconds);
+        if (r != R_DELAY_NOT_SCHEDULED) return respring_result(r);
     }
-    if (!relaunch) {
-        printf("[RESPRING] no relaunch selector on SpringBoard\n");
-        return ASRemovalNotScheduled;
-    }
-    uint64_t sel = r_sel(relaunch);
-    if (!sel) return ASRemovalNotScheduled;
-    // On SpringBoard's main thread: afterDelay: uses the calling thread's run
-    // loop, and our synthetic call thread has none.
-    uint64_t nilArg = 0;
-    double delay = delaySeconds;
-    r_msg2_main_raw(app, "performSelector:withObject:afterDelay:",
-                    &sel, sizeof(sel), &nilArg, sizeof(nilArg), &delay, sizeof(delay), NULL, 0);
-    ASRemovalResult r = r_last_main_ok() ? ASRemovalScheduled : ASRemovalUnknown;
-    printf("[RESPRING] -[SpringBoard %s] %s (in %.2fs)\n", relaunch,
-           r == ASRemovalScheduled ? "scheduled" : "result UNKNOWN (treated as scheduled)", delaySeconds);
-    return r;
+    printf("[RESPRING] no relaunch method found in SpringBoard\n");
+    return ASRemovalNotScheduled;
 }

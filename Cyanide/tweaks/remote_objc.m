@@ -1026,6 +1026,62 @@ out:
     return ok;
 }
 
+// [obj selName:a0] on the target's main run loop, `delay` seconds from now:
+// an NSInvocation (arguments retained) whose -invoke is scheduled with
+// performSelector:withObject:afterDelay: -- unlike that call alone, this
+// passes non-object arguments such as a BOOL. The timer keeps the invocation
+// alive; ours is released right away. Returns R_DELAY_NOT_SCHEDULED when
+// nothing can fire, R_DELAY_SCHEDULED, or R_DELAY_UNKNOWN when the
+// scheduling call was sent but its result was lost (treat as scheduled).
+int r_invoke_after_delay(uint64_t obj, const char *selName, const void *a0, size_t a0Size, double delay)
+{
+    if (!r_is_objc_ptr(obj) || !selName || a0Size > 8) return R_DELAY_NOT_SCHEDULED;
+    uint64_t sel = r_sel(selName);
+    uint64_t invokeSel = r_sel("invoke");
+    if (!sel || !invokeSel) return R_DELAY_NOT_SCHEDULED;
+    uint64_t sig = r_method_signature(obj, sel);   // retained
+    if (!r_is_objc_ptr(sig)) return R_DELAY_NOT_SCHEDULED;
+
+    int result = R_DELAY_NOT_SCHEDULED;
+    uint64_t inv = 0;
+    uint64_t NSInvocation = r_class("NSInvocation");
+    if (!r_is_objc_ptr(NSInvocation)) goto out;
+    inv = r_msg_retained_return(NSInvocation, r_sel("invocationWithMethodSignature:"), sig, 0, 0, 0);
+    if (!r_is_objc_ptr(inv)) { inv = 0; goto out; }
+    {
+        uint64_t numArgs = r_msg2(sig, "numberOfArguments", 0, 0, 0, 0);
+        if (!t_r_last_ok || numArgs != (a0 ? 3u : 2u)) goto out;   // exactly the arguments we pass
+        r_msg2(inv, "setTarget:", obj, 0, 0, 0);
+        if (!t_r_last_ok) goto out;
+        r_msg2(inv, "setSelector:", sel, 0, 0, 0);
+        if (!t_r_last_ok) goto out;
+        if (a0) {
+            uint64_t argBuf = r_call_stable(R_TIMEOUT, "calloc", 1, 8, 0, 0, 0, 0, 0, 0);
+            if (!t_r_last_ok || !argBuf) goto out;
+            bool argOK = r_write_remote_arg(argBuf, a0, a0Size, 8);
+            if (argOK) {
+                r_msg2(inv, "setArgument:atIndex:", argBuf, 2, 0, 0);
+                argOK = t_r_last_ok;
+            }
+            r_free(argBuf);
+            if (!argOK) goto out;
+        }
+        r_msg2(inv, "retainArguments", 0, 0, 0, 0);
+        if (!t_r_last_ok) goto out;
+        // On the main thread: afterDelay: uses the calling thread's run loop,
+        // and our synthetic call thread has none.
+        uint64_t nilObject = 0;
+        r_msg2_main_raw(inv, "performSelector:withObject:afterDelay:",
+                        &invokeSel, sizeof(invokeSel), &nilObject, sizeof(nilObject),
+                        &delay, sizeof(delay), NULL, 0);
+        result = r_last_main_ok() ? R_DELAY_SCHEDULED : R_DELAY_UNKNOWN;
+    }
+out:
+    if (inv) r_msg2(inv, "release", 0, 0, 0, 0);
+    r_msg(sig, r_sel("release"), 0, 0, 0, 0);
+    return result;
+}
+
 uint64_t r_perform_main(uint64_t obj, uint64_t sel, uint64_t object, bool wait)
 {
     if (!r_is_objc_ptr(obj) || !sel) return 0;
