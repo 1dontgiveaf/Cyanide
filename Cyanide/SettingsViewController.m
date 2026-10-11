@@ -18,6 +18,7 @@
 #import "tweaks/sbcustomizer.h"
 #import "tweaks/location_services.h"
 #import "tweaks/app_switcher.h"
+#import "tweaks/respring.h"
 #import "tweaks/powercuff.h"
 #import "tweaks/statbar.h"
 #import "tweaks/experimental_tweaks.h"
@@ -788,6 +789,7 @@ static NSArray<NSDictionary *> *settings_repotweaks_tweaks_for_url(NSString *rep
 @end
 
 @interface DSRespringOverlayView : UIView
+@property (nonatomic, assign) BOOL direct;   // SpringBoard relaunch scheduled: no WebKit payload
 @property (nonatomic, strong) WKWebView *webView;
 @property (nonatomic, assign) BOOL didLoadPayload;
 @end
@@ -855,6 +857,18 @@ static NSArray<NSDictionary *> *settings_repotweaks_tweaks_for_url(NSString *rep
 - (void)loadRespringPayload {
     if (self.didLoadPayload) return;
     self.didLoadPayload = YES;
+    if (self.direct) {
+        printf("[RESPRING] waiting for SpringBoard to restart\n");
+        UIActivityIndicatorView *spinner =
+            [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
+        spinner.color = UIColor.whiteColor;
+        spinner.center = CGPointMake(CGRectGetMidX(self.bounds), CGRectGetMidY(self.bounds));
+        spinner.autoresizingMask = UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin |
+                                   UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin;
+        [spinner startAnimating];
+        [self addSubview:spinner];
+        return;
+    }
     printf("[RESPRING] loading Lara-style in-app WebKit overlay\n");
 
     // Mirrors Lara's respringview verbatim: default-init WKWebView, the
@@ -2952,6 +2966,10 @@ static void settings_present_controller(UIViewController *controller, UIViewCont
     });
 }
 
+// Set by settings_prepare_for_respring_sync when SpringBoard itself will
+// relaunch (scheduled through the RemoteCall session); otherwise the WebKit
+// overlay has to force the respring.
+static volatile int g_respring_scheduled = 0;
 static void settings_show_respring_overlay(UIViewController *fallback)
 {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -2961,6 +2979,8 @@ static void settings_show_respring_overlay(UIViewController *fallback)
             return;
         }
         DSRespringOverlayView *overlay = [[DSRespringOverlayView alloc] initWithFrame:window.bounds];
+        // SpringBoard restarts on its own: just cover the screen meanwhile.
+        overlay.direct = g_respring_scheduled != 0;
         [window addSubview:overlay];
         [overlay loadRespringPayload];
     });
@@ -3482,6 +3502,11 @@ static void settings_destroy_springboard_remote_call_locked(const char *reason)
     settings_destroy_springboard_remote_call_locked_internal(reason, YES);
 }
 
+// Time from scheduling the relaunch to the end of our cleanup: closing the
+// SpringBoard session (~0.8 s) and parking kernel access (ms). The respring
+// usually ends Cyanide, so it must not start before that's done.
+static const double kRespringDelay = 2.5;
+
 static void settings_prepare_for_respring_sync(void)
 {
     log_user("[RESPRING] Stopping live sessions before respring.\n");
@@ -3490,11 +3515,24 @@ static void settings_prepare_for_respring_sync(void)
     settings_end_statbar_background_task_async("pre-respring cleanup");
     settings_wait_live_loops_stopped_for_switch("pre-respring cleanup");
 
+    g_respring_scheduled = 0;
+    uint64_t scheduledNs = 0;
+    // A direct relaunch needs a SpringBoard session; open one if kernel
+    // access is live or parked (never a full exploit run for this).
+    BOOL kernelReady = g_springboard_rc_ready || settings_ensure_kexploit_for_read();
     @synchronized (settings_rc_lock()) {
+        if (!g_springboard_rc_ready && kernelReady) {
+            log_user("[RESPRING] Opening SpringBoard to ask it to restart…\n");
+            settings_ensure_springboard_remote_call_locked();
+        }
         if (g_springboard_rc_ready) {
-            // SB is about to be killed by the respring, so cleanup uses the
-            // fast variant for tweaks where full remote restoration is wasted.
+            // SB is about to restart, so cleanup uses the fast variant for
+            // tweaks where full remote restoration is wasted.
             settings_stop_springboard_tweaks_locked("pre-respring cleanup", YES);
+            if (respring_schedule_in_session(kRespringDelay) != ASRemovalNotScheduled) {
+                g_respring_scheduled = 1;
+                scheduledNs = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+            }
             settings_destroy_springboard_remote_call_locked("pre-respring cleanup");
         }
     }
@@ -3509,6 +3547,14 @@ static void settings_prepare_for_respring_sync(void)
         settings_notify_remote_call_state_changed();
     }
 
+    if (g_respring_scheduled) {
+        double elapsed = (double)(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - scheduledNs) / 1e9;
+        log_user("[RESPRING] Cleanup complete after %.2fs; SpringBoard restarts %.1fs after the request.\n",
+                 elapsed, kRespringDelay);
+        if (elapsed > kRespringDelay - 0.5)
+            log_user("[RESPRING] WARNING: cleanup took %.2fs, close to the %.1fs restart.\n", elapsed, kRespringDelay);
+        return;
+    }
     log_user("[RESPRING] Cleanup complete. Opening respring flow.\n");
     usleep(300000);
 }
