@@ -36,10 +36,18 @@ static _Atomic int g_excport_terminating = 0;
 // Residual: this re-opens the small ABBA window for teardown-owned ops —
 // accepted; the proven-fatal alternative is a parked sentinel thread.
 static _Atomic int g_excport_teardown_depth = 0;
+// Review F-07: the bypass is process-wide, so while one thread tears down,
+// any other thread passes the gate too. Step 1 (log-only): each thread knows
+// whether it began a teardown, and a pass by a thread that didn't is logged.
+// Only once the logs show none (or which path needs it) does this become
+// enforced -- refusing a teardown step that runs on another thread would
+// bring back the parked-sentinel panics the bypass exists to prevent.
+static __thread int t_excport_teardown_depth = 0;
 static pthread_mutex_t g_excport_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void excport_teardown_bypass_begin(const char *where)
 {
+    t_excport_teardown_depth++;
     int depth = atomic_fetch_add(&g_excport_teardown_depth, 1) + 1;
     if (depth == 1 && excport_gate_blocked())
         printf("[EXCPORT] gate: teardown bypass ACTIVE (%s) — teardown-owned "
@@ -50,6 +58,9 @@ void excport_teardown_bypass_begin(const char *where)
 
 void excport_teardown_bypass_end(const char *where)
 {
+    if (t_excport_teardown_depth > 0) t_excport_teardown_depth--;
+    else printf("[EXCPORT] gate: teardown bypass end (%s) on a thread that didn't begin one\n",
+                where ?: "teardown");
     int depth = atomic_fetch_sub(&g_excport_teardown_depth, 1) - 1;
     if (depth < 0) {   // unpaired end — clamp, scream
         atomic_store(&g_excport_teardown_depth, 0);
@@ -58,10 +69,17 @@ void excport_teardown_bypass_end(const char *where)
     }
 }
 
-static bool excport_gate_blocked_for_caller(void)
+static bool excport_gate_blocked_for_caller(const char *what)
 {
-    if (atomic_load(&g_excport_teardown_depth) > 0)
-        return false;   // teardown owns this window
+    if (atomic_load(&g_excport_teardown_depth) > 0) {
+        // Teardown owns this window. Still allowed for every thread (step 1),
+        // but a thread other than the teardown's own is logged when the gate
+        // would otherwise have refused it.
+        if (what && t_excport_teardown_depth == 0 && excport_gate_blocked())   // logged once per op
+            printf("[EXCPORT] gate: FOREIGN thread %p passed during teardown bypass (%s) "
+                   "-- review F-07\n", (void *)pthread_self(), what ?: "op");
+        return false;
+    }
     return excport_gate_blocked();
 }
 
@@ -95,7 +113,7 @@ void excport_gate_snapshot(int *backgrounded, int *terminating)
 
 bool excport_op_begin(const char *what)
 {
-    if (excport_gate_blocked_for_caller()) {
+    if (excport_gate_blocked_for_caller(what)) {
         printf("[EXCPORT] refusing %s: app backgrounded/terminating\n",
                what ?: "op");
         return false;
@@ -103,7 +121,7 @@ bool excport_op_begin(const char *what)
     pthread_mutex_lock(&g_excport_mutex);
     // Re-check under the mutex: a lifecycle transition may have landed while
     // we waited for the previous operation to finish.
-    if (excport_gate_blocked_for_caller()) {
+    if (excport_gate_blocked_for_caller(NULL)) {
         pthread_mutex_unlock(&g_excport_mutex);
         printf("[EXCPORT] refusing %s: lifecycle transition landed while "
                "waiting\n", what ?: "op");
