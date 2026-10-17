@@ -6,6 +6,7 @@
 #import "FileBrowserViewController.h"
 #import "SettingsViewController.h"
 #import "PlistEditorViewController.h"
+#import "FBAppContainers.h"
 #import "installer/MainTabBarController.h"
 
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
@@ -793,6 +794,7 @@ static NSArray<NSString *> *fb_bounded_directory_names(NSString *path, BOOL *inc
 @property (nonatomic, strong) NSDate *modified;
 @property (nonatomic, assign) BOOL viaRoot;   // listed/readable only through launchd root
 @property (nonatomic, assign) BOOL rootUnlocked;   // not readable as mobile, opened through root
+@property (nonatomic, strong) FBAppContainer *container;   // app container folders: whose it is
 @end
 
 @implementation FBEntry
@@ -1488,7 +1490,33 @@ static const NSUInteger kFBMaxShareBytes = 64 * 1024 * 1024;
 @property (nonatomic, assign) NSUInteger reloadRequest;      // newest reload; older results are dropped
 @property (nonatomic, assign) NSUInteger loadedFsGeneration;
 @property (nonatomic, assign) BOOL listingIncomplete;        // root listing was cut short
+@property (nonatomic, strong) FBAppContainer *container;     // the app container this folder is in
+@property (nonatomic, strong) FBAppContainer *relatedContainer;   // its bundle <-> data counterpart
 @end
+
+// In the folders holding app containers: name each UUID folder after its app
+// and sort by that name. Off the main thread (reads metadata).
+static void fb_annotate_containers(NSString *dir, NSMutableArray<FBEntry *> *entries, BOOL viaRoot)
+{
+    if (!fb_is_container_parent(dir)) return;
+    for (FBEntry *e in entries)
+        if (e.isDirectory && !e.isSymlink) e.container = fb_container_for_path(e.path, viaRoot || e.viaRoot);
+    [entries sortUsingComparator:^NSComparisonResult(FBEntry *a, FBEntry *b) {
+        if ((a.container != nil) != (b.container != nil)) return a.container ? NSOrderedAscending : NSOrderedDescending;
+        NSString *na = a.container.displayName ?: a.name, *nb = b.container.displayName ?: b.name;
+        return [na localizedStandardCompare:nb];
+    }];
+}
+
+static NSString *fb_related_title(FBAppContainer *c)
+{
+    switch (c.kind) {
+        case FBContainerKindBundle: return @"Open Data Container";
+        case FBContainerKindData:   return @"Open App Bundle";
+        case FBContainerKindPlugin: return @"Open App's Data Container";
+        default:                    return nil;
+    }
+}
 
 @implementation FileBrowserViewController
 
@@ -1519,8 +1547,60 @@ static const NSUInteger kFBMaxShareBytes = 64 * 1024 * 1024;
     self.definesPresentationContext = YES;
 
     self.refreshControl = [UIRefreshControl new];
-    [self.refreshControl addTarget:self action:@selector(reload) forControlEvents:UIControlEventValueChanged];
+    [self.refreshControl addTarget:self action:@selector(pullToRefresh) forControlEvents:UIControlEventValueChanged];
     [self reload];
+    [self lookUpContainer];
+}
+
+- (void)pullToRefresh
+{
+    if (fb_is_container_parent(self.path)) fb_containers_reset();   // apps may have changed
+    [self reload];
+}
+
+// Inside an app container: show the app's name and offer its other container.
+- (void)lookUpContainer
+{
+    NSString *path = self.path;
+    BOOL viaRoot = [NSUserDefaults.standardUserDefaults boolForKey:kSettingsFileBrowserRootAccess];
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        FBAppContainer *c = fb_container_for_path(path, viaRoot);
+        FBAppContainer *related = c ? fb_related_container(c) : nil;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) me = weakSelf;
+            if (!me || !c) return;
+            me.container = c;
+            me.relatedContainer = related;
+            if ([fb_canonical_path(path) isEqualToString:c.path]) me.title = c.displayName;
+            [me updateBarButtons];
+        });
+    });
+}
+
+- (void)openContainer:(FBAppContainer *)c
+{
+    if (!c) return;
+    FileBrowserViewController *vc = [[FileBrowserViewController alloc] initWithPath:c.path];
+    [self.navigationController pushViewController:vc animated:YES];
+}
+
+// The other container of entry e's app, looked up off the main thread.
+- (void)openRelatedOf:(FBAppContainer *)c
+{
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        FBAppContainer *related = fb_related_container(c);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) me = weakSelf;
+            if (!me) return;
+            if (related) { [me openContainer:related]; return; }
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:c.displayName
+                message:@"No matching container was found for this app." preferredStyle:UIAlertControllerStyleAlert];
+            [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            [me presentViewController:ac animated:YES completion:nil];
+        });
+    });
 }
 
 - (void)viewDidAppear:(BOOL)animated
@@ -1594,7 +1674,18 @@ static const NSUInteger kFBMaxShareBytes = 64 * 1024 * 1024;
         a.state = [d boolForKey:key] ? UIMenuElementStateOn : UIMenuElementStateOff;
         return a;
     };
+    NSMutableArray<UIMenuElement *> *appItems = [NSMutableArray array];
+    if (self.container && ![fb_canonical_path(self.path) isEqualToString:self.container.path])
+        [appItems addObject:[UIAction actionWithTitle:@"Go to Container Top"
+                                                image:[UIImage systemImageNamed:@"arrow.up.to.line"] identifier:nil
+                                              handler:^(UIAction *x) { [weakOptions openContainer:weakOptions.container]; }]];
+    if (self.relatedContainer && fb_related_title(self.container))
+        [appItems addObject:[UIAction actionWithTitle:fb_related_title(self.container)
+                                                image:[UIImage systemImageNamed:@"arrow.triangle.swap"] identifier:nil
+                                              handler:^(UIAction *x) { [weakOptions openContainer:weakOptions.relatedContainer]; }]];
     UIMenu *optionsMenu = [UIMenu menuWithChildren:@[
+        [UIMenu menuWithTitle:self.container.displayName ?: @"" image:nil identifier:nil
+                      options:UIMenuOptionsDisplayInline children:appItems],
         [UIAction actionWithTitle:@"Go to Folder…" image:[UIImage systemImageNamed:@"arrow.right.circle"]
                        identifier:nil handler:^(UIAction *x) { [weakOptions goToPath]; }],
         [UIMenu menuWithTitle:@"Show" image:nil identifier:nil options:UIMenuOptionsDisplayInline children:@[
@@ -1909,6 +2000,7 @@ static const NSUInteger kFBMaxShareBytes = 64 * 1024 * 1024;
                     [entries addObject:fb_entry_from_root_dict(path, info)];
                 }
                 [entries sortUsingComparator:order];
+                fb_annotate_containers(path, entries, YES);
                 NSString *rstatus = nil;
                 if (!rootEntries.count) rstatus = incomplete ? @"The folder could not be read completely." : @"Empty folder.";
                 else if (!entries.count) rstatus = [NSString stringWithFormat:@"%lu hidden item%@ (root). The ⋯ menu can show them.",
@@ -1937,6 +2029,7 @@ static const NSUInteger kFBMaxShareBytes = 64 * 1024 * 1024;
             [entries addObject:e];
         }
         [entries sortUsingComparator:order];
+        fb_annotate_containers(path, entries, NO);
         if (!names && !status) {
             // The bounded readdir listing returns a POSIX error directly;
             // NSFileManager wrapped it as the underlying error. Accept both.
@@ -2023,7 +2116,9 @@ static const NSUInteger kFBMaxShareBytes = 64 * 1024 * 1024;
         self.shown = self.entries;
     } else {
         NSPredicate *p = [NSPredicate predicateWithBlock:^BOOL(FBEntry *e, NSDictionary *b) {
-            return [e.name rangeOfString:q options:NSCaseInsensitiveSearch].location != NSNotFound;
+            return [e.name rangeOfString:q options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                   [e.container.displayName rangeOfString:q options:NSCaseInsensitiveSearch].location != NSNotFound ||
+                   [e.container.identifier rangeOfString:q options:NSCaseInsensitiveSearch].location != NSNotFound;
         }];
         self.shown = [self.entries filteredArrayUsingPredicate:p];
     }
@@ -2102,6 +2197,18 @@ static const NSUInteger kFBMaxShareBytes = 64 * 1024 * 1024;
     cell.textLabel.numberOfLines = 1;
     cell.textLabel.text = e.isSymlink && e.linkTarget
         ? [NSString stringWithFormat:@"%@ → %@", e.name, e.linkTarget] : e.name;
+    if (e.container) {
+        // An app container: its app's name and icon, identifier and UUID below.
+        cell.textLabel.text = e.container.displayName;
+        cell.detailTextLabel.text = [e.container.displayName isEqualToString:e.container.identifier]
+            ? e.name : [NSString stringWithFormat:@"%@ · %@", e.container.identifier, e.name];
+        cell.imageView.image = e.container.icon ?: [UIImage systemImageNamed:@"folder.fill"];
+        cell.imageView.tintColor = UIColor.systemBlueColor;
+        cell.textLabel.textColor = UIColor.labelColor;
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+        return cell;
+    }
     if (e.statFailed) {
         cell.detailTextLabel.text = @"(no information)";
     } else {
@@ -2222,6 +2329,18 @@ static const NSUInteger kFBMaxShareBytes = 64 * 1024 * 1024;
         }];
         NSMutableArray<UIMenuElement *> *items = [NSMutableArray arrayWithObject:copy];
         if (!e.isDirectory) [items addObject:info];
+        FBAppContainer *c = e.container;
+        if (c) {
+            NSString *relatedTitle = fb_related_title(c);
+            if (relatedTitle)
+                [items insertObject:[UIAction actionWithTitle:relatedTitle image:[UIImage systemImageNamed:@"arrow.triangle.swap"]
+                                                   identifier:nil handler:^(UIAction *a) { [self openRelatedOf:c]; }]
+                            atIndex:0];
+            [items addObject:[UIAction actionWithTitle:@"Copy Identifier" image:[UIImage systemImageNamed:@"number"]
+                                            identifier:nil handler:^(UIAction *a) {
+                UIPasteboard.generalPasteboard.string = c.identifier;
+            }]];
+        }
         if (filebrowser_write_enabled() && !self.loadedViaRoot && !e.viaRoot) {
             UIAction *ren = [UIAction actionWithTitle:@"Rename" image:[UIImage systemImageNamed:@"pencil"]
                                            identifier:nil handler:^(UIAction *a) { [self promptRename:e]; }];
@@ -2233,7 +2352,8 @@ static const NSUInteger kFBMaxShareBytes = 64 * 1024 * 1024;
             [items addObject:[UIMenu menuWithTitle:@"" image:nil identifier:nil
                                            options:UIMenuOptionsDisplayInline children:@[ ren, dup, del ]]];
         }
-        return [UIMenu menuWithTitle:e.path children:items];
+        return [UIMenu menuWithTitle:c ? [NSString stringWithFormat:@"%@\n%@", c.displayName, e.path] : e.path
+                            children:items];
     }];
 }
 
