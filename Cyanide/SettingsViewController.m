@@ -12546,11 +12546,92 @@ static BOOL settings_debug_launchd_spawn(NSString *exePath,
     return YES;
 }
 
+// Exact self-spawn path that produced the successful uid=0 proof. Keep this
+// separate from the generic helper spawn: the generic rewrite changed only
+// this side and the child stopped writing its output file.
 static BOOL settings_debug_launchd_root_exec(NSString *outPath, NSString **messageOut)
 {
-    return settings_debug_launchd_spawn(NSBundle.mainBundle.executablePath,
-                                        @[ @"--cyanide-root-exec-child", outPath ],
-                                        outPath, messageOut);
+    __block NSString *error = nil;
+    __block int spawnRC = -1;
+    __block int childPid = 0;
+    __block BOOL callOK = NO;
+    __block BOOL spawned = NO;
+
+    BOOL ran = pm_with_launchd_session("debug launchd root exec", &error, ^(RemoteCallSession *s) {
+        BOOL ok = NO;
+        const uint64_t buf = pm_root_call(s, 1000, "malloc", 0x1000, 0, 0, &ok);
+        if (!ok || !buf) {
+            error = ok ? @"launchd malloc failed." : @"launchd transport failed.";
+            return;
+        }
+        const uint64_t offExe = 0x000, offFlag = 0x300, offOut = 0x340;
+        const uint64_t offArgv = 0x500, offEnvp = 0x540;
+        const uint64_t offEnvPath = 0x580, offEnvHome = 0x600, offPid = 0x680;
+        NSString *exe = NSBundle.mainBundle.executablePath;
+        NSString *flag = @"--cyanide-root-exec-child";
+        BOOL wrote = exe.length > 0 &&
+            [s remoteWriteString:buf + offExe value:exe.fileSystemRepresentation] &&
+            [s remoteWriteString:buf + offFlag value:flag.UTF8String] &&
+            [s remoteWriteString:buf + offOut value:outPath.fileSystemRepresentation] &&
+            [s remoteWriteString:buf + offEnvPath value:"PATH=/usr/bin:/bin:/usr/sbin:/sbin"] &&
+            [s remoteWriteString:buf + offEnvHome value:"HOME=/var/mobile"];
+        if (wrote) {
+            uint64_t argv[4] = { buf + offExe, buf + offFlag, buf + offOut, 0 };
+            uint64_t envp[3] = { buf + offEnvPath, buf + offEnvHome, 0 };
+            wrote = [s remoteWrite:buf + offArgv from:argv size:sizeof(argv)] &&
+                    [s remoteWrite:buf + offEnvp from:envp size:sizeof(envp)];
+        }
+        if (!wrote) {
+            error = @"could not build the launchd argv/envp block.";
+            pm_root_call(s, 1000, "free", buf, 0, 0, &ok);
+            return;
+        }
+
+        uint64_t rc = [s doRemoteCallStableWithTimeout:3000 functionName:"posix_spawn"
+            x0:buf + offPid x1:buf + offExe x2:0 x3:0 x4:buf + offArgv x5:buf + offEnvp x6:0 x7:0];
+        callOK = remote_call_last_call_ok();
+        spawnRC = (int)rc;
+        if (callOK && spawnRC == 0) {
+            int pid = 0;
+            if ([s remoteRead:buf + offPid to:&pid size:sizeof(pid)]) childPid = pid;
+            spawned = YES;
+        }
+        pm_root_call(s, 1000, "free", buf, 0, 0, &ok);
+    });
+
+    if (!ran) {
+        if (messageOut) *messageOut = error ?: @"launchd session unavailable.";
+        return NO;
+    }
+    if (!callOK) {
+        if (messageOut) *messageOut = @"posix_spawn reply was lost; the child may have started. "
+                                      @"No output was checked.";
+        return NO;
+    }
+    if (!spawned || spawnRC != 0) {
+        if (messageOut) *messageOut = [NSString stringWithFormat:
+            @"posix_spawn failed: rc=%d (%s)", spawnRC,
+            spawnRC > 0 ? strerror(spawnRC) : "unknown"];
+        return NO;
+    }
+
+    NSFileManager *fm = NSFileManager.defaultManager;
+    for (int i = 0; i < 50; i++) {
+        if ([fm fileExistsAtPath:outPath]) break;
+        usleep(100000);
+    }
+    NSString *contents = [NSString stringWithContentsOfFile:outPath
+                                                   encoding:NSUTF8StringEncoding
+                                                      error:nil];
+    if (contents.length == 0) {
+        if (messageOut) *messageOut = [NSString stringWithFormat:
+            @"posix_spawn returned 0 (pid %d), but no output appeared at %@. "
+            @"The child may have been denied exec or write.", childPid, outPath];
+        return NO;
+    }
+    if (messageOut) *messageOut = [NSString stringWithFormat:
+        @"posix_spawn returned 0 (pid %d).\n\n%@", childPid, contents];
+    return YES;
 }
 
 static BOOL settings_debug_launchd_helper_exec(NSString *outPath, NSString **messageOut)
