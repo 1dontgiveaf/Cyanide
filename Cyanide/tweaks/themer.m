@@ -31,7 +31,7 @@ typedef struct {
 
 static const int    kThemerMaxCache    = 512;
 static const int    kThemerMaxIconBundleCache = 512;
-static const size_t kThemerMaxPngBytes = 1 << 18;   // 256 KB hard cap per icon
+static const size_t kThemerMaxPngBytes = THEMER_MAX_ICON_BYTES;   // 256 KB hard cap per icon
 static const NSUInteger kThemerBulkModelGraftCap = 128;
 static const uint32_t kThemerApplySettleUS = 0;
 static const bool kThemerDetailedIconLogs = false;

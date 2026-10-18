@@ -8,6 +8,11 @@
 #define themer_h
 
 #import <stdbool.h>
+
+// Hard per-icon byte cap used by both the importer and the apply path.
+// Keep these in lockstep: importing a PNG the apply path will refuse makes a
+// theme look complete when some icons are silently skipped.
+#define THEMER_MAX_ICON_BYTES (1u << 18)   // 256 KB
 #ifdef __OBJC__
 #import <Foundation/Foundation.h>
 #endif
