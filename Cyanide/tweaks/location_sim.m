@@ -707,9 +707,15 @@ static bool locationsim_apply_to_host(const LocationSimConfig *config,
             confirmed = r_last_call_ok() && confirmed;
             started = true;
             locationsim_notify_timezone();
-            ok = confirmed;
+            // The start was SENT: the manager may be running. Reporting failure
+            // here would leave the caller believing the device is back on its real
+            // location while it is being fed this (possibly reduced) route, and
+            // later target edits are skipped because the started flag stays NO.
+            // Report success from here and keep the uncertainty in the log; the
+            // stop path corrects any false positive.
+            ok = started;
             printf("[LOCSIM] %s loop %.8f, %.8f alt=%.1f hAcc=%.1f host=%s points=%zu radius=%.1fm\n",
-                   confirmed ? "started" : "start NOT confirmed (lost RemoteCall reply) for",
+                   confirmed ? "started" : "start sent but NOT confirmed (lost RemoteCall reply; treating as running) for",
                    config->latitude,
                    config->longitude,
                    config->altitude,
