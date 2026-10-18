@@ -1200,6 +1200,26 @@ static void rc_excguard_release(uint64_t task, uint64_t id, const void *holder,
                  "initproc-exit risk\n", where);
         return;
     }
+    // A dead or reused task address must never receive these flags. The sweep
+    // already enforces "write only into a task verified alive"; do the same
+    // here, because abandon_remote_call() is called precisely when the target
+    // is believed dead and KRW can still be live.
+    RcTaskLiveness live = rc_task_liveness(e->pid, task);
+    if (live == RC_TASK_DEAD) {
+        printf("[RC] task_exc_guard release (%s): task=%#llx pid=%u is dead — "
+               "entry dropped, nothing written\n",
+               where, task, e->pid);
+        memset(e, 0, sizeof(*e));
+        pthread_mutex_unlock(&g_rc_excguard_mutex);
+        return;
+    }
+    if (live == RC_TASK_UNKNOWN) {
+        e->restorePending = true;
+        pthread_mutex_unlock(&g_rc_excguard_mutex);
+        printf("[RC] task_exc_guard release (%s): task=%#llx pid=%u liveness "
+               "UNKNOWN — kept pending for a sweep\n", where, task, e->pid);
+        return;
+    }
     uint32_t orig = e->origFlags;
     if (restore_excguard_kill(task, orig) == 0) {
         memset(e, 0, sizeof(*e));
