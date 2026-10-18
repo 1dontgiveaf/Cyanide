@@ -31,12 +31,6 @@ This release adds the Daemons screen and System Info, makes respring and File Br
 - **The init watchdog uses one atomic decision word**, so an init that returns at the 12 s boundary is either healthy or repaired, never both.
 - **Safe-detach registration no longer leaks an assertion** when iOS expires the background task before the id is published.
 
-## About A18 / M4
-
-- **pe_v3 is the default A18/M4 exploit path.** It stages once, hunts one mapping, caps unproven foreign reads at 20 and re-rolls a fresh layout instead of grinding a hunt that has already exceeded the cap. Every aperture panic in the collected logs happened during the hunt, not during a clean reoccupation cycle.
-- **pe_v1 is kept as the explicit compatibility/debug path.** It has a per-pass successful-read budget (150) and a foreign-read cap (50), and the bounded-search option defaults to on (four passes, then a clean retry).
-- **Post-hunt and post-acquisition verification.** After every hunt, and again after a successful acquisition, the app checks a fresh user mapping and the physical-OOB state before writing the result row or starting tweak work. On T8140 the page tables are SPTM-owned, so this is the checkable alternative to reading PFNs directly. It can catch a corrupted mapping before the delayed `write(2)` path; it does not make the physical-aperture primitive risk-free.
-
 ## Good to know
 
 > [!CAUTION]
@@ -44,3 +38,9 @@ This release adds the Daemons screen and System Info, makes respring and File Br
 
 - A run can still reboot an A18 / M4 device instead of succeeding. pe_v3 and the new caps reduce the exposure; they do not make the physical-aperture primitive risk-free.
 - No on-device validation was possible for the exploit changes in this release; they are build- and code-path-verified only.
+
+## About A18 / M4
+
+- **pe_v3 is the default A18/M4 exploit path.** It stages once, hunts one mapping, caps unproven foreign reads at 20 and re-rolls a fresh layout instead of grinding a hunt that has already exceeded the cap. Every aperture panic in the collected logs happened during the hunt, not during a clean reoccupation cycle.
+- **pe_v1 is kept as the explicit compatibility/debug path.** It has a per-pass successful-read budget (150) and a foreign-read cap (50), and the bounded-search option defaults to on (four passes, then a clean retry).
+- **Post-hunt and post-acquisition verification.** After every hunt, and again after a successful acquisition, the app checks a fresh user mapping and the physical-OOB state before writing the result row or starting tweak work. On T8140 the page tables are SPTM-owned, so this is the checkable alternative to reading PFNs directly. It can catch a corrupted mapping before the delayed `write(2)` path; it does not make the physical-aperture primitive risk-free.

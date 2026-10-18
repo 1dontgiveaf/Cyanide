@@ -40,9 +40,11 @@ static _Atomic int g_excport_teardown_depth = 0;
 // excport_teardown_bypass_begin() may pass the gate while it is blocked.
 // The original process-wide check let an unrelated live-tweak call reach
 // remote_pac/thread_create during teardown -- the runningboardd ABBA window
-// this gate exists to close. Internal teardown helpers that run on their own
-// thread (the late-trap responder's re-park) explicitly enter the bypass
-// around their sign; everything else is refused normally.
+// this gate exists to close. Only teardown-owned work enters the bypass, on
+// the thread doing it: destroy/abandon, the init-abort re-park, and the
+// background-detach / fastkill teardown holds. The late-trap responder never
+// signs (it replies with each thread's own state), and live calls -- including
+// their crash re-park -- stay behind the gate.
 static __thread int t_excport_teardown_depth = 0;
 static pthread_mutex_t g_excport_mutex = PTHREAD_MUTEX_INITIALIZER;
 

@@ -71,7 +71,8 @@ static BOOL PackageEnabledKeyIsRepoDriven(NSString *enabledKey)
     if (![rawURLs isKindOfClass:NSArray.class]) return NO;
     for (id value in (NSArray *)rawURLs) {
         if (![value isKindOfClass:NSString.class]) continue;
-        if ([d stringForKey:repotweaks_installed_version_key((NSString *)value, repoTweakID)].length > 0) {
+        // Present at all = installed (an installed tweak may have an empty version).
+        if ([d objectForKey:repotweaks_installed_version_key((NSString *)value, repoTweakID)] != nil) {
             return YES;
         }
     }
