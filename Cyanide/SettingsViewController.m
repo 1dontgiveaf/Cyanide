@@ -888,17 +888,20 @@ static NSString * const kSettingsSpringBoardRestartedNotification = @"CYSpringBo
             [weakSelf removeFromSuperview];
         }];
         self.restartObserver = observer;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        // 10 s: SpringBoard came back ~4 s after the tap in testing (live 57).
+        // Firing the WebKit payload during a slow but real relaunch would
+        // force a second respring on top of it.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             if (!weakSelf.superview || weakSelf.webView) return;
-            printf("[RESPRING] no SpringBoard restart seen 6 s after the request; "
+            printf("[RESPRING] no SpringBoard restart seen 10 s after the request; "
                    "using the WebKit fallback\n");
             for (UIView *v in weakSelf.subviews)
                 if ([v isKindOfClass:UIActivityIndicatorView.class]) [v removeFromSuperview];
             [weakSelf loadWebKitFallback];
         });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             if (!weakSelf.superview) return;
-            printf("[RESPRING] no SpringBoard restart seen after 20 s; removing the respring cover\n");
+            printf("[RESPRING] no SpringBoard restart seen after 25 s; removing the respring cover\n");
             [weakSelf removeFromSuperview];
         });
         UIActivityIndicatorView *spinner =
