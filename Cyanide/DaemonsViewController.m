@@ -159,6 +159,26 @@ static void daemons_note_change(NSArray<NSString *> *labels)
 {
     [super viewWillAppear:animated];
     [self.tableView reloadData];   // a group screen may have changed something
+    [self updateInteractivePopGesture];
+}
+
+- (void)viewWillDisappear:(BOOL)animated
+{
+    [super viewWillDisappear:animated];
+    // The recognizer belongs to the shared navigation controller (and may be
+    // used by a pushed group screen): never leave it disabled after this VC.
+    self.navigationController.interactivePopGestureRecognizer.enabled = YES;
+}
+
+// Unsaved daemon changes have no confirmation on the edge-swipe path; the
+// Discard/Back substitution only covers the bar button. Disable the shared
+// interactive pop only while this controller is the visible one; a pushed
+// group screen keeps its own swipe-back (which returns here, changes intact).
+- (void)updateInteractivePopGesture
+{
+    if (self.navigationController.topViewController != self) return;
+    UIGestureRecognizer *pop = self.navigationController.interactivePopGestureRecognizer;
+    if (pop) pop.enabled = self.staged.count == 0;
 }
 
 - (void)viewDidAppear:(BOOL)animated
@@ -270,6 +290,7 @@ static void daemons_note_change(NSArray<NSString *> *labels)
                                           target:self action:@selector(discardChanges)]
         : nil;
     self.navigationItem.leftBarButtonItem.enabled = !self.busy;
+    [self updateInteractivePopGesture];
     [self.tableView reloadData];
     for (UIViewController *vc in self.navigationController.viewControllers)
         if ([vc isKindOfClass:DaemonGroupViewController.class]) [((UITableViewController *)vc).tableView reloadData];
