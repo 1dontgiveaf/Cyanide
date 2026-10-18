@@ -12449,21 +12449,24 @@ static BOOL settings_debug_launchd_root_exec(NSString *outPath, NSString **messa
         }
         // Scratch layout inside launchd: strings, argv/envp pointer arrays,
         // and the pid_t result. All offsets are 16-byte aligned.
-        const uint64_t offPath = 0x000, offArg0 = 0x020, offArgC = 0x040, offCmd = 0x060;
+        //
+        // Spawn OUR OWN signed executable, not /bin/sh: stock iOS does not
+        // ship a shell (the old proof got ENOENT), and the app binary is
+        // definitely present and signed. The child mode in main.m writes the
+        // real uid/euid before UIKit starts.
+        const uint64_t offExe = 0x000, offFlag = 0x300, offOut = 0x340;
         const uint64_t offArgv = 0x500, offEnvp = 0x540;
         const uint64_t offEnvPath = 0x580, offEnvHome = 0x600, offPid = 0x680;
-        NSString *cmd = [NSString stringWithFormat:
-            @"{ echo \"shell_uid=$UID shell_euid=$EUID\"; id; echo \"id_exit=$?\"; } > '%@' 2>&1",
-            outPath];
-        BOOL wrote =
-            [s remoteWriteString:buf + offPath value:"/bin/sh"] &&
-            [s remoteWriteString:buf + offArg0 value:"sh"] &&
-            [s remoteWriteString:buf + offArgC value:"-c"] &&
-            [s remoteWriteString:buf + offCmd value:cmd.UTF8String] &&
+        NSString *exe = NSBundle.mainBundle.executablePath;
+        NSString *flag = @"--cyanide-root-exec-child";
+        BOOL wrote = exe.length > 0 &&
+            [s remoteWriteString:buf + offExe value:exe.fileSystemRepresentation] &&
+            [s remoteWriteString:buf + offFlag value:flag.UTF8String] &&
+            [s remoteWriteString:buf + offOut value:outPath.fileSystemRepresentation] &&
             [s remoteWriteString:buf + offEnvPath value:"PATH=/usr/bin:/bin:/usr/sbin:/sbin"] &&
             [s remoteWriteString:buf + offEnvHome value:"HOME=/var/mobile"];
         if (wrote) {
-            uint64_t argv[4] = { buf + offArg0, buf + offArgC, buf + offCmd, 0 };
+            uint64_t argv[4] = { buf + offExe, buf + offFlag, buf + offOut, 0 };
             uint64_t envp[3] = { buf + offEnvPath, buf + offEnvHome, 0 };
             wrote = [s remoteWrite:buf + offArgv from:argv size:sizeof(argv)] &&
                     [s remoteWrite:buf + offEnvp from:envp size:sizeof(envp)];
@@ -12475,7 +12478,7 @@ static BOOL settings_debug_launchd_root_exec(NSString *outPath, NSString **messa
         }
 
         uint64_t rc = [s doRemoteCallStableWithTimeout:3000 functionName:"posix_spawn"
-            x0:buf + offPid x1:buf + offPath x2:0 x3:0 x4:buf + offArgv x5:buf + offEnvp x6:0 x7:0];
+            x0:buf + offPid x1:buf + offExe x2:0 x3:0 x4:buf + offArgv x5:buf + offEnvp x6:0 x7:0];
         callOK = remote_call_last_call_ok();
         spawnRC = (int)rc;
         if (callOK && spawnRC == 0) {
@@ -12530,8 +12533,9 @@ static void settings_debug_present_root_exec_proof(UIViewController *presenter)
     UIAlertController *ac = [UIAlertController
         alertControllerWithTitle:@"Launchd Root Exec Proof"
                          message:[NSString stringWithFormat:
-            @"Debug only. Spawns /bin/sh via launchd (root, unsandboxed) and "
-            @"writes the result to:\n%@\n\nNo root filesystem writes and no "
+            @"Debug only. Asks launchd (root, unsandboxed) to spawn Cyanide's "
+            @"own signed executable in a tiny child mode, which writes its real "
+            @"uid/euid to:\n%@\n\nNo shell, no root filesystem writes, no "
             @"remount. A blocked launchd thread can reboot the device; keep "
             @"Cyanide in the foreground.", outPath]
                   preferredStyle:UIAlertControllerStyleAlert];
@@ -13723,7 +13727,7 @@ static NSUInteger settings_tab_index_for_title(UITabBarController *tab, NSString
 #if DEBUG
         @{ @"kind": @"button", @"action": @"debug-root-exec-proof",
            @"title": @"[Debug] Launchd root exec proof",
-           @"subtitle": @"Debug only: asks launchd to posix_spawn /bin/sh and writes the result to Cyanide's tmp directory. No root filesystem writes or remount." },
+           @"subtitle": @"Debug only: asks launchd to posix_spawn Cyanide's own signed executable in a child mode that writes its real uid. No shell, no root filesystem writes, no remount." },
 #endif
         @{ @"key": kSettingsLocationServicesLinksEnabled, @"title": @"Location Services links",
            @"subtitle": @"Lets cyanide://location-services links turn Location Services on or off. Any app can open these links without asking, so this is off by default. The Control Center toggle and the Shortcuts action work without it." },
