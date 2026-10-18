@@ -353,11 +353,11 @@ static BOOL PackageShouldAutoQueueForApply(Package *package)
     [self notifyChange];
 }
 
-- (void)commit
+- (BOOL)commit
 {
     if (self.isCommitting) {
         log_user("[INSTALLER] A queue commit is already running; ignoring this one.\n");
-        return;
+        return NO;
     }
     self.isCommitting = YES;
 
@@ -407,7 +407,7 @@ static BOOL PackageShouldAutoQueueForApply(Package *package)
 
     if (!hasHeavy) {
         [self finishCommitRunningActions:needsRunActions allApplied:allApplied];
-        return;
+        return YES;
     }
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -418,6 +418,7 @@ static BOOL PackageShouldAutoQueueForApply(Package *package)
             [self finishCommitRunningActions:needsRunActions allApplied:allApplied];
         });
     });
+    return YES;
 }
 
 // Main queue. Clears isCommitting, then either hands off to the actions run

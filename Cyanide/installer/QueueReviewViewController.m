@@ -527,14 +527,34 @@ static BOOL QueuePackageIsHideHomeBar(Package *pkg)
         return;
     }
 
+    if ([PackageQueue sharedQueue].isCommitting) {
+        [self presentInstallStillRunningAlert];
+        return;
+    }
+
     InstallProgressViewController *vc = [[InstallProgressViewController alloc] init];
     vc.promptsForHideHomeBarRespring = includesHideHomeBar;
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
     nav.modalPresentationStyle = UIModalPresentationAutomatic;
     [self presentViewController:nav animated:YES completion:^{
         log_user("[INSTALLER] ── Applying %ld pending change(s) ──\n", (long)count);
-        [[PackageQueue sharedQueue] commit];
+        if (![[PackageQueue sharedQueue] commit]) {
+            // Lost a race with another commit: don't leave a progress
+            // screen spinning for a run it isn't attached to.
+            [nav dismissViewControllerAnimated:YES completion:^{
+                [self presentInstallStillRunningAlert];
+            }];
+        }
     }];
+}
+
+- (void)presentInstallStillRunningAlert
+{
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Install Running"
+                                                                message:@"An install is still running."
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
 }
 
 - (void)didTapClear

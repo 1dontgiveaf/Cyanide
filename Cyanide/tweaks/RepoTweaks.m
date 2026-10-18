@@ -18,6 +18,10 @@ extern uint64_t r_nsstr_retained(const char *str);
 
 static const NSUInteger kRepoTweaksMaxRepoBytes = 512 * 1024;
 static const NSUInteger kRepoTweaksMaxScriptBytes = 512 * 1024;
+static const NSUInteger kRepoTweaksMaxTweaksPerRepo = 256;
+static const NSUInteger kRepoTweaksMaxRepoScriptBytes = 16 * 1024 * 1024;
+static const long kRepoTweaksMaxConcurrentScripts = 4;
+static const NSTimeInterval kRepoTweaksDefaultRefreshRetryInterval = 10 * 60;
 static NSString * const kRepoTweaksDefaultRepoURL = @"https://raw.githubusercontent.com/MinePlayer16/MinePlayer16.github.io/refs/heads/main/repotweaks.json";
 static NSString * const kRepoTweaksDefaultReposSeedVersionKey = @"RepoTweaksDefaultReposSeedVersion";
 static NSString * const kRepoTweaksDefaultReposSeedVersion = @"6";
@@ -490,7 +494,12 @@ static NSDictionary *repotweaks_sanitized_repo(id raw, NSString **errorMessage) 
 
     NSMutableArray *tweaks = [NSMutableArray array];
     NSMutableSet<NSString *> *seenIDs = [NSMutableSet set];
+    NSUInteger dropped = 0;
     for (id rawTweak in (NSArray *)rawTweaks) {
+        if (tweaks.count >= kRepoTweaksMaxTweaksPerRepo) {
+            dropped++;
+            continue;
+        }
         NSString *entryError = nil;
         NSDictionary *tweak = repotweaks_sanitized_tweak(rawTweak, &entryError);
         if (tweak) {
@@ -504,6 +513,10 @@ static NSDictionary *repotweaks_sanitized_repo(id raw, NSString **errorMessage) 
         } else if (entryError.length > 0) {
             log_user("[RepoTweaks] Skipping invalid entry: %s\n", entryError.UTF8String);
         }
+    }
+    if (dropped > 0) {
+        log_user("[RepoTweaks] Repo lists more than %lu tweaks; ignoring %lu more entr%s\n",
+                 (unsigned long)kRepoTweaksMaxTweaksPerRepo, (unsigned long)dropped, dropped == 1 ? "y" : "ies");
     }
     if (tweaks.count == 0) {
         if (errorMessage) *errorMessage = @"Repository has no valid HTTPS-backed tweaks.";
@@ -620,10 +633,30 @@ void repotweaks_seed_default_repos(void) {
 
     // Seeding itself is local; only the fetch below needs Repo sources on.
     if (!repotweaks_sources_enabled()) return;
+    // A source the user deleted stays deleted; this runs on every catalog
+    // enumeration, so also keep one refresh in flight and retry an empty
+    // cache at most every few minutes (offline must not storm the network).
+    if (![urls containsObject:kRepoTweaksDefaultRepoURL]) return;
     NSDictionary *repo = repotweaks_saved_caches(d)[kRepoTweaksDefaultRepoURL];
     NSArray *tweaks = [repo isKindOfClass:NSDictionary.class] ? repo[@"tweaks"] : nil;
     if (firstSeedForVersion || ![tweaks isKindOfClass:NSArray.class] || tweaks.count == 0) {
+        static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+        static BOOL inFlight = NO;
+        static NSTimeInterval lastAttempt = 0;
+        NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+        pthread_mutex_lock(&lock);
+        BOOL start = !inFlight &&
+            (firstSeedForVersion || lastAttempt == 0 || now - lastAttempt >= kRepoTweaksDefaultRefreshRetryInterval);
+        if (start) {
+            inFlight = YES;
+            lastAttempt = now;
+        }
+        pthread_mutex_unlock(&lock);
+        if (!start) return;
         repotweaks_refresh_repo(kRepoTweaksDefaultRepoURL, ^(BOOL success, NSString *message) {
+            pthread_mutex_lock(&lock);
+            inFlight = NO;
+            pthread_mutex_unlock(&lock);
             if (!success) {
                 log_user("[RepoTweaks] Default source refresh failed: %s\n", (message ?: @"Download failed.").UTF8String);
             }
@@ -972,6 +1005,9 @@ bool repotweaks_apply_in_session(void) {
 // addIfMissing: YES only for an explicit Add Source. A refresh never puts a
 // URL (back) into RepoTweaksURLs, and drops its result if the source was
 // removed while the fetch was in flight.
+static void repotweaks_download_script_capped(NSString *repoURL, NSString *tweakId, NSString *scriptURL,
+                                              NSUInteger maxBytes, void (^completion)(BOOL success, NSUInteger bytes));
+
 static void repotweaks_fetch_repo(NSString *repoURL, BOOL addIfMissing,
                                   void (^completion)(BOOL success, NSString *message)) {
     void (^finish)(BOOL, NSString *) = ^(BOOL success, NSString *message) {
@@ -1073,13 +1109,37 @@ static void repotweaks_fetch_repo(NSString *repoURL, BOOL addIfMissing,
             NSArray *tweaks = sanitized[@"tweaks"];
             dispatch_group_t group = dispatch_group_create();
             __block BOOL scriptsOK = YES;
-            for (NSDictionary *tweak in tweaks) {
-                dispatch_group_enter(group);
-                repotweaks_download_script(repoURL, tweak[@"id"], tweak[@"scriptURL"], ^(BOOL success) {
-                    if (!success) scriptsOK = NO;
-                    dispatch_group_leave(group);
-                });
-            }
+            // At most a few scripts in flight, and a byte budget for the
+            // whole repo; completions run on main, budget/scriptsOK are
+            // shared with the launcher thread under the group's lock.
+            __block NSUInteger budget = kRepoTweaksMaxRepoScriptBytes;
+            dispatch_semaphore_t slots = dispatch_semaphore_create(kRepoTweaksMaxConcurrentScripts);
+            for (NSUInteger i = 0; i < tweaks.count; i++) dispatch_group_enter(group);
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                for (NSDictionary *tweak in tweaks) {
+                    dispatch_semaphore_wait(slots, DISPATCH_TIME_FOREVER);
+                    NSUInteger remaining;
+                    @synchronized (group) { remaining = budget; }
+                    if (remaining == 0) {
+                        log_user("[RepoTweaks] Script budget for repo exhausted; skipping %s\n",
+                                 repotweaks_string_or_empty(tweak[@"id"]).UTF8String);
+                        @synchronized (group) { scriptsOK = NO; }
+                        dispatch_semaphore_signal(slots);
+                        dispatch_group_leave(group);
+                        continue;
+                    }
+                    repotweaks_download_script_capped(repoURL, tweak[@"id"], tweak[@"scriptURL"],
+                                                      MIN(kRepoTweaksMaxScriptBytes, remaining),
+                                                      ^(BOOL success, NSUInteger bytes) {
+                        @synchronized (group) {
+                            if (!success) scriptsOK = NO;
+                            budget = bytes >= budget ? 0 : budget - bytes;
+                        }
+                        dispatch_semaphore_signal(slots);
+                        dispatch_group_leave(group);
+                    });
+                }
+            });
             dispatch_group_notify(group, dispatch_get_main_queue(), ^{
                 finish(scriptsOK, scriptsOK ? @"Refreshed." : @"Refreshed, but one or more scripts failed to download.");
             });
@@ -1096,8 +1156,16 @@ void repotweaks_add_repo(NSString *repoURL, void (^completion)(BOOL success, NSS
 }
 
 void repotweaks_download_script(NSString *repoURL, NSString *tweakId, NSString *scriptURL, void (^completion)(BOOL success)) {
+    repotweaks_download_script_capped(repoURL, tweakId, scriptURL, kRepoTweaksMaxScriptBytes, ^(BOOL success, NSUInteger bytes) {
+        if (completion) completion(success);
+    });
+}
+
+// Completion runs on main; bytes is the stored script's size (0 on failure).
+static void repotweaks_download_script_capped(NSString *repoURL, NSString *tweakId, NSString *scriptURL,
+                                              NSUInteger maxBytes, void (^completion)(BOOL success, NSUInteger bytes)) {
     void (^finish)(BOOL) = ^(BOOL success) {
-        if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(success); });
+        if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(success, 0); });
     };
     if (!repotweaks_sources_enabled()) {
         finish(NO);
@@ -1115,7 +1183,7 @@ void repotweaks_download_script(NSString *repoURL, NSString *tweakId, NSString *
         return;
     }
 
-    repotweaks_bounded_fetch(request, 20.0, kRepoTweaksMaxScriptBytes, ^(NSData *data, NSURLResponse *response, NSError *error) {
+    repotweaks_bounded_fetch(request, 20.0, maxBytes, ^(NSData *data, NSURLResponse *response, NSError *error) {
         if (error || !data) {
             finish(NO);
             return;
@@ -1132,7 +1200,7 @@ void repotweaks_download_script(NSString *repoURL, NSString *tweakId, NSString *
                 return;
             }
         }
-        if (data.length == 0 || data.length > kRepoTweaksMaxScriptBytes) {
+        if (data.length == 0 || data.length > maxBytes) {
             finish(NO);
             return;
         }
@@ -1146,7 +1214,8 @@ void repotweaks_download_script(NSString *repoURL, NSString *tweakId, NSString *
         [d setObject:jsCode forKey:repotweaks_script_defaults_key(repoURL, tweakId)];
         repotweaks_seed_default_values_for_script(d, repoURL, tweakId, jsCode);
         [d synchronize];
-        finish(YES);
+        NSUInteger stored = data.length;
+        if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(YES, stored); });
     });
 }
 
@@ -1247,7 +1316,10 @@ static BOOL repotweaks_bound_uses_major_wildcard(NSString *bound)
     return [safe hasSuffix:@".x"] || [safe hasSuffix:@".*"];
 }
 
-static NSComparisonResult repotweaks_compare_ios_to_bound(NSString *current, NSString *bound)
+// Component-wise: NSNumericSearch ranks "18.6.1" (and "18.6.0") above "18.6".
+// A lower bound pads missing components with 0; an upper bound with fewer
+// components is a prefix, so maxIOS "18.6" still allows 18.6.x.
+static NSComparisonResult repotweaks_compare_ios_to_bound(NSString *current, NSString *bound, BOOL upperBound)
 {
     if (repotweaks_bound_uses_major_wildcard(bound)) {
         NSInteger currentMajor = repotweaks_version_major(current);
@@ -1257,8 +1329,16 @@ static NSComparisonResult repotweaks_compare_ios_to_bound(NSString *current, NSS
         if (currentMajor > boundMajor) return NSOrderedDescending;
         return NSOrderedSame;
     }
-    return [repotweaks_string_or_empty(current) compare:repotweaks_string_or_empty(bound)
-                                                options:NSNumericSearch];
+    NSArray<NSString *> *cur = [repotweaks_string_or_empty(current) componentsSeparatedByString:@"."];
+    NSArray<NSString *> *lim = [repotweaks_string_or_empty(bound) componentsSeparatedByString:@"."];
+    NSUInteger count = upperBound ? lim.count : MAX(cur.count, lim.count);
+    for (NSUInteger i = 0; i < count; i++) {
+        NSInteger a = i < cur.count ? cur[i].integerValue : 0;
+        NSInteger b = i < lim.count ? lim[i].integerValue : 0;
+        if (a < b) return NSOrderedAscending;
+        if (a > b) return NSOrderedDescending;
+    }
+    return NSOrderedSame;
 }
 
 NSString *repotweaks_compatibility_note(NSDictionary *tweak)
@@ -1284,9 +1364,9 @@ NSString *repotweaks_unsupported_reason(NSDictionary *tweak)
     NSString *minIOS = repotweaks_string_or_empty(tweak[@"minIOS"]);
     NSString *maxIOS = repotweaks_string_or_empty(tweak[@"maxIOS"]);
     BOOL tooOld = minIOS.length > 0 &&
-        repotweaks_compare_ios_to_bound(current, minIOS) == NSOrderedAscending;
+        repotweaks_compare_ios_to_bound(current, minIOS, NO) == NSOrderedAscending;
     BOOL tooNew = maxIOS.length > 0 &&
-        repotweaks_compare_ios_to_bound(current, maxIOS) == NSOrderedDescending;
+        repotweaks_compare_ios_to_bound(current, maxIOS, YES) == NSOrderedDescending;
     if (!tooOld && !tooNew) return nil;
 
     NSString *message = repotweaks_string_or_empty(tweak[@"unsupportedMessage"]);

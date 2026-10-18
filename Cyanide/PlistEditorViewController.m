@@ -566,6 +566,9 @@ static const NSUInteger kPLMaxDataEditBytes = 64 * 1024;
                                                                                     @"Overwrite it with your version, or Revert to load the current one?"
                                                                      preferredStyle:UIAlertControllerStyleAlert];
                 [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+                [ac addAction:[UIAlertAction actionWithTitle:@"Revert" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                    [self confirmRevert];
+                }]];
                 [ac addAction:[UIAlertAction actionWithTitle:@"Overwrite" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
                     [self saveForcing:YES];
                 }]];

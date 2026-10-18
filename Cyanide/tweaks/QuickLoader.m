@@ -107,8 +107,12 @@ static NSString *quickloader_compiled_script_for_raw_script(NSString *rawScript,
         NSString *defValue = [quickloader_string_or_empty(parts[3]) stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
         if (!quickloader_valid_identifier(varName)) continue;
 
+        // A cleared text/color value is the user's choice: only a missing
+        // (or non-string) value takes the default there.
         NSString *currentValue = quickloader_string_or_empty(values[varName]);
-        if (currentValue.length == 0) {
+        BOOL emptyIsValue = [values[varName] isKindOfClass:NSString.class] &&
+            ([type isEqualToString:@"text"] || [type isEqualToString:@"color"]);
+        if (currentValue.length == 0 && !emptyIsValue) {
             currentValue = defValue;
             values[varName] = defValue ?: @"";
         }

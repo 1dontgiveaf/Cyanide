@@ -45,9 +45,13 @@ typedef NS_ENUM(NSInteger, PackageQueueIntent) {
 - (void)removePackage:(Package *)package;
 - (void)clear;
 
+// YES while a commit is running (from -commit until its run finishes).
+@property (nonatomic, readonly) BOOL isCommitting;
+
 // Writes the persisted state for every queued package, then triggers
-// settings_run_actions() once. Clears the queue afterwards.
-- (void)commit;
+// settings_run_actions() once. Clears the queue afterwards. Returns NO
+// (and does nothing) when a commit is already running.
+- (BOOL)commit;
 
 @end
 
