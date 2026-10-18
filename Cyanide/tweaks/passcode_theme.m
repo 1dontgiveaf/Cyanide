@@ -991,6 +991,12 @@ NSUInteger settings_passcode_import_backup_items(NSArray<NSURL *> *items,
     NSUInteger kept = 0;
     NSUInteger failed = 0;
     NSUInteger unusable = 0;
+    if (entryBudgetHit) {
+        // The traversal stopped before every entry was seen, so any .orig files
+        // beyond the limit never reached the loop below. Count the truncation as
+        // a failure so the caller cannot report a complete import.
+        failed++;
+    }
     unsigned long long bytes = 0;
     NSUInteger considered = 0;
     for (NSUInteger idx = 0; idx < sources.count; idx++) {
