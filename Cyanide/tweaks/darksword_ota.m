@@ -566,6 +566,32 @@ static bool ota_run_enable_cleanup(void)
     return ok;
 }
 
+// A successful enable may still fail its ancillary cleanup (customer catalog /
+// MobileGestalt flags). The plist edit is the primary switch; do not report it
+// as failed because the cleanup needs an access that is unavailable, but keep a
+// record so the next OTA action retries it once /private/var is writable.
+static NSString * const kOTACleanupPendingKey = @"OTACleanupPending";
+static bool ota_prepare_local_root_rw(void);
+
+static bool ota_enable_cleanup_best_effort(void)
+{
+    if (!ota_prepare_local_root_rw()) {
+        printf("[OTA] cleanup: local /private/var rw unavailable; trying the "
+               "preference writes anyway\n");
+    }
+    bool ok = ota_run_enable_cleanup();
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    if (ok) {
+        if ([d boolForKey:kOTACleanupPendingKey]) [d removeObjectForKey:kOTACleanupPendingKey];
+    } else {
+        [d setBool:YES forKey:kOTACleanupPendingKey];
+        log_user("[OTA] Update daemons are enabled, but OTA cleanup did not finish. "
+                 "It will be retried on the next OTA change.\n");
+    }
+    [d synchronize];
+    return ok;
+}
+
 static bool ota_prepare_local_root_rw(void)
 {
     if (check_sandbox_var_rw() == 0) {
@@ -771,30 +797,42 @@ bool darksword_ota_set_disabled(bool disabled)
         return false;
     }
 
+    // A previous enable left its ancillary cleanup pending: retry now that
+    // kernel access is available again. Failure keeps the record for later.
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    if (!disabled && [defaults boolForKey:kOTACleanupPendingKey] && ota_prepare_local_root_rw()) {
+        if (ota_run_enable_cleanup()) {
+            [defaults removeObjectForKey:kOTACleanupPendingKey];
+            [defaults synchronize];
+            printf("[OTA] pending enable cleanup completed\n");
+        }
+    }
+
     if (disabled || !krw_persistence_launchd_holds_krw()) {
         // Live KRW: try direct /private/var access first for both directions.
         bool noRootAccess = false;
-        bool ok = ota_set_local_with_launchd_krw(disabled, &noRootAccess);
-        // Ancillary cleanup only once the primary plist edit is known good.
-        if (!disabled && ok) {
-            ok = ota_run_enable_cleanup();
+        bool plistOK = ota_set_local_with_launchd_krw(disabled, &noRootAccess);
+        // Ancillary cleanup only once the primary plist edit is known good,
+        // and never folded into its result: a cleanup failure must not claim
+        // the daemons were not re-enabled (they were).
+        if (!disabled && plistOK) {
+            (void)ota_enable_cleanup_best_effort();
         }
-        if (ok || !noRootAccess) {
+        if (plistOK || !noRootAccess) {
             printf("[OTA] === %s OTA result=%d reboot/userspace restart required ===\n",
-                   disabled ? "DISABLE" : "ENABLE", ok);
-            return ok;
+                   disabled ? "DISABLE" : "ENABLE", plistOK);
+            return plistOK;
         }
         // Direct root access unavailable: fall back to the redirect route below.
         printf("[OTA] direct root access unavailable; trying launchd dir redirect\n");
     } else {
-        bool ok = ota_set_local_with_launchd_krw(disabled, NULL);
-        // Ancillary cleanup only once the primary plist edit is known good.
-        if (!disabled && ok) {
-            ok = ota_run_enable_cleanup();
+        bool plistOK = ota_set_local_with_launchd_krw(disabled, NULL);
+        if (!disabled && plistOK) {
+            (void)ota_enable_cleanup_best_effort();
         }
         printf("[OTA] === %s OTA result=%d reboot/userspace restart required ===\n",
-               disabled ? "DISABLE" : "ENABLE", ok);
-        return ok;
+               disabled ? "DISABLE" : "ENABLE", plistOK);
+        return plistOK;
     }
 
     printf("[OTA] === %s OTA ===\n", disabled ? "DISABLING" : "ENABLING");
@@ -808,7 +846,7 @@ bool darksword_ota_set_disabled(bool disabled)
     NSString *plistPath = [redir.localDir stringByAppendingPathComponent:@(kOTAPlistFileName)];
     NSString *tempPath = [redir.localDir stringByAppendingPathComponent:@(kOTAPlistTempFileName)];
 
-    bool ok = false;
+    bool plistOK = false;
 
     do {
         NSMutableDictionary *plist = ota_read_disabled_plist_strict(plistPath);
@@ -817,33 +855,26 @@ bool darksword_ota_set_disabled(bool disabled)
 
         if (changed == 0) {
             printf("[OTA] no plist changes needed\n");
-            ok = true;
+            plistOK = true;
             break;
         }
 
-        ok = ota_write_disabled_plist(plist, plistPath, tempPath, redir.localDir);
+        plistOK = ota_write_disabled_plist(plist, plistPath, tempPath, redir.localDir);
     } while (0);
 
     if (!ota_end_launchd_dir_redirect(&redir)) {
         printf("[OTA] launchd plist dir redirect restore failed\n");
-        ok = false;
+        plistOK = false;
     }
 
-    // Ancillary cleanup only once the primary plist edit is known good. The
-    // cleanup writes under /var/mobile, so it needs local root rw first.
-    if (!disabled && ok) {
-        if (!ota_prepare_local_root_rw()) {
-            printf("[OTA] disabled.plist re-enabled OTA daemons; "
-                   "cleanup skipped: no local /private/var rw access\n");
-            ok = false;
-        } else if (!ota_run_enable_cleanup()) {
-            printf("[OTA] disabled.plist re-enabled OTA daemons; "
-                   "catalog/MobileGestalt cleanup failed\n");
-            ok = false;
-        }
+    // The redirect path exists precisely because /private/var was not writable
+    // locally; the cleanup may still fail, but its result is now separate from
+    // the plist edit (and is retried on the next OTA action).
+    if (!disabled && plistOK) {
+        (void)ota_enable_cleanup_best_effort();
     }
 
     printf("[OTA] === %s OTA result=%d reboot/userspace restart required ===\n",
-           disabled ? "DISABLE" : "ENABLE", ok);
-    return ok;
+           disabled ? "DISABLE" : "ENABLE", plistOK);
+    return plistOK;
 }
