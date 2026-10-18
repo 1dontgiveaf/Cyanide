@@ -3308,6 +3308,38 @@ static void settings_log_run_context(void)
 {
 }
 
+static void settings_destroy_springboard_remote_call_locked_internal_ex(const char *reason, BOOL notifyState, BOOL preserveApplied);
+
+// Review F-03: the cached kernel access stopped validating while a
+// SpringBoard session may still be open. Never just forget that session: a
+// later init would orphan its hijacked thread. Recover the parked primitive
+// first; with kernel access back, close the session properly (stopping its
+// tweaks), otherwise abandon it under the session lock, as on a SpringBoard
+// restart. Returns YES when kernel access was recovered.
+static BOOL settings_handle_stale_krw(const char *why)
+{
+    BOOL recovered = kexploit_opa334_recover_only() == 0;
+    @synchronized (settings_rc_lock()) {
+        settings_request_all_live_loops_stop(why);
+        if (recovered && g_springboard_rc_ready) {
+            settings_stop_springboard_tweaks_locked(why, NO);   // SpringBoard stays: restore properly
+            settings_destroy_springboard_remote_call_locked_internal_ex(why, NO, NO);
+        }
+        if (remote_call_has_local_state()) {
+            printf("[SETTINGS] %s: abandoning the SpringBoard RemoteCall session\n", why);
+            abandon_remote_call();
+        }
+        g_springboard_rc_ready = 0;
+        g_springboard_sandbox_escaped = 0;
+        settings_forget_springboard_tweak_state_locked();
+    }
+    kutils_reset_self_cache();
+    g_kexploit_done = recovered;
+    settings_notify_remote_call_state_changed();
+    printf("[SETTINGS] %s: kernel access %s\n", why, recovered ? "recovered from the parked state" : "not recoverable");
+    return recovered;
+}
+
 static BOOL settings_ensure_kexploit(void)
 {
     if (!settings_wait_for_pending_switcher_removal()) return NO;
@@ -3323,11 +3355,7 @@ static BOOL settings_ensure_kexploit(void)
         }
         printf("[SETTINGS] cached KRW is stale; clearing RemoteCall state and recovering\n");
         log_user("[KRW] Cached app KRW failed validation; clearing RemoteCall state and trying recovery.\n");
-        g_kexploit_done = NO;
-        g_springboard_rc_ready = 0;
-        g_springboard_sandbox_escaped = 0;
-        kutils_reset_self_cache();
-        settings_notify_remote_call_state_changed();
+        if (settings_handle_stale_krw("stale KRW")) return YES;
     }
 
     int res = kexploit_opa334();
@@ -3372,11 +3400,8 @@ static BOOL settings_ensure_kexploit_for_read(void)
     if (g_kexploit_done) {
         if (kexploit_krw_ready()) return YES;
         printf("[SETTINGS] cached KRW is stale; read-only action will not re-exploit\n");
-        g_kexploit_done = NO;
-        g_springboard_rc_ready = 0;
-        g_springboard_sandbox_escaped = 0;
-        kutils_reset_self_cache();
-        settings_notify_remote_call_state_changed();
+        if (settings_handle_stale_krw("stale KRW (read)")) return YES;
+        return NO;   // the parked recovery was just tried
     }
 
     cyanide_launch_trace("recover_only: entry");
