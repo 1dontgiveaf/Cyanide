@@ -627,15 +627,36 @@ int procmgr_exe_kind(int pid) {
     return kind;
 }
 
-// Read one proc's pid+name into an entry. Returns false if the proc looks bogus.
-static bool procmgr_fill_entry(uint64_t proc, procmgr_entry_t *e) {
+// struct proc fields the list/fill path touches (p_list at 0, p_pid and
+// p_name) must be covered by the kernel_map snapshot before any of them is
+// read. A freed and trimmed zone page is still a valid kernel VA to the plain
+// range check; the KRW read of it faults the kernel synchronously.
+static size_t pm_proc_core_len(void) {
+    return (size_t)off_proc_p_name + 32;
+}
+
+static bool pm_proc_readable(uint64_t proc) {
     if (!procmgr_is_kern_ptr(proc)) return false;
+    if (!ksafe_available()) return true;   // no map = no gate (old behavior)
+    return kaddr_is_mapped(proc, pm_proc_core_len());
+}
+
+// A newly allocated struct proc/thread is absent from the boot-time snapshot.
+// Rather than refresh inside the allproc batch (ksafe_refresh takes KRW locks),
+// note the miss and refresh once before the NEXT walk. The caller reports the
+// walk as incomplete, so it keeps its previous list.
+static volatile int g_pm_ksafe_refresh_pending = 0;
+
+// Read one proc's pid+name into an entry. Returns false if the proc looks bogus
+// or its core fields are not mapped right now.
+static bool procmgr_fill_entry(uint64_t proc, procmgr_entry_t *e) {
+    if (!pm_proc_readable(proc)) return false;
     uint32_t pid = kread32(proc + off_proc_p_pid);
     if (pid > 500000) return false;                 // sanity: not a real pid
     e->pid = (int)pid;
     e->kproc = proc;
     e->name[0] = '\0';
-    char *nm = proc_get_p_name(proc);               // fills a static buffer
+    char *nm = proc_get_p_name(proc);               // gated name read, static buffer
     if (nm) { strncpy(e->name, nm, sizeof(e->name) - 1); e->name[sizeof(e->name) - 1] = '\0'; }
     if (e->name[0] == '\0') snprintf(e->name, sizeof(e->name), "pid %u", pid);
     return true;
@@ -653,7 +674,25 @@ int procmgr_list(procmgr_entry_t *entries, int max) {
     uint64_t self = proc_self();
     if (!procmgr_is_kern_ptr(self)) { krw_set_nonfatal(false); return -1; }
 
+    // A previous walk stopped on an address the boot snapshot did not know
+    // (typically a process created after bringup). Refreshing here, outside the
+    // batch below, avoids taking krwLock recursively from inside it.
+    if (__atomic_load_n(&g_pm_ksafe_refresh_pending, __ATOMIC_RELAXED) &&
+        ksafe_available()) {
+        // Only a snapshot taken by this call is guaranteed to be newer than
+        // the address that missed; RECENT means the rate limit kept the old
+        // snapshot, so keep the pending flag for the next poll.
+        if (ksafe_refresh_status() == KSAFE_REFRESH_DONE)
+            __atomic_store_n(&g_pm_ksafe_refresh_pending, 0, __ATOMIC_RELAXED);
+    }
+    if (!pm_proc_readable(self)) {
+        __atomic_store_n(&g_pm_ksafe_refresh_pending, 1, __ATOMIC_RELAXED);
+        krw_set_nonfatal(false);
+        return -1;
+    }
+
     int n = 0;
+    BOOL incomplete = NO;
     // Round 13: one krwLock hold + one final repark for the whole list walk
     // (~6 kreads/proc — the per-op repark was a third syscall on every read of
     // every poll). procmgr_fill_entry() is pure kreads, so this is batch-safe.
@@ -665,28 +704,45 @@ int procmgr_list(procmgr_entry_t *entries, int max) {
 
     uint64_t p = kread64(self + off_proc_p_list_le_next);
     for (int i = 0; i < 8192 && n < max && procmgr_is_kern_ptr(p); i++) {
+        // Gate every dereference of the candidate, including the link read
+        // below: a process can exit and its zone page be trimmed between the
+        // link we followed and this iteration.
+        if (!pm_proc_readable(p)) {
+            incomplete = YES;
+            __atomic_store_n(&g_pm_ksafe_refresh_pending, 1, __ATOMIC_RELAXED);
+            break;
+        }
         if (procmgr_fill_entry(p, &entries[n])) n++;
         uint64_t nx = kread64(p + off_proc_p_list_le_next);
         if (nx == p) break;
         p = nx;
     }
 
-    p = kread64(self + off_proc_p_list_le_prev);
-    for (int i = 0; i < 8192 && n < max && procmgr_is_kern_ptr(p); i++) {
-        procmgr_entry_t tmp;
-        if (!procmgr_fill_entry(p, &tmp)) break;    // walked off the list head
-        entries[n++] = tmp;
-        uint64_t pv = kread64(p + off_proc_p_list_le_prev);
-        if (pv == p) break;
-        p = pv;
+    if (!incomplete) {
+        p = kread64(self + off_proc_p_list_le_prev);
+        for (int i = 0; i < 8192 && n < max && procmgr_is_kern_ptr(p); i++) {
+            if (!pm_proc_readable(p)) {
+                incomplete = YES;
+                __atomic_store_n(&g_pm_ksafe_refresh_pending, 1, __ATOMIC_RELAXED);
+                break;
+            }
+            procmgr_entry_t tmp;
+            if (!procmgr_fill_entry(p, &tmp)) break;    // walked off the list head
+            entries[n++] = tmp;
+            uint64_t pv = kread64(p + off_proc_p_list_le_prev);
+            if (pv == p) break;
+            p = pv;
+        }
     }
     if (batched) krw_batch_end();
 
     krw_set_nonfatal(false);
     // A failed-safe read anywhere in the walk (ours or a concurrent one -- we
     // can't tell them apart) may have zero-filled a link and ended it early:
-    // report "incomplete" so the caller keeps its previous list.
-    if (krw_op_error_count() != errorsBefore) return -1;
+    // report "incomplete" so the caller keeps its previous list. An unmapped
+    // candidate (stale snapshot or a process that exited mid-walk) is the same
+    // kind of incomplete pass, never a partially trusted list.
+    if (incomplete || krw_op_error_count() != errorsBefore) return -1;
     return n;
 }
 
