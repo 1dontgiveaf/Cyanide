@@ -9,7 +9,8 @@
 NS_ASSUME_NONNULL_BEGIN
 
 // The destination is owned by the extractor: failed or cancelled extraction
-// removes it so callers cannot accidentally import a partial tree.
+// removes it so callers cannot accidentally import a partial tree. It must not
+// exist yet (or be an empty directory); a non-empty destination is refused.
 BOOL SBLExtractArchiveToDirectory(NSURL *url, NSString *destination, NSError **error);
 
 // `progress` may be cancelled by the caller. Work is still synchronous from

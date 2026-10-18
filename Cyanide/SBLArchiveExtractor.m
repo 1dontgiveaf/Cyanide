@@ -463,6 +463,7 @@ static BOOL sbl_extract_tar(NSData *tar, NSString *destination, NSProgress *prog
     NSUInteger len = tar.length;
     NSUInteger p = 0;
     NSUInteger extracted = 0;
+    NSUInteger entries = 0;
     uint64_t totalBytes = 0;
     BOOL ended = NO;
 
@@ -474,6 +475,12 @@ static BOOL sbl_extract_tar(NSData *tar, NSString *destination, NSProgress *prog
             if (h[i] != 0) { empty = NO; break; }
         }
         if (empty) { ended = YES; break; }
+        // Same entry budget as the ZIP path: zero-byte entries never grow
+        // totalBytes, so the byte cap alone does not bound the file count.
+        if (++entries > SBLMaxImportFileCount) {
+            sbl_set_error(error, 34, @"TAR contains too many entries.");
+            return NO;
+        }
 
         NSString *name = [[NSString alloc] initWithBytes:h length:100 encoding:NSUTF8StringEncoding];
         name = [[name componentsSeparatedByString:@"\0"] firstObject];
@@ -604,6 +611,22 @@ BOOL SBLExtractArchiveToDirectoryWithProgress(NSURL *url, NSString *destination,
                                               NSProgress *progress, NSError **error)
 {
     if (sbl_cancelled(progress, error)) return NO;
+    NSFileManager *fm = NSFileManager.defaultManager;
+    // The destination is replaced (and removed on failure), so it must be new
+    // or an empty directory: never clear a real folder (review F-35).
+    if (destination.length == 0) {
+        sbl_set_error(error, 53, @"No extraction destination was given.");
+        return NO;
+    }
+    struct stat destStat;
+    if (lstat(destination.fileSystemRepresentation, &destStat) == 0) {
+        NSArray *contents = S_ISDIR(destStat.st_mode)
+            ? [fm contentsOfDirectoryAtPath:destination error:nil] : nil;
+        if (!contents || contents.count > 0) {
+            sbl_set_error(error, 53, @"The extraction destination already exists and is not empty.");
+            return NO;
+        }
+    }
     // Size the input before materializing it: the decompressed and entry
     // bounds below only apply once the whole archive is already in memory.
     NSNumber *isRegular = nil;
@@ -628,7 +651,6 @@ BOOL SBLExtractArchiveToDirectoryWithProgress(NSURL *url, NSString *destination,
         return NO;
     }
 
-    NSFileManager *fm = NSFileManager.defaultManager;
     [fm removeItemAtPath:destination error:nil];
     if (![fm createDirectoryAtPath:destination withIntermediateDirectories:YES attributes:nil error:error]) {
         return NO;

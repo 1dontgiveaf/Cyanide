@@ -9,6 +9,7 @@
 #import "../map_app.h"
 #import "../TaskRop/RemoteCall.h"
 #import "../LogTextView.h"
+#import "../SBLArchiveExtractor.h"
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -226,15 +227,26 @@ static ThemerEntry *themer_lookup_entry(const char *bundle)
     return NULL;
 }
 
-static void themer_cache_image(const char *bundle, uint64_t image)
+// Takes ownership of `image` on success. On failure (cache full) the caller
+// still owns the +1 image and must release it.
+static bool themer_cache_image(const char *bundle, uint64_t image)
 {
-    if (!bundle || !bundle[0] || !r_is_objc_ptr(image)) return;
-    if (gThemerCacheCount >= kThemerMaxCache) return;
+    if (!bundle || !bundle[0] || !r_is_objc_ptr(image)) return false;
+    if (gThemerCacheCount >= kThemerMaxCache) {
+        static int fullLogs = 0;
+        if (fullLogs < 4) {
+            printf("[THEMER] image cache full (%d) bundle=%s skipped\n",
+                   kThemerMaxCache, bundle);
+            fullLogs++;
+        }
+        return false;
+    }
     ThemerEntry *e = &gThemerCache[gThemerCacheCount++];
     snprintf(e->bundle, sizeof(e->bundle), "%s", bundle);
     e->image = image;
     e->dataSource = 0;
     e->iconServicesSeeded = false;
+    return true;
 }
 
 static void themer_cache_icon_bundle(uint64_t icon, const char *bundle)
@@ -398,6 +410,10 @@ static bool themer_ensure_iconservices_loaded(void)
 static NSData *themer_rounded_png_data(NSData *bytes, const char *label)
 {
     if (!bytes || bytes.length == 0 || bytes.length > kThemerMaxPngBytes) return bytes;
+    // Header-declared dimensions are checked before any decode/render: a tiny
+    // PNG can declare a huge canvas (review F-12). Rejected bytes are also
+    // refused by themer_build_remote_uiimage_from_data.
+    if (!SBLImageDataPassesPixelPreflight(bytes)) return bytes;
 
     @autoreleasepool {
         UIImage *src = [UIImage imageWithData:bytes];
@@ -643,6 +659,11 @@ static uint64_t themer_build_remote_uiimage_from_data(NSData *bytes, const char 
                label ?: "?",
                (unsigned long)bytes.length,
                kThemerMaxPngBytes);
+        return 0;
+    }
+    if (!SBLImageDataPassesPixelPreflight(bytes)) {
+        printf("[THEMER] PNG dimensions rejected label=%s size=%lu\n",
+               label ?: "?", (unsigned long)bytes.length);
         return 0;
     }
 
@@ -1739,7 +1760,13 @@ static int themer_iter_iconviews(uint64_t listView,
                 if (misses) (*misses)++;
                 continue;
             }
-            themer_cache_image(bundle, image);
+            if (!themer_cache_image(bundle, image)) {
+                r_msg2(image, "release", 0, 0, 0, 0);
+                themer_clear_dynamic_overlay(v);
+                themer_clear_visible_override(v);
+                if (misses) (*misses)++;
+                continue;
+            }
             if (gThemerLogBudget > 0) {
                 printf("[THEMER] built bundle=%s image=0x%llx\n",
                        bundle, (unsigned long long)image);
@@ -2124,7 +2151,11 @@ static int themer_graft_icon_models_for_theme(NSDictionary<NSString *, NSData *>
                 modelMisses++;
                 continue;
             }
-            themer_cache_image(bundle, image);
+            if (!themer_cache_image(bundle, image)) {
+                r_msg2(image, "release", 0, 0, 0, 0);
+                modelMisses++;
+                continue;
+            }
         }
 
         uint64_t icon = themer_lookup_model_icon_for_bundle(bundle);
@@ -2344,6 +2375,110 @@ static NSSet<NSString *> *themer_collect_visible_bundles(void)
     return bundles;
 }
 
+// Cached remote images belong to the theme bytes they were built from. When a
+// different theme is applied while the tweak stays enabled, release and drop
+// every entry whose bytes changed or that the new theme no longer has, so a
+// cache hit can never show the previous theme's image (review F-11). Entries
+// whose bytes are identical are kept, so re-applying the same theme is
+// unchanged. Grafted models/shared caches hold their own retains.
+static int themer_drop_stale_cache_entries(NSDictionary<NSString *, NSData *> *previous,
+                                           NSDictionary<NSString *, NSData *> *next)
+{
+    int kept = 0;
+    int dropped = 0;
+    for (int i = 0; i < gThemerCacheCount; i++) {
+        ThemerEntry *e = &gThemerCache[i];
+        NSString *key = e->bundle[0] ? [NSString stringWithUTF8String:e->bundle] : nil;
+        NSData *oldBytes = key ? previous[key] : nil;
+        NSData *newBytes = key ? next[key] : nil;
+        if (oldBytes && newBytes && [oldBytes isEqualToData:newBytes]) {
+            if (kept != i) gThemerCache[kept] = *e;
+            kept++;
+            continue;
+        }
+        if (r_is_objc_ptr(e->image))
+            r_msg2(e->image, "release", 0, 0, 0, 0);
+        if (r_is_objc_ptr(e->dataSource))
+            r_msg2(e->dataSource, "release", 0, 0, 0, 0);
+        dropped++;
+    }
+    for (int i = kept; i < gThemerCacheCount; i++) {
+        gThemerCache[i].image = 0;
+        gThemerCache[i].dataSource = 0;
+        gThemerCache[i].iconServicesSeeded = false;
+        gThemerCache[i].bundle[0] = '\0';
+    }
+    gThemerCacheCount = kept;
+    return dropped;
+}
+
+// Revert a model icon grafted by themer_graft_icon_model back to its original
+// class and drop the associated theme images. Only touches icons whose class is
+// one of our CNDThemed* subclasses.
+static bool themer_unthem_model_icon(const char *bundle)
+{
+    uint64_t icon = themer_lookup_model_icon_for_bundle(bundle);
+    if (!r_is_objc_ptr(icon)) return false;
+
+    uint64_t themedClass = r_dlsym_call(R_TIMEOUT, "object_getClass",
+                                        icon, 0, 0, 0, 0, 0, 0, 0);
+    if (!r_is_objc_ptr(themedClass)) return false;
+    char clsName[160] = {0};
+    themer_read_class_object_name(themedClass, clsName, sizeof(clsName));
+    if (strncmp(clsName, "CNDThemed", 9) != 0) return false;
+
+    uint64_t baseClass = themedClass;
+    while (strncmp(clsName, "CNDThemed", 9) == 0) {
+        uint64_t superCls = r_dlsym_call(R_TIMEOUT, "class_getSuperclass",
+                                         baseClass, 0, 0, 0, 0, 0, 0, 0);
+        if (!r_is_objc_ptr(superCls) || superCls == baseClass) return false;
+        baseClass = superCls;
+        themer_read_class_object_name(baseClass, clsName, sizeof(clsName));
+    }
+    if (!clsName[0]) return false;
+
+    // Class first, so SpringBoard never dispatches the themed getter after its
+    // associated image is gone.
+    r_dlsym_call(R_TIMEOUT, "object_setClass",
+                 icon, baseClass, 0, 0, 0, 0, 0, 0);
+    static const char *imageSels[] = {
+        "makeIconImageWithInfo:traitCollection:context:options:",
+        "iconImageWithInfo:traitCollection:context:options:",
+        "iconImageWithInfo:traitCollection:options:",
+    };
+    for (int i = 0; i < 3; i++) {
+        uint64_t sel = r_sel(imageSels[i]);
+        if (!sel) continue;
+        r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject",
+                     icon, sel, 0, 1, 0, 0, 0, 0);
+    }
+    (void)themer_notify_icon_image_changed(icon);
+    return true;
+}
+
+// Bundles themed by the previous theme but absent from the new one.
+static void themer_unthem_removed_bundles(NSDictionary<NSString *, NSData *> *previous,
+                                          NSDictionary<NSString *, NSData *> *next)
+{
+    if (previous.count == 0) return;
+    NSUInteger removed = 0;
+    NSUInteger reverted = 0;
+    for (NSString *key in previous) {
+        if (next[key]) continue;
+        removed++;
+        if (reverted >= kThemerBulkModelGraftCap) continue;
+        const char *bundle = key.UTF8String;
+        if (bundle && bundle[0] && themer_unthem_model_icon(bundle)) reverted++;
+    }
+    if (removed == 0) return;
+    printf("[THEMER] previous theme bundles not in new theme=%lu reverted=%lu\n",
+           (unsigned long)removed, (unsigned long)reverted);
+    if (reverted < removed) {
+        printf("[THEMER] %lu icons keep the previous theme until respring\n",
+               (unsigned long)(removed - reverted));
+    }
+}
+
 bool themer_apply_data_in_session(NSDictionary<NSString *, NSData *> *imageDataByBundle)
 {
     if (imageDataByBundle.count == 0) {
@@ -2351,9 +2486,11 @@ bool themer_apply_data_in_session(NSDictionary<NSString *, NSData *> *imageDataB
         return false;
     }
     imageDataByBundle = themer_normalized_theme_data(imageDataByBundle);
+    NSDictionary<NSString *, NSData *> *previousData = gThemerActiveThemeDataByBundle;
     gThemerActiveThemeDataByBundle = [imageDataByBundle copy];
-    printf("[THEMER] apply data entries=%lu cacheCarried=%d\n",
-           (unsigned long)imageDataByBundle.count, gThemerCacheCount);
+    int staleDropped = themer_drop_stale_cache_entries(previousData, imageDataByBundle);
+    printf("[THEMER] apply data entries=%lu cacheCarried=%d staleDropped=%d\n",
+           (unsigned long)imageDataByBundle.count, gThemerCacheCount, staleDropped);
     if (!gThemerVisiblePolicyLogged) {
         gThemerVisiblePolicyLogged = true;
         printf("[THEMER] visible push policy iosMajor=%d legacyVisible=%d\n",
@@ -2366,6 +2503,7 @@ bool themer_apply_data_in_session(NSDictionary<NSString *, NSData *> *imageDataB
     // ObjC send just makes the initial icon flip visibly lag.
     uint64_t startUS = themer_now_us();
     uint32_t prevSettle = r_settle_us(kThemerApplySettleUS);
+    themer_unthem_removed_bundles(previousData, imageDataByBundle);
     themer_reset_icon_bundle_cache();
 
     uint64_t listViewCls = r_class("SBIconListView");
@@ -2544,6 +2682,13 @@ bool themer_apply_in_session(const char *themePath)
             caseFallbacks++;
         }
         if (!path) continue;
+        // Size/dimension check before the read (review F-12); the same
+        // bytes would be refused at upload anyway.
+        if (!SBLImageFilePassesPreflight(path, kThemerMaxPngBytes, NULL)) {
+            printf("[THEMER] skip %s: file fails preflight (size cap=%zu or dimensions)\n",
+                   bid.UTF8String, kThemerMaxPngBytes);
+            continue;
+        }
         NSData *bytes = [NSData dataWithContentsOfFile:path];
         if (bytes.length) {
             dict[bid] = bytes;

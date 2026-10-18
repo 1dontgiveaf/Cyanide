@@ -376,15 +376,26 @@ static bool pt_write_data_to_target(NSData *data,
 }
 
 // Puts back the folder modes a run widened, once, after all its writes.
-static void pt_restore_directory_modes(NSMutableDictionary<NSString *, NSNumber *> *lockedDirs)
+// Success is judged by stat, not the chmod return (vnode_apfs_chmod can apply
+// the mode and still report failure, or the reverse). Records whose mode did
+// not come back are kept; returns false if any folder is still widened.
+static bool pt_restore_directory_modes(NSMutableDictionary<NSString *, NSNumber *> *lockedDirs)
 {
+    NSMutableArray<NSString *> *restoredDirs = [NSMutableArray array];
     for (NSString *dir in lockedDirs) {
         mode_t original = (mode_t)lockedDirs[dir].unsignedIntValue;
-        if (vnode_apfs_chmod(dir.UTF8String, original) != 0) {
-            printf("[PASSCODE] could not restore folder mode for %s\n", dir.UTF8String);
+        (void)vnode_apfs_chmod(dir.UTF8String, original);
+        struct stat st = {0};
+        if (stat(dir.UTF8String, &st) == 0 &&
+            (st.st_mode & 07777) == (original & 07777)) {
+            [restoredDirs addObject:dir];
+        } else {
+            log_user("[PASSCODE] Could not restore the folder mode of %s (want %o).\n",
+                     dir.UTF8String, (unsigned)(original & 07777));
         }
     }
-    [lockedDirs removeAllObjects];
+    [lockedDirs removeObjectsForKeys:restoredDirs];
+    return lockedDirs.count == 0;
 }
 
 #pragma mark - Originals discarded flag
@@ -776,8 +787,12 @@ NSUInteger settings_passcode_import_backup_items(NSArray<NSURL *> *items,
 
     // Collect every .orig in the picked items. A folder is walked all the way
     // down, because an exported copy usually arrives inside another folder.
+    // Collection stops one past the file budget so an archive of countless
+    // tiny *.orig entries cannot grow this list without bound; the overflow
+    // entry trips the budget check below.
     NSMutableArray<NSURL *> *sources = [NSMutableArray array];
     for (NSURL *item in items) {
+        if (sources.count > SBLMaxImportFileCount) break;
         BOOL isDir = NO;
         if (![fm fileExistsAtPath:item.path isDirectory:&isDir]) continue;
         if (!isDir) {
@@ -794,6 +809,7 @@ NSUInteger settings_passcode_import_backup_items(NSArray<NSURL *> *items,
         for (NSURL *found in en) {
             if ([found.pathExtension.lowercaseString isEqualToString:@"orig"]) {
                 [sources addObject:found];
+                if (sources.count > SBLMaxImportFileCount) break;
             }
         }
     }
@@ -804,9 +820,19 @@ NSUInteger settings_passcode_import_backup_items(NSArray<NSURL *> *items,
     NSUInteger unusable = 0;
     unsigned long long bytes = 0;
     NSUInteger considered = 0;
-    for (NSURL *src in sources) {
+    for (NSUInteger idx = 0; idx < sources.count; idx++) {
+        NSURL *src = sources[idx];
         NSString *name = src.lastPathComponent;
         if (name.length == 0) continue;
+
+        // Every candidate counts against the file budget, whether or not it
+        // passes preflight; once over, stop instead of logging each entry.
+        if (++considered > SBLMaxImportFileCount) {
+            log_user("[PASSCODE] The import exceeds its %lu-file budget; the remaining files were skipped.\n",
+                     (unsigned long)SBLMaxImportFileCount);
+            failed += sources.count - idx;
+            break;
+        }
 
         if (!pt_backup_name_looks_usable(name)) unusable++;
 
@@ -833,12 +859,11 @@ NSUInteger settings_passcode_import_backup_items(NSArray<NSURL *> *items,
             failed++;
             continue;
         }
-        if (++considered > SBLMaxImportFileCount ||
-            bytes + (unsigned long long)srcStat.st_size > SBLMaxImportTotalBytes) {
-            log_user("[PASSCODE] Skipping %s: the import exceeds its file count or size budget.\n",
+        if (bytes + (unsigned long long)srcStat.st_size > SBLMaxImportTotalBytes) {
+            log_user("[PASSCODE] Skipping %s and the rest: the import exceeds its size budget.\n",
                      name.UTF8String);
-            failed++;
-            continue;
+            failed += sources.count - idx;
+            break;
         }
 
         // Copy to a sidecar first and move it into place only after the size is
@@ -1386,7 +1411,8 @@ bool settings_passcode_apply_digits(NSDictionary<NSString *, NSData *> *digits)
         }
     }
 
-    pt_restore_directory_modes(lockedDirs);
+    bool modesRestored = pt_restore_directory_modes(lockedDirs);
+    if (!modesRestored) [details addObject:@"keypad folder mode not restored"];
 
     // The keypad cache just changed: nothing cached about it is valid anymore.
     settings_passcode_invalidate_caches();
@@ -1395,7 +1421,7 @@ bool settings_passcode_apply_digits(NSDictionary<NSString *, NSData *> *digits)
         ? [NSString stringWithFormat:@", %lu original(s) saved", (unsigned long)g_pt_backups_written]
         : @"";
 
-    if (failed == 0) {
+    if (failed == 0 && modesRestored) {
         // Main clause first, detail second — same shape as the other actions'
         // logs ("[OK] Location Simulator applied.", "[NANO] Wrote pairing gates: …").
         NSString *detail = [NSString stringWithFormat:@"%lu file(s) in %.1fs%@.",
@@ -1509,18 +1535,19 @@ bool settings_passcode_restore_originals(NSString *basePath)
         }
     }
 
-    pt_restore_directory_modes(lockedDirs);
+    bool modesRestored = pt_restore_directory_modes(lockedDirs);
+    if (!modesRestored) [details addObject:@"keypad folder mode not restored"];
 
     // The keypad cache just changed: nothing cached about it is valid anymore.
     settings_passcode_invalidate_caches();
 
-    if (restored == 0 && failed == 0) {
+    if (restored == 0 && failed == 0 && modesRestored) {
         pt_set_summary(@"No original digit backups were found to restore.");
         log_user("[WARN] No original digit backups were found to restore.\n");
         return false;
     }
 
-    if (failed == 0) {
+    if (failed == 0 && modesRestored) {
         NSString *detail = [NSString stringWithFormat:@"%lu file(s) in %.1fs.",
                             (unsigned long)restored,
                             CFAbsoluteTimeGetCurrent() - startedAt];
@@ -1711,7 +1738,15 @@ static NSData *pt_normalized_png_data(NSData *data)
     }
 
     UIImage *image = [UIImage imageWithData:data];
-    return image ? UIImagePNGRepresentation(image) : nil;
+    NSData *png = image ? UIImagePNGRepresentation(image) : nil;
+    // The re-encode can outgrow the source; a digit over the cap would be
+    // stored but never read back (pt_read_style_digit), so refuse it here.
+    if (png.length > kPTMaxDigitBytes) {
+        log_user("[PASSCODE] Re-encoded PNG is too large (%lu bytes, cap %lu); skipped.\n",
+                 (unsigned long)png.length, (unsigned long)kPTMaxDigitBytes);
+        return nil;
+    }
+    return png;
 }
 
 // Library digit art, read only when it is a regular file within the cap: the
