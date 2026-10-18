@@ -12659,59 +12659,32 @@ static BOOL settings_debug_launchd_helper_exec(NSString *outPath, NSString **mes
     return settings_debug_launchd_spawn(helper, @[ outPath ], outPath, messageOut);
 }
 
-static void settings_debug_present_launchd_proof(UIViewController *presenter, BOOL nestedHelper)
+static void settings_debug_run_launchd_proof(BOOL nestedHelper)
 {
     NSString *outPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
         (nestedHelper ? @"cyanide-helper-exec-proof.txt" : @"cyanide-root-exec-proof.txt")];
-    NSString *title = nestedHelper ? @"Launchd Nested Helper Proof" : @"Launchd Root Exec Proof";
-    NSString *what = nestedHelper
-        ? @"a separate dev-signed Helpers/hello binary from the app bundle"
-        : @"Cyanide's own signed executable in a tiny child mode";
-    UIAlertController *ac = [UIAlertController
-        alertControllerWithTitle:title
-                         message:[NSString stringWithFormat:
-            @"Debug only. Asks launchd (root, unsandboxed) to spawn %@, which "
-            @"writes its real uid/euid to:\n%@\n\nNo shell, no root "
-            @"filesystem writes, no remount. A blocked launchd thread can "
-            @"reboot the device; keep Cyanide in the foreground.", what, outPath]
-                  preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    __weak UIViewController *weakPresenter = presenter;
-    [ac addAction:[UIAlertAction actionWithTitle:@"Run Proof"
-                                           style:UIAlertActionStyleDestructive
-                                         handler:^(UIAlertAction *a) {
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-            NSString *message = nil;
-            BOOL ok = NO;
-            if (!settings_try_claim_actions_lock("launchd exec proof",
-                                                 "[DEBUG] Another action is already running.")) {
-                message = @"Another action is already running.";
-            } else {
-                @try {
-                    [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
-                    ok = nestedHelper
-                        ? settings_debug_launchd_helper_exec(outPath, &message)
-                        : settings_debug_launchd_root_exec(outPath, &message);
-                } @finally {
-                    settings_release_actions_lock();
-                }
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        const char *which = nestedHelper ? "nested helper" : "self";
+        log_user("[ROOTEXEC] %s proof started (output %s)\n",
+                 which, outPath.fileSystemRepresentation);
+        NSString *message = nil;
+        BOOL ok = NO;
+        if (!settings_try_claim_actions_lock("launchd exec proof",
+                                             "[DEBUG] Another action is already running.")) {
+            message = @"Another action is already running.";
+        } else {
+            @try {
+                [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
+                ok = nestedHelper
+                    ? settings_debug_launchd_helper_exec(outPath, &message)
+                    : settings_debug_launchd_root_exec(outPath, &message);
+            } @finally {
+                settings_release_actions_lock();
             }
-            dispatch_async(dispatch_get_main_queue(), ^{
-                UIViewController *host = weakPresenter;
-                if (!host) return;
-                UIAlertController *result = [UIAlertController
-                    alertControllerWithTitle:ok ? [title stringByAppendingString:@": SUCCESS"]
-                                               : [title stringByAppendingString:@": FAILED"]
-                                     message:message ?: @"No detail."
-                              preferredStyle:UIAlertControllerStyleAlert];
-                [result addAction:[UIAlertAction actionWithTitle:@"OK"
-                                                           style:UIAlertActionStyleDefault
-                                                         handler:nil]];
-                settings_present_controller(result, host);
-            });
-        });
-    }]];
-    settings_present_controller(ac, presenter);
+        }
+        log_user("[ROOTEXEC] %s proof %s\n%s\n", which, ok ? "SUCCESS" : "FAILED",
+                 (message ?: @"No detail.").UTF8String);
+    });
 }
 #endif
 
@@ -18982,11 +18955,11 @@ void cyanide_present_contact(UIViewController *host)
         if (indexPath.row < (NSInteger)launchRows.count) {
             NSString *action = launchRows[indexPath.row][@"action"];
             if ([action isEqualToString:@"debug-root-exec-proof"]) {
-                settings_debug_present_launchd_proof(self, NO);
+                settings_debug_run_launchd_proof(NO);
                 return;
             }
             if ([action isEqualToString:@"debug-helper-exec-proof"]) {
-                settings_debug_present_launchd_proof(self, YES);
+                settings_debug_run_launchd_proof(YES);
                 return;
             }
         }
