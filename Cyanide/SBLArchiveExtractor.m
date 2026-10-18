@@ -7,8 +7,10 @@
 #import "SBLArchiveExtractor.h"
 
 #import <dlfcn.h>
+#import <errno.h>
 #import <ImageIO/ImageIO.h>
 #import <sys/stat.h>
+#import <unistd.h>
 #import <zlib.h>
 
 static NSString * const SBLArchiveErrorDomain = @"SnowBoardLiteArchive";
@@ -651,8 +653,22 @@ BOOL SBLExtractArchiveToDirectoryWithProgress(NSURL *url, NSString *destination,
         return NO;
     }
 
-    [fm removeItemAtPath:destination error:nil];
-    if (![fm createDirectoryAtPath:destination withIntermediateDirectories:YES attributes:nil error:error]) {
+    // Clear and recreate the destination without any recursive delete. The
+    // emptiness check above is only a fast path: another writer can populate
+    // the folder before this point, and removeItemAtPath: would then delete
+    // their files. rmdir only succeeds on an empty directory, and mkdir is
+    // exclusive, so a recreated/populated path makes the import fail closed.
+    NSString *parent = destination.stringByDeletingLastPathComponent;
+    if (parent.length > 0 &&
+        ![fm createDirectoryAtPath:parent withIntermediateDirectories:YES attributes:nil error:error]) {
+        return NO;
+    }
+    if (rmdir(destination.fileSystemRepresentation) != 0 && errno != ENOENT) {
+        sbl_set_error(error, 53, @"The extraction destination is no longer empty; refusing to clear it.");
+        return NO;
+    }
+    if (mkdir(destination.fileSystemRepresentation, 0700) != 0) {
+        sbl_set_error(error, 53, @"The extraction destination could not be created exclusively.");
         return NO;
     }
 
