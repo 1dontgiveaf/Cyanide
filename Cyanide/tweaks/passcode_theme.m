@@ -334,6 +334,14 @@ static bool pt_retry_pending_dir_modes(void)
                 [pending removeObjectForKey:dir];
                 continue;
             }
+            // Only a folder, or an inode whose type bits were lost, may be
+            // written: S_IFDIR on a file or FIFO now at this path would
+            // retype (corrupt) it.
+            if (!S_ISDIR(st.st_mode) && (st.st_mode & S_IFMT) != 0) {
+                log_user("[PASSCODE] %s is no longer a folder; dropping its saved mode.\n", dir.UTF8String);
+                [pending removeObjectForKey:dir];
+                continue;
+            }
             (void)vnode_apfs_chmod(dir.UTF8String, desired);
             memset(&st, 0, sizeof(st));
             if (stat(dir.UTF8String, &st) == 0 && S_ISDIR(st.st_mode) &&
@@ -502,8 +510,21 @@ static bool pt_restore_directory_modes(NSMutableDictionary<NSString *, NSNumber 
         mode_t saved = (mode_t)lockedDirs[dir].unsignedIntValue;
         mode_t desired = pt_directory_restore_mode(saved);
         struct stat st = {0};
-        if (stat(dir.UTF8String, &st) == 0 && S_ISDIR(st.st_mode) &&
-            (st.st_mode & 07777) == (saved & 07777)) {
+        if (stat(dir.UTF8String, &st) != 0) {
+            if (errno == ENOENT || errno == ENOTDIR) {
+                [restoredDirs addObject:dir];   // gone: nothing to restore
+            } else {
+                log_user("[PASSCODE] Could not inspect the folder %s (errno=%d).\n", dir.UTF8String, errno);
+            }
+            continue;   // never write without a fresh stat of the path
+        }
+        if (S_ISDIR(st.st_mode) && (st.st_mode & 07777) == (saved & 07777)) {
+            [restoredDirs addObject:dir];
+            continue;
+        }
+        // Same rule as the retry: never write S_IFDIR over a non-folder.
+        if (!S_ISDIR(st.st_mode) && (st.st_mode & S_IFMT) != 0) {
+            log_user("[PASSCODE] %s is no longer a folder; dropping its saved mode.\n", dir.UTF8String);
             [restoredDirs addObject:dir];
             continue;
         }
