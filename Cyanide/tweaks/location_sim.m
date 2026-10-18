@@ -501,22 +501,34 @@ static uint64_t locationsim_new_manager(void)
     return manager;
 }
 
-static void locationsim_stop_manager(uint64_t manager)
+// Returns true only when every call of the stop sequence got its reply.
+static bool locationsim_stop_manager(uint64_t manager)
 {
-    if (!r_is_objc_ptr(manager)) return;
+    if (!r_is_objc_ptr(manager)) return false;
 
+    bool confirmed = true;
     r_msg2(manager, "stopLocationSimulation", 0, 0, 0, 0);
+    confirmed = r_last_call_ok() && confirmed;
     r_msg2(manager, "clearSimulatedLocations", 0, 0, 0, 0);
+    confirmed = r_last_call_ok() && confirmed;
     r_msg2(manager, "stopWifiSimulation", 0, 0, 0, 0);
+    confirmed = r_last_call_ok() && confirmed;
     r_msg2(manager, "stopCellSimulation", 0, 0, 0, 0);
+    confirmed = r_last_call_ok() && confirmed;
     r_msg2(manager, "clearSimulatedCells", 0, 0, 0, 0);
+    confirmed = r_last_call_ok() && confirmed;
     r_msg2(manager, "flush", 0, 0, 0, 0);
+    confirmed = r_last_call_ok() && confirmed;
     usleep(250000);
 
     r_msg2(manager, "stopLocationSimulation", 0, 0, 0, 0);
+    confirmed = r_last_call_ok() && confirmed;
     r_msg2(manager, "clearSimulatedLocations", 0, 0, 0, 0);
+    confirmed = r_last_call_ok() && confirmed;
     r_msg2(manager, "flush", 0, 0, 0, 0);
+    confirmed = r_last_call_ok() && confirmed;
     usleep(250000);
+    return confirmed;
 }
 
 static double locationsim_clamp(double value, double minValue, double maxValue)
@@ -547,10 +559,14 @@ static void locationsim_configure_route_manager(uint64_t manager)
            (unsigned long long)(newRepeat & 0xff));
 }
 
+// Returns the number of confirmed appends; *allConfirmedOut is false when any
+// append's outcome is unknown (it may or may not have reached the manager).
 static size_t locationsim_append_loop_locations(uint64_t manager,
                                                 const LocationSimConfig *config,
-                                                double *radiusOut)
+                                                double *radiusOut,
+                                                bool *allConfirmedOut)
 {
+    if (allConfirmedOut) *allConfirmedOut = true;
     if (!r_is_objc_ptr(manager) || !config) return 0;
 
     double radiusMeters = locationsim_clamp(config->horizontalAccuracy * 2.5, 10.0, 15.0);
@@ -593,7 +609,11 @@ static size_t locationsim_append_loop_locations(uint64_t manager,
         r_msg2(manager, "appendSimulatedLocation:", location, 0, 0, 0);
         // The manager retains what it keeps; drop our alloc/init +1 once the
         // hand-off verifiably completed (otherwise leak: it may still run).
-        if (r_last_call_ok()) locationsim_release_owned(location);
+        if (!r_last_call_ok()) {
+            if (allConfirmedOut) *allConfirmedOut = false;
+            continue;
+        }
+        locationsim_release_owned(location);
         appended++;
     }
 
@@ -669,19 +689,27 @@ static bool locationsim_apply_to_host(const LocationSimConfig *config,
         // Replacement: the previous apply's manager goes first. Whatever its
         // deallocation does, the stop sequence below does anyway.
         locationsim_release_previous_manager(host);
-        locationsim_stop_manager(manager);
+        bool confirmed = locationsim_stop_manager(manager);
         locationsim_configure_route_manager(manager);
 
         double radiusMeters = 0.0;
+        bool appendsConfirmed = true;
         size_t routePoints = locationsim_append_loop_locations(manager,
                                                                config,
-                                                               &radiusMeters);
+                                                               &radiusMeters,
+                                                               &appendsConfirmed);
+        confirmed = appendsConfirmed && confirmed;
+        bool started = false;   // start attempted: the manager may be running
         if (routePoints > 0) {
             r_msg2(manager, "flush", 0, 0, 0, 0);
+            confirmed = r_last_call_ok() && confirmed;
             r_msg2(manager, "startLocationSimulation", 0, 0, 0, 0);
+            confirmed = r_last_call_ok() && confirmed;
+            started = true;
             locationsim_notify_timezone();
-            ok = true;
-            printf("[LOCSIM] started loop %.8f, %.8f alt=%.1f hAcc=%.1f host=%s points=%zu radius=%.1fm\n",
+            ok = confirmed;
+            printf("[LOCSIM] %s loop %.8f, %.8f alt=%.1f hAcc=%.1f host=%s points=%zu radius=%.1fm\n",
+                   confirmed ? "started" : "start NOT confirmed (lost RemoteCall reply) for",
                    config->latitude,
                    config->longitude,
                    config->altitude,
@@ -693,8 +721,9 @@ static bool locationsim_apply_to_host(const LocationSimConfig *config,
             printf("[LOCSIM] no loop locations appended host=%s\n", host);
         }
 
-        if (ok) {
-            // Keep the running simulation's manager alive deliberately.
+        if (started) {
+            // Keep the running simulation's manager alive deliberately, even
+            // when the start wasn't confirmed: it may be running regardless.
             if (!locationsim_session_clean() ||
                 !locationsim_store_active_manager(host, manager)) {
                 printf("[LOCSIM] simulation manager kept alive untracked host=%s\n", host);
@@ -782,14 +811,20 @@ static bool locationsim_stop_in_host(const char *hostProcess, bool launchHost, i
     bool ok = false;
     uint64_t manager = locationsim_new_manager();
     if (r_is_objc_ptr(manager)) {
-        locationsim_stop_manager(manager);
+        bool confirmed = locationsim_stop_manager(manager);
         locationsim_notify_timezone();
-        ok = true;
-        printf("[LOCSIM] stopped host=%s\n", host);
-        // Simulation stopped: the apply's manager (same host instance only)
-        // and this temporary one can go — each only if confirmed.
-        locationsim_release_previous_manager(host);
-        locationsim_release_owned(manager);
+        ok = confirmed;
+        if (confirmed) {
+            printf("[LOCSIM] stopped host=%s\n", host);
+            // Simulation stopped: the apply's manager (same host instance only)
+            // and this temporary one can go — each only if confirmed.
+            locationsim_release_previous_manager(host);
+            locationsim_release_owned(manager);
+        } else {
+            // Outcome unknown: keep the apply's manager stored (it may still
+            // be running) and leak this temporary one.
+            printf("[LOCSIM] stop NOT confirmed (lost RemoteCall reply) host=%s\n", host);
+        }
     }
 
     destroy_remote_call();

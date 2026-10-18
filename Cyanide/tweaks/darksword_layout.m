@@ -718,7 +718,9 @@ static bool darksword_layout_apply_in_session_ios26(double exL, double exR, doub
     for (int i = 0; i < nlv; i++) {
         haveFrameCache[i] = false;
         if (!lvs[i]) continue;
-        haveFrameCache[i] = r_msg2_main_struct_ret(lvs[i], "frame",
+        // -bounds, not -frame: frame reflects the transform a prior Run
+        // applied below, which would skew both the size vote and the scale.
+        haveFrameCache[i] = r_msg2_main_struct_ret(lvs[i], "bounds",
                                                     frameCache[i], sizeof(frameCache[i]),
                                                     NULL, 0, NULL, 0, NULL, 0, NULL, 0);
         if (!haveFrameCache[i]) continue;
@@ -777,7 +779,7 @@ static bool darksword_layout_apply_in_session_ios26(double exL, double exR, doub
         double frame[4] = { 0, 0, 0, 0 };
         bool haveFrame = haveFrameCache[i];
         if (haveFrame) memcpy(frame, frameCache[i], sizeof(frame));
-        else haveFrame = r_msg2_main_struct_ret(lv, "frame", frame, sizeof(frame),
+        else haveFrame = r_msg2_main_struct_ret(lv, "bounds", frame, sizeof(frame),
                                                 NULL, 0, NULL, 0, NULL, 0, NULL, 0);
         if (haveFrame) {
             double w = frame[2], h = frame[3];

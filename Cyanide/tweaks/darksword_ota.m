@@ -771,16 +771,22 @@ bool darksword_ota_set_disabled(bool disabled)
         return false;
     }
 
-    if (disabled && kexploit_krw_ready()) {
+    if (disabled || !krw_persistence_launchd_holds_krw()) {
+        // Live KRW: try direct /private/var access first for both directions.
         bool noRootAccess = false;
         bool ok = ota_set_local_with_launchd_krw(disabled, &noRootAccess);
+        // Ancillary cleanup only once the primary plist edit is known good.
+        if (!disabled && ok) {
+            ok = ota_run_enable_cleanup();
+        }
         if (ok || !noRootAccess) {
-            printf("[OTA] === DISABLE OTA result=%d reboot/userspace restart required ===\n", ok);
+            printf("[OTA] === %s OTA result=%d reboot/userspace restart required ===\n",
+                   disabled ? "DISABLE" : "ENABLE", ok);
             return ok;
         }
         // Direct root access unavailable: fall back to the redirect route below.
         printf("[OTA] direct root access unavailable; trying launchd dir redirect\n");
-    } else if (krw_persistence_launchd_holds_krw()) {
+    } else {
         bool ok = ota_set_local_with_launchd_krw(disabled, NULL);
         // Ancillary cleanup only once the primary plist edit is known good.
         if (!disabled && ok) {
@@ -823,9 +829,18 @@ bool darksword_ota_set_disabled(bool disabled)
         ok = false;
     }
 
-    // Ancillary cleanup only once the primary plist edit is known good.
+    // Ancillary cleanup only once the primary plist edit is known good. The
+    // cleanup writes under /var/mobile, so it needs local root rw first.
     if (!disabled && ok) {
-        ok = ota_run_enable_cleanup();
+        if (!ota_prepare_local_root_rw()) {
+            printf("[OTA] disabled.plist re-enabled OTA daemons; "
+                   "cleanup skipped: no local /private/var rw access\n");
+            ok = false;
+        } else if (!ota_run_enable_cleanup()) {
+            printf("[OTA] disabled.plist re-enabled OTA daemons; "
+                   "catalog/MobileGestalt cleanup failed\n");
+            ok = false;
+        }
     }
 
     printf("[OTA] === %s OTA result=%d reboot/userspace restart required ===\n",
