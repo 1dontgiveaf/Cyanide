@@ -12432,8 +12432,22 @@ NSData *settings_root_read_file(NSString *path, NSUInteger maxBytes, BOOL *trunc
 //
 // The hijacked launchd thread must never block: posix_spawn is bounded to 3 s
 // and the child redirects its output, so launchd does not wait for the shell.
-static BOOL settings_debug_launchd_root_exec(NSString *outPath, NSString **messageOut)
+static BOOL settings_debug_launchd_spawn(NSString *exePath,
+                                         NSArray<NSString *> *arguments,
+                                         NSString *outPath,
+                                         NSString **messageOut)
 {
+    if (exePath.length == 0 ||
+        ![[NSFileManager defaultManager] isExecutableFileAtPath:exePath]) {
+        if (messageOut) *messageOut = [NSString stringWithFormat:
+            @"Executable not found: %@", exePath ?: @"(nil)"];
+        return NO;
+    }
+    if (arguments.count > 4) {
+        if (messageOut) *messageOut = @"Too many proof arguments.";
+        return NO;
+    }
+
     __block NSString *error = nil;
     __block int spawnRC = -1;
     __block int childPid = 0;
@@ -12447,30 +12461,33 @@ static BOOL settings_debug_launchd_root_exec(NSString *outPath, NSString **messa
             error = ok ? @"launchd malloc failed." : @"launchd transport failed.";
             return;
         }
-        // Scratch layout inside launchd: strings, argv/envp pointer arrays,
-        // and the pid_t result. All offsets are 16-byte aligned.
-        //
-        // Spawn OUR OWN signed executable, not /bin/sh: stock iOS does not
-        // ship a shell (the old proof got ENOENT), and the app binary is
-        // definitely present and signed. The child mode in main.m writes the
-        // real uid/euid before UIKit starts.
-        const uint64_t offExe = 0x000, offFlag = 0x300, offOut = 0x340;
-        const uint64_t offArgv = 0x500, offEnvp = 0x540;
-        const uint64_t offEnvPath = 0x580, offEnvHome = 0x600, offPid = 0x680;
-        NSString *exe = NSBundle.mainBundle.executablePath;
-        NSString *flag = @"--cyanide-root-exec-child";
-        BOOL wrote = exe.length > 0 &&
-            [s remoteWriteString:buf + offExe value:exe.fileSystemRepresentation] &&
-            [s remoteWriteString:buf + offFlag value:flag.UTF8String] &&
-            [s remoteWriteString:buf + offOut value:outPath.fileSystemRepresentation] &&
-            [s remoteWriteString:buf + offEnvPath value:"PATH=/usr/bin:/bin:/usr/sbin:/sbin"] &&
-            [s remoteWriteString:buf + offEnvHome value:"HOME=/var/mobile"];
-        if (wrote) {
-            uint64_t argv[4] = { buf + offExe, buf + offFlag, buf + offOut, 0 };
-            uint64_t envp[3] = { buf + offEnvPath, buf + offEnvHome, 0 };
-            wrote = [s remoteWrite:buf + offArgv from:argv size:sizeof(argv)] &&
-                    [s remoteWrite:buf + offEnvp from:envp size:sizeof(envp)];
+        // Scratch layout inside launchd. The parent app path and each argument
+        // get 0x100 bytes; argv/envp arrays and the pid_t result follow.
+        const uint64_t offExe = 0x000, offArgs = 0x200, argStride = 0x100;
+        const uint64_t offArgv = 0x700, offEnvp = 0x740;
+        const uint64_t offEnvPath = 0x780, offEnvHome = 0x7C0, offPid = 0x800;
+        BOOL wrote = [s remoteWriteString:buf + offExe value:exePath.fileSystemRepresentation];
+        uint64_t argv[8] = {0};
+        int argc = 0;
+        argv[argc++] = buf + offExe;
+        for (NSUInteger i = 0; wrote && i < arguments.count; i++) {
+            NSString *arg = arguments[i];
+            if (![arg isKindOfClass:NSString.class] ||
+                strlen(arg.fileSystemRepresentation) >= argStride) {
+                wrote = NO;
+                break;
+            }
+            uint64_t at = buf + offArgs + i * argStride;
+            wrote = [s remoteWriteString:at value:arg.fileSystemRepresentation];
+            argv[argc++] = at;
         }
+        argv[argc] = 0;
+        uint64_t envp[3] = { buf + offEnvPath, buf + offEnvHome, 0 };
+        wrote = wrote &&
+            [s remoteWriteString:buf + offEnvPath value:"PATH=/usr/bin:/bin:/usr/sbin:/sbin"] &&
+            [s remoteWriteString:buf + offEnvHome value:"HOME=/var/mobile"] &&
+            [s remoteWrite:buf + offArgv from:argv size:(uint64_t)(argc + 1) * sizeof(uint64_t)] &&
+            [s remoteWrite:buf + offEnvp from:envp size:sizeof(envp)];
         if (!wrote) {
             error = @"could not build the launchd argv/envp block.";
             pm_root_call(s, 1000, "free", buf, 0, 0, &ok);
@@ -12505,7 +12522,7 @@ static BOOL settings_debug_launchd_root_exec(NSString *outPath, NSString **messa
         return NO;
     }
 
-    // Wait up to 5 s for the root shell to write the output file. The child is
+    // Wait up to 5 s for the child to write the output file. The child is
     // independent of the launchd session, which has already been released.
     NSFileManager *fm = NSFileManager.defaultManager;
     for (int i = 0; i < 50; i++) {
@@ -12518,7 +12535,7 @@ static BOOL settings_debug_launchd_root_exec(NSString *outPath, NSString **messa
     if (contents.length == 0) {
         if (messageOut) *messageOut = [NSString stringWithFormat:
             @"posix_spawn returned 0 (pid %d), but no output appeared at %@. "
-            @"The shell may have been denied exec or write.", childPid, outPath];
+            @"The child may have been denied exec or write.", childPid, outPath];
         return NO;
     }
     if (messageOut) *messageOut = [NSString stringWithFormat:
@@ -12526,18 +12543,35 @@ static BOOL settings_debug_launchd_root_exec(NSString *outPath, NSString **messa
     return YES;
 }
 
-static void settings_debug_present_root_exec_proof(UIViewController *presenter)
+static BOOL settings_debug_launchd_root_exec(NSString *outPath, NSString **messageOut)
 {
-    NSString *outPath = [NSTemporaryDirectory()
-        stringByAppendingPathComponent:@"cyanide-root-exec-proof.txt"];
+    return settings_debug_launchd_spawn(NSBundle.mainBundle.executablePath,
+                                        @[ @"--cyanide-root-exec-child", outPath ],
+                                        outPath, messageOut);
+}
+
+static BOOL settings_debug_launchd_helper_exec(NSString *outPath, NSString **messageOut)
+{
+    NSString *helper = [NSBundle.mainBundle.bundlePath
+        stringByAppendingPathComponent:@"Helpers/hello"];
+    return settings_debug_launchd_spawn(helper, @[ outPath ], outPath, messageOut);
+}
+
+static void settings_debug_present_launchd_proof(UIViewController *presenter, BOOL nestedHelper)
+{
+    NSString *outPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
+        (nestedHelper ? @"cyanide-helper-exec-proof.txt" : @"cyanide-root-exec-proof.txt")];
+    NSString *title = nestedHelper ? @"Launchd Nested Helper Proof" : @"Launchd Root Exec Proof";
+    NSString *what = nestedHelper
+        ? @"a separate dev-signed Helpers/hello binary from the app bundle"
+        : @"Cyanide's own signed executable in a tiny child mode";
     UIAlertController *ac = [UIAlertController
-        alertControllerWithTitle:@"Launchd Root Exec Proof"
+        alertControllerWithTitle:title
                          message:[NSString stringWithFormat:
-            @"Debug only. Asks launchd (root, unsandboxed) to spawn Cyanide's "
-            @"own signed executable in a tiny child mode, which writes its real "
-            @"uid/euid to:\n%@\n\nNo shell, no root filesystem writes, no "
-            @"remount. A blocked launchd thread can reboot the device; keep "
-            @"Cyanide in the foreground.", outPath]
+            @"Debug only. Asks launchd (root, unsandboxed) to spawn %@, which "
+            @"writes its real uid/euid to:\n%@\n\nNo shell, no root "
+            @"filesystem writes, no remount. A blocked launchd thread can "
+            @"reboot the device; keep Cyanide in the foreground.", what, outPath]
                   preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     __weak UIViewController *weakPresenter = presenter;
@@ -12547,13 +12581,15 @@ static void settings_debug_present_root_exec_proof(UIViewController *presenter)
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             NSString *message = nil;
             BOOL ok = NO;
-            if (!settings_try_claim_actions_lock("launchd root exec proof",
+            if (!settings_try_claim_actions_lock("launchd exec proof",
                                                  "[DEBUG] Another action is already running.")) {
                 message = @"Another action is already running.";
             } else {
                 @try {
                     [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
-                    ok = settings_debug_launchd_root_exec(outPath, &message);
+                    ok = nestedHelper
+                        ? settings_debug_launchd_helper_exec(outPath, &message)
+                        : settings_debug_launchd_root_exec(outPath, &message);
                 } @finally {
                     settings_release_actions_lock();
                 }
@@ -12562,8 +12598,8 @@ static void settings_debug_present_root_exec_proof(UIViewController *presenter)
                 UIViewController *host = weakPresenter;
                 if (!host) return;
                 UIAlertController *result = [UIAlertController
-                    alertControllerWithTitle:ok ? @"Root Exec Proof: SUCCESS"
-                                               : @"Root Exec Proof: FAILED"
+                    alertControllerWithTitle:ok ? [title stringByAppendingString:@": SUCCESS"]
+                                               : [title stringByAppendingString:@": FAILED"]
                                      message:message ?: @"No detail."
                               preferredStyle:UIAlertControllerStyleAlert];
                 [result addAction:[UIAlertAction actionWithTitle:@"OK"
@@ -13728,6 +13764,9 @@ static NSUInteger settings_tab_index_for_title(UITabBarController *tab, NSString
         @{ @"kind": @"button", @"action": @"debug-root-exec-proof",
            @"title": @"[Debug] Launchd root exec proof",
            @"subtitle": @"Debug only: asks launchd to posix_spawn Cyanide's own signed executable in a child mode that writes its real uid. No shell, no root filesystem writes, no remount." },
+        @{ @"kind": @"button", @"action": @"debug-helper-exec-proof",
+           @"title": @"[Debug] Launchd nested helper proof",
+           @"subtitle": @"Debug only: asks launchd to posix_spawn Helpers/hello (a separate dev-signed binary in the app bundle). Tests whether nested helper binaries are accepted by AMFI." },
 #endif
         @{ @"key": kSettingsLocationServicesLinksEnabled, @"title": @"Location Services links",
            @"subtitle": @"Lets cyanide://location-services links turn Location Services on or off. Any app can open these links without asking, so this is off by default. The Control Center toggle and the Shortcuts action work without it." },
@@ -18838,10 +18877,16 @@ void cyanide_present_contact(UIViewController *host)
 #if DEBUG
     if (indexPath.section == SectionLaunch) {
         NSArray<NSDictionary *> *launchRows = [self rowsForSection:SectionLaunch];
-        if (indexPath.row < (NSInteger)launchRows.count &&
-            [launchRows[indexPath.row][@"action"] isEqualToString:@"debug-root-exec-proof"]) {
-            settings_debug_present_root_exec_proof(self);
-            return;
+        if (indexPath.row < (NSInteger)launchRows.count) {
+            NSString *action = launchRows[indexPath.row][@"action"];
+            if ([action isEqualToString:@"debug-root-exec-proof"]) {
+                settings_debug_present_launchd_proof(self, NO);
+                return;
+            }
+            if ([action isEqualToString:@"debug-helper-exec-proof"]) {
+                settings_debug_present_launchd_proof(self, YES);
+                return;
+            }
         }
     }
 #endif
