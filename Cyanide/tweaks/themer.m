@@ -2500,16 +2500,9 @@ bool themer_apply_data_in_session(NSDictionary<NSString *, NSData *> *imageDataB
         return false;
     }
     imageDataByBundle = themer_normalized_theme_data(imageDataByBundle);
-    NSDictionary<NSString *, NSData *> *previousData = gThemerActiveThemeDataByBundle;
-    gThemerActiveThemeDataByBundle = [imageDataByBundle copy];
-    int staleDropped = themer_drop_stale_cache_entries(previousData, imageDataByBundle);
-    printf("[THEMER] apply data entries=%lu cacheCarried=%d staleDropped=%d\n",
-           (unsigned long)imageDataByBundle.count, gThemerCacheCount, staleDropped);
-    if (!gThemerVisiblePolicyLogged) {
-        gThemerVisiblePolicyLogged = true;
-        printf("[THEMER] visible push policy iosMajor=%d legacyVisible=%d\n",
-               themer_host_ios_major(),
-               themer_needs_visible_push(NULL));
+    if (imageDataByBundle.count == 0) {
+        printf("[THEMER] apply data: normalization left no usable icons\n");
+        return false;
     }
 
     // Drop the per-msgSend settle for the duration of the apply. The stable
@@ -2517,9 +2510,10 @@ bool themer_apply_data_in_session(NSDictionary<NSString *, NSData *> *imageDataB
     // ObjC send just makes the initial icon flip visibly lag.
     uint64_t startUS = themer_now_us();
     uint32_t prevSettle = r_settle_us(kThemerApplySettleUS);
-    themer_unthem_removed_bundles(previousData, imageDataByBundle);
-    themer_reset_icon_bundle_cache();
 
+    // Resolve the target BEFORE committing the new theme. These checks can
+    // fail (no visible SBIconListView, older/unknown SpringBoard); a failed
+    // apply must leave the previous active theme and its image cache intact.
     uint64_t listViewCls = r_class("SBIconListView");
     uint64_t iconViewCls = r_class("SBIconView");
     if (!r_is_objc_ptr(listViewCls) || !r_is_objc_ptr(iconViewCls)) {
@@ -2538,6 +2532,21 @@ bool themer_apply_data_in_session(NSDictionary<NSString *, NSData *> *imageDataB
         r_settle_us(prevSettle);
         return false;
     }
+
+    // The apply can proceed: commit the new theme now.
+    NSDictionary<NSString *, NSData *> *previousData = gThemerActiveThemeDataByBundle;
+    gThemerActiveThemeDataByBundle = [imageDataByBundle copy];
+    int staleDropped = themer_drop_stale_cache_entries(previousData, imageDataByBundle);
+    printf("[THEMER] apply data entries=%lu cacheCarried=%d staleDropped=%d\n",
+           (unsigned long)imageDataByBundle.count, gThemerCacheCount, staleDropped);
+    if (!gThemerVisiblePolicyLogged) {
+        gThemerVisiblePolicyLogged = true;
+        printf("[THEMER] visible push policy iosMajor=%d legacyVisible=%d\n",
+               themer_host_ios_major(),
+               themer_needs_visible_push(NULL));
+    }
+    themer_unthem_removed_bundles(previousData, imageDataByBundle);
+    themer_reset_icon_bundle_cache();
 
     // Resolve the shared icon-image cache + appearances once so the model pass
     // can cache every themed icon (all pages), fixing off-screen pages showing
