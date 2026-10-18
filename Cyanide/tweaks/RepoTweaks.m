@@ -1044,7 +1044,9 @@ static void repotweaks_prune_unlisted_scripts(NSUserDefaults *d,
         NSString *enabledKey = [@"RepoTweakEnabled_" stringByAppendingString:storageKey];
         NSString *versionKey = [@"RepoTweakInstalledVersion_" stringByAppendingString:storageKey];
         if ([d boolForKey:enabledKey]) continue;
-        if ([[d stringForKey:versionKey] length] > 0) continue;
+        // Presence, not length: installs record `self.version ?: @""`, so an
+        // installed tweak with an empty version must still count as installed.
+        if ([d objectForKey:versionKey] != nil) continue;
         [d removeObjectForKey:key];
         [d removeObjectForKey:[@"RepoTweakValues_" stringByAppendingString:storageKey]];
         [d removeObjectForKey:[@"RepoTweakSeen_" stringByAppendingString:storageKey]];
