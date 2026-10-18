@@ -19,6 +19,7 @@ static NSString * const kMetadataName      = @".com.apple.mobile_container_manag
 @property (nonatomic, copy) NSString *identifier;
 @property (nonatomic, copy) NSString *displayName;
 @property (nonatomic, strong) UIImage *icon;
+@property (nonatomic) BOOL viaRoot;   // metadata was read through launchd root
 @end
 
 @implementation FBAppContainer
@@ -199,6 +200,7 @@ static FBAppContainer *fb_make_container_locked(NSString *dir, FBContainerKind k
     c.kind = kind;
     c.path = dir;
     c.identifier = identifier;
+    c.viaRoot = viaRoot;
     NSDictionary<NSString *, FBAppRecord *> *apps = fb_apps_locked();
     FBAppRecord *app = apps[identifier];
     if (kind == FBContainerKindPlugin && !app) {
@@ -236,6 +238,10 @@ FBAppContainer *fb_container_for_path(NSString *path, BOOL viaRoot)
             if (!c) {
                 c = fb_make_container_locked(dir, (FBContainerKind)i, viaRoot);
                 if (c) g_containers[dir] = c;
+            } else if (viaRoot) {
+                // Cached from a mobile-readable earlier lookup; related lookups
+                // may still need the root path.
+                c.viaRoot = YES;
             }
             return c;
         }
@@ -243,18 +249,30 @@ FBAppContainer *fb_container_for_path(NSString *path, BOOL viaRoot)
     return nil;
 }
 
-// Data containers by bundle identifier, read once on first use.
-static NSString *fb_data_container_for_id_locked(NSString *bundleID)
+// Data containers by bundle identifier, read once on first use. viaRoot is
+// passed through: a container whose metadata is only readable as root must not
+// be permanently missing from the index. The index is marked complete only
+// when the listing and every metadata read succeeded; an incomplete build is
+// retried on the next lookup instead of caching the hole.
+static NSString *fb_data_container_for_id_locked(NSString *bundleID, BOOL viaRoot)
 {
     if (!g_dataIndexed) {
+        NSArray<NSString *> *uuids =
+            [NSFileManager.defaultManager contentsOfDirectoryAtPath:kDataParent error:nil];
+        if (!uuids) return nil;   // unavailable right now; do not cache an empty index
         g_dataByBundleID = [NSMutableDictionary dictionary];
-        for (NSString *uuid in [NSFileManager.defaultManager contentsOfDirectoryAtPath:kDataParent error:nil]) {
+        BOOL complete = YES;
+        for (NSString *uuid in uuids) {
             NSString *dir = [kDataParent stringByAppendingPathComponent:uuid];
-            NSDictionary *meta = fb_read_plist([dir stringByAppendingPathComponent:kMetadataName], NO);
+            NSDictionary *meta = fb_read_plist([dir stringByAppendingPathComponent:kMetadataName], viaRoot);
+            if (!meta) {
+                complete = NO;
+                continue;
+            }
             NSString *bid = meta[@"MCMMetadataIdentifier"];
             if ([bid isKindOfClass:NSString.class]) g_dataByBundleID[bid] = dir;
         }
-        g_dataIndexed = YES;
+        g_dataIndexed = complete;
     }
     return g_dataByBundleID[bundleID];
 }
@@ -265,21 +283,21 @@ FBAppContainer *fb_related_container(FBAppContainer *container)
     @synchronized (fb_containers_lock()) {
         switch (container.kind) {
             case FBContainerKindBundle:
-                target = fb_data_container_for_id_locked(container.identifier);
+                target = fb_data_container_for_id_locked(container.identifier, container.viaRoot);
                 break;
             case FBContainerKindData:
                 target = fb_apps_locked()[container.identifier].bundleContainer;
                 break;
             case FBContainerKindPlugin: {
                 NSString *owner = fb_owner_app_id_locked(container.identifier);
-                target = owner ? fb_data_container_for_id_locked(owner) : nil;
+                target = owner ? fb_data_container_for_id_locked(owner, container.viaRoot) : nil;
                 break;
             }
             default:
                 break;
         }
     }
-    return target ? fb_container_for_path(target, NO) : nil;
+    return target ? fb_container_for_path(target, container.viaRoot) : nil;
 }
 
 void fb_containers_reset(void)
