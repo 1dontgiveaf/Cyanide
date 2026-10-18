@@ -810,11 +810,9 @@ NSString *CyanideNiceBarWeatherSummary(NSInteger code, BOOL chinese)
     self.weatherFetchInFlight = YES;
 
     NSString *unit = self.requestUsesCelsius ? @"celsius" : @"fahrenheit";
-    // ~11 km precision is enough to debug; the log is shareable/uploadable.
-    log_user("[NICEBAR] Weather fetching lat=%.1f lon=%.1f unit=%s.\n",
-             location.coordinate.latitude,
-             location.coordinate.longitude,
-             unit.UTF8String);
+    // No coordinates: the log is kept in Documents, shareable and uploadable,
+    // and even ~11 km is the user's location.
+    log_user("[NICEBAR] Weather fetching unit=%s.\n", unit.UTF8String);
     NSString *urlString = [NSString stringWithFormat:
         @"https://api.open-meteo.com/v1/forecast?latitude=%.5f&longitude=%.5f&current=temperature_2m,weather_code&temperature_unit=%@&timezone=auto",
         location.coordinate.latitude,

@@ -6784,16 +6784,36 @@ void stagestrip_start_control_loop(void)
     });
 }
 
-void stagestrip_stop_control_loop(void)
+// Asks the control loop to stop and waits up to 1.5 s (the registry's quick
+// stop request). Returns whether it has exited.
+bool stagestrip_stop_control_loop(void)
 {
     gStripControlLoopStop = 1;
     for (int i = 0; i < 75 && gStripControlLoopRunning; i++)
         usleep(20000);
+    return !gStripControlLoopRunning;
+}
+
+bool stagestrip_control_loop_running(void)
+{
+    return gStripControlLoopRunning != 0;
 }
 
 bool stagestrip_stop_in_session(void)
 {
-    stagestrip_stop_control_loop();
+    // The teardown below clears state the loop reads and writes (live scenes,
+    // float slots) and removes the SpringBoard objects it messages, so it may
+    // only run once the loop has really exited. One of its remote calls can
+    // take up to R_TIMEOUT to give up: wait past that before refusing.
+    bool exited = stagestrip_stop_control_loop();
+    for (int i = 0; !exited && i < (R_TIMEOUT * 1000 + 1500) / 20; i++) {
+        usleep(20000);
+        exited = !gStripControlLoopRunning;
+    }
+    if (!exited) {
+        printf("[STAGE] stop: control loop still running after %ds; leaving its state alone\n", R_TIMEOUT + 3);
+        return false;
+    }
     stagestrip_clear_live_rendering_state();
 
     uint64_t UIApplication = r_class("UIApplication");

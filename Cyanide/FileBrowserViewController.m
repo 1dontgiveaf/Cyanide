@@ -670,6 +670,7 @@ static BOOL fb_import_copy_path(NSString *source, NSString *target, NSUInteger *
     if (S_ISLNK(st.st_mode)) {
         char link[PATH_MAX];
         ssize_t n = readlink(source.fileSystemRepresentation, link, sizeof(link) - 1);
+        if (n >= 0 && n < (ssize_t)sizeof(link) - 1) link[n] = 0;   // readlink doesn't terminate
         if (n < 0 || n >= (ssize_t)sizeof(link) - 1 || symlink(link, target.fileSystemRepresentation) != 0) {
             if (failure) *failure = [NSString stringWithFormat:@"Couldn't copy link %@.", source.lastPathComponent];
             return NO;
@@ -709,6 +710,7 @@ static BOOL fb_import_copy_path(NSString *source, NSString *target, NSUInteger *
         } else if (S_ISLNK(childStat.st_mode)) {
             char link[PATH_MAX];
             ssize_t n = readlink(child.fileSystemRepresentation, link, sizeof(link) - 1);
+            if (n >= 0 && n < (ssize_t)sizeof(link) - 1) link[n] = 0;   // readlink doesn't terminate
             if (n < 0 || n >= (ssize_t)sizeof(link) - 1 || symlink(link, destination.fileSystemRepresentation) != 0) {
                 if (failure) *failure = [NSString stringWithFormat:@"Couldn't copy link %@.", relative];
                 return NO;

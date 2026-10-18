@@ -30,6 +30,9 @@ NSString *repotweaks_storage_key(NSString *repoURL, NSString *tweakId);
 NSString *repotweaks_enabled_defaults_key(NSString *repoURL, NSString *tweakId);
 NSString *repotweaks_script_defaults_key(NSString *repoURL, NSString *tweakId);
 NSString *repotweaks_values_defaults_key(NSString *repoURL, NSString *tweakId);
+// NO when the cached script came from a different scriptURL than the feed now
+// lists (its replacement failed to download): don't run it.
+BOOL repotweaks_cached_script_is_current(NSString *repoURL, NSString *tweakId);
 
 // Downloads the raw .js code for a specific repository tweak
 void repotweaks_download_script(NSString *repoURL, NSString *tweakId, NSString *scriptURL, void (^completion)(BOOL success));

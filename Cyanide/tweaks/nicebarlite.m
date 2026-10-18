@@ -476,20 +476,31 @@ NSString *nicebarlite_traffic_store_path(void)
             stringByAppendingPathComponent:@"NiceBarLiteTraffic.json"];
 }
 
-static NSMutableDictionary<NSString *, NSString *> *nbl_read_traffic_history_mutable(void)
+// The stored history: empty only when there is no file yet. nil when a file
+// exists but can't be read (*corrupt = NO) or parsed (*corrupt = YES) -- never
+// silently "empty", or the next sample would overwrite every earlier day.
+static NSMutableDictionary<NSString *, NSString *> *nbl_read_traffic_history_checked(BOOL *corrupt)
 {
+    if (corrupt) *corrupt = NO;
     NSString *path = nicebarlite_traffic_store_path();
-    NSData *data = [NSData dataWithContentsOfFile:path];
+    if (access(path.fileSystemRepresentation, F_OK) != 0 && errno == ENOENT)
+        return [NSMutableDictionary dictionary];
+    NSError *readError = nil;
+    NSData *data = [NSData dataWithContentsOfFile:path options:0 error:&readError];
+    if (!data) {
+        NBL_DEBUG_LOG("[NICEBARLITE][TRAFFIC] history exists but can't be read: %s\n",
+                      readError.localizedDescription.UTF8String ?: "unknown");
+        return nil;
+    }
     if (data.length == 0) return [NSMutableDictionary dictionary];
 
     NSError *error = nil;
     id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
     if (![obj isKindOfClass:NSDictionary.class]) {
-        if (error) {
-            NBL_DEBUG_LOG("[NICEBARLITE][TRAFFIC] history read failed: %s\n",
-                          error.localizedDescription.UTF8String ?: "unknown");
-        }
-        return [NSMutableDictionary dictionary];
+        NBL_DEBUG_LOG("[NICEBARLITE][TRAFFIC] history is not valid JSON: %s\n",
+                      error.localizedDescription.UTF8String ?: "not a dictionary");
+        if (corrupt) *corrupt = YES;
+        return nil;
     }
 
     NSMutableDictionary<NSString *, NSString *> *out = [NSMutableDictionary dictionary];
@@ -503,6 +514,11 @@ static NSMutableDictionary<NSString *, NSString *> *nbl_read_traffic_history_mut
         }
     }];
     return out;
+}
+
+static NSMutableDictionary<NSString *, NSString *> *nbl_read_traffic_history_mutable(void)
+{
+    return nbl_read_traffic_history_checked(NULL) ?: [NSMutableDictionary dictionary];
 }
 
 NSDictionary<NSString *, NSString *> *nicebarlite_traffic_history_snapshot(void)
@@ -558,7 +574,21 @@ static void nbl_persist_traffic_bytes(NSString *dateKey, uint64_t bytes, BOOL fo
         return;
     }
 
-    NSMutableDictionary<NSString *, NSString *> *history = nbl_read_traffic_history_mutable();
+    BOOL corrupt = NO;
+    NSMutableDictionary<NSString *, NSString *> *history = nbl_read_traffic_history_checked(&corrupt);
+    if (!history && !corrupt) return;   // unreadable right now: leave it, try again later
+    if (!history) {
+        // Unparseable: keep it as a recovery copy (the first one wins), then
+        // start a fresh history instead of overwriting the old bytes.
+        NSString *path = nicebarlite_traffic_store_path();
+        NSString *copy = [path.stringByDeletingPathExtension stringByAppendingString:@".corrupt.json"];
+        if (access(copy.fileSystemRepresentation, F_OK) != 0) {
+            if (rename(path.fileSystemRepresentation, copy.fileSystemRepresentation) != 0) return;
+            log_user("[NICEBARLITE] Traffic history was damaged; kept it as %s and started a new one.\n",
+                     copy.lastPathComponent.UTF8String);
+        }
+        history = [NSMutableDictionary dictionary];
+    }
     history[dateKey] = [NSString stringWithFormat:@"%llu", (unsigned long long)bytes];
     if (nbl_write_traffic_history(history)) {
         gNBLTrafficLastPersistedBytes = bytes;
@@ -983,13 +1013,15 @@ static double nbl_bottom_row_y(double topAreaHeight, NiceBarLiteConfig config)
     return fmax(kNBLBottomY, floor(y)) + config.bottomYOffset;
 }
 
+// These report whether the main-thread call verifiably completed, so a lost
+// update is retried on the next tick instead of being counted as done.
 static bool nbl_send_double_main(uint64_t obj, const char *selName, double value)
 {
     if (!r_is_objc_ptr(obj)) return false;
     r_msg2_main_raw(obj, selName,
                     &value, sizeof(value),
                     NULL, 0, NULL, 0, NULL, 0);
-    return true;
+    return r_last_main_ok();
 }
 
 static bool nbl_send_rect_main(uint64_t obj, const char *selName,
@@ -1000,7 +1032,7 @@ static bool nbl_send_rect_main(uint64_t obj, const char *selName,
     r_msg2_main_raw(obj, selName,
                     &rect, sizeof(rect),
                     NULL, 0, NULL, 0, NULL, 0);
-    return true;
+    return r_last_main_ok();
 }
 
 static void nbl_make_window_click_through(uint64_t win)
@@ -1061,7 +1093,7 @@ static bool nbl_set_text_fast(uint64_t label, uint64_t textObj)
     if (!gNBLSetTextSel) gNBLSetTextSel = r_sel("setText:");
     if (!gNBLSetTextSel) return false;
     r_msg2_main(label, "setText:", textObj, 0, 0, 0);
-    return true;
+    return r_last_main_ok();
 }
 
 static uint64_t nbl_status_text_color(void)
@@ -1559,6 +1591,7 @@ bool nicebarlite_apply_in_session(NiceBarLiteConfig config)
         unsigned long long setFrameMs = 0;
         unsigned long long setHiddenMs = 0;
         BOOL textSetOK = YES;
+        BOOL layoutLanded = YES;
         if (textChanged) {
             uint64_t setTextStartUs = nbl_now_us();
             uint64_t textObj = nbl_nsstring_utf8_fast(text.UTF8String);
@@ -1570,26 +1603,38 @@ bool nicebarlite_apply_in_session(NiceBarLiteConfig config)
                 ok &= setOK;
                 textSetOK = setOK ? YES : NO;
                 nbl_release_remote_obj(textObj);
-                gNBLLastText[i] = [text copy];
+                // Cached only once it is verifiably shown: a lost setText:
+                // is sent again next tick.
+                gNBLLastText[i] = setOK ? [text copy] : nil;
             }
             setTextMs = nbl_elapsed_ms_since(setTextStartUs);
         }
         if (layoutChanged) {
             uint64_t setFrameStartUs = nbl_now_us();
             r_msg2_main(label, "setTextAlignment:", 1, 0, 0, 0);
-            ok &= nbl_send_rect_main(label, "setFrame:", rect.x, rect.y, rect.width, rect.height);
-            gNBLLastX[i] = rect.x;
-            gNBLLastY[i] = rect.y;
-            gNBLLastW[i] = rect.width;
+            bool frameOK = nbl_send_rect_main(label, "setFrame:", rect.x, rect.y, rect.width, rect.height);
+            ok &= frameOK;
+            if (frameOK) {
+                gNBLLastX[i] = rect.x;
+                gNBLLastY[i] = rect.y;
+                gNBLLastW[i] = rect.width;
+            } else {
+                layoutLanded = NO;
+            }
             setFrameMs = nbl_elapsed_ms_since(setFrameStartUs);
         }
         if (hiddenChanged) {
             uint64_t setHiddenStartUs = nbl_now_us();
             r_msg2_main(label, "setHidden:", hidden[i] ? 1 : 0, 0, 0, 0);
+            bool hiddenOK = r_last_main_ok();
+            ok &= hiddenOK;
             gNBLLastHidden[i] = hidden[i];
+            if (!hiddenOK) layoutLanded = NO;
             setHiddenMs = nbl_elapsed_ms_since(setHiddenStartUs);
         }
-        gNBLHasLastLayout[i] = YES;
+        // A frame or hidden update that didn't verifiably land leaves no
+        // cached layout, so the next tick sends both again.
+        gNBLHasLastLayout[i] = layoutLanded;
         unsigned long long slotMs = nbl_elapsed_ms_since(slotStartUs);
         if (trace || slotMs >= kNBLSlowLogMs || !textSetOK) {
             NBL_DEBUG_LOG("[NICEBARLITE][SLOT] slot=%s kind=%s item=%s len=%lu textChanged=%d layoutChanged=%d hiddenChanged=%d textOK=%d rect=%.0f,%.0f %.0fx%.0f ensure=%llums style=%llums measure=%llums setText=%llums setFrame=%llums setHidden=%llums total=%llums\n",

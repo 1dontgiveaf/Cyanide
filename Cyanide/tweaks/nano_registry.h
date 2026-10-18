@@ -62,6 +62,9 @@ bool nano_registry_seed_current_phone_compatibility_index(int max_pairing_versio
 // the file with its stale cache the next time any process calls
 // CFPreferencesSetValue on the same domain. Pass apply=false to clear.
 // Requires KRW (kexploit must have run); does its own RemoteCall init.
+// The live push is currently disabled for stability: this only posts the
+// change notification and returns false, so the caller reports that a
+// respring is needed before the override takes effect.
 bool nano_registry_push_to_cfprefsd(const nano_registry_values *values, bool apply);
 
 #endif /* nano_registry_h */

@@ -6,6 +6,7 @@
 //
 
 #import "SceneDelegate.h"
+#import <objc/message.h>
 #import "LogTextView.h"
 #import "AppDelegate.h"            // round 31: cyanide_launch_trace
 #import "SettingsViewController.h"
@@ -58,6 +59,13 @@ static void scene_note_session(UISceneSession *session)
 // Cyanide, go Home, use the toggle" looks like. A touch or a longer stay is
 // something only the user does.
 static BOOL g_scene_user_opened = NO;               // main thread only
+// The same signals per foreground visit: the user touched Cyanide or kept it
+// in front kSceneUserStaySeconds since it last came to the foreground. A
+// request arriving during such a visit was run from inside Cyanide (Control
+// Center or Siri over it) and stays there; any other request brought Cyanide
+// up and sends the user back afterwards. Reset when the scene connects or
+// enters the foreground.
+static BOOL g_scene_visit_user_owned = NO;          // main thread only
 static uint64_t g_scene_idle_active_since_ns = 0;   // active with no request; 0 = not
 static const double kSceneUserStaySeconds = 4.0;
 
@@ -66,6 +74,7 @@ static void scene_note_idle_active_end(void)
     if (!g_scene_idle_active_since_ns) return;
     double stayed = (double)(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - g_scene_idle_active_since_ns) / 1e9;
     g_scene_idle_active_since_ns = 0;
+    if (stayed >= kSceneUserStaySeconds) g_scene_visit_user_owned = YES;
     if (stayed >= kSceneUserStaySeconds && !g_scene_user_opened) {
         g_scene_user_opened = YES;
         log_user("[URL] app was in front %.1fs: opened by the user\n", stayed);
@@ -74,6 +83,7 @@ static void scene_note_idle_active_end(void)
 
 static void scene_note_user_touch(void)
 {
+    g_scene_visit_user_owned = YES;
     if (g_scene_user_opened) return;
     g_scene_user_opened = YES;
     log_user("[URL] app touched: opened by the user\n");
@@ -141,6 +151,11 @@ static BOOL scene_request_launched_app(void)
 // A successful quiet run that couldn't go Home because Cyanide was inactive
 // at that moment: done on the next activation.
 @property (nonatomic, assign) BOOL homeOnNextActivation;
+// With homeOnNextActivation: the app to go back to instead of Home (nil = Home).
+@property (nonatomic, copy) NSString *returnAppOnNextActivation;
+// Whether the waiting request (pendingActionURL) brought Cyanide to the
+// front, judged when it arrived (g_scene_visit_user_owned).
+@property (nonatomic, assign) BOOL pendingActionBroughtToFront;
 // Identifies the current shortcut run: a delayed return-to-Home from an
 // earlier run must not act on a later one.
 @property (nonatomic, assign) NSUInteger actionGeneration;
@@ -168,6 +183,7 @@ static CYLocationRequestCompletion g_scene_intent_completion = nil;
 
 - (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)connectionOptions {
     scene_note_session(session);   // before any request is judged (scene_request_launched_app)
+    g_scene_visit_user_owned = NO;
     cyanide_launch_trace("scene willConnect: entry");
     {
         // Diagnostics: what iOS says about why this scene connected.
@@ -268,12 +284,14 @@ static CYLocationRequestCompletion g_scene_intent_completion = nil;
     self.pendingActionURL = url;
     self.pendingActionCompletion = completion;
     self.pendingActionCold = cold;
+    self.pendingActionBroughtToFront = cold || !g_scene_visit_user_owned;
     if (replaced && replaced != completion) replaced(NO, @"A newer Location Services request replaced this one.");
 }
 
 - (void)receiveActionURL:(NSURL *)url scene:(UIScene *)scene completion:(CYLocationRequestCompletion)completion coldLaunched:(BOOL)cold {
     if (scene.activationState == UISceneActivationStateForegroundActive) {
-        [self handleActionURL:url completion:completion coldLaunched:cold];
+        [self handleActionURL:url completion:completion coldLaunched:cold
+               broughtToFront:cold || !g_scene_visit_user_owned];
     } else {
         [self setPendingURL:url completion:completion coldLaunched:cold];   // sceneDidBecomeActive runs it
         [self coverEarlyForURL:url];
@@ -393,6 +411,23 @@ static void scene_suspend_to_home(void)
             UIApplication.sharedApplication, suspend);
     }
 }
+
+static const double kSceneReturnAppTimeout = 1.5;
+
+// Brings another app to the front, as a launch from its icon would.
+// NO when iOS refused (or the API is missing): the caller goes Home instead.
+static BOOL scene_open_app(NSString *bundleID)
+{
+    if (bundleID.length == 0) return NO;
+    Class workspaceClass = NSClassFromString(@"LSApplicationWorkspace");
+    SEL defaultSel = NSSelectorFromString(@"defaultWorkspace");
+    SEL openSel = NSSelectorFromString(@"openApplicationWithBundleID:");
+    if (![workspaceClass respondsToSelector:defaultSel]) return NO;
+    id workspace = ((id (*)(id, SEL))objc_msgSend)(workspaceClass, defaultSel);
+    if (![workspace respondsToSelector:openSel]) return NO;
+    return ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace, openSel, bundleID);
+}
+
 
 - (UIViewController *)topViewController {
     UIViewController *top = self.window.rootViewController;
@@ -614,9 +649,11 @@ static const double kQuietMinPhase = 0.35;   // a phase stays readable at least 
 }
 
 // cyanide://location-services/toggle | /on | /off. Runs only that action.
-//  - Default (quiet): a progress screen instead of Cyanide's UI; on success
-//    Cyanide returns to the Home Screen as soon as its SpringBoard work is
-//    finished. Only a run that COLD-LAUNCHED Cyanide then has SpringBoard
+//  - Default (quiet): a progress screen instead of Cyanide's UI; on success,
+//    as soon as its SpringBoard work is finished, Cyanide goes back to where
+//    the request was made: the app that was open, or the Home Screen (also
+//    when that can't be read). Run while Cyanide itself was in front, it
+//    stays. Only a run that COLD-LAUNCHED Cyanide then has SpringBoard
 //    remove the switcher card (unless keepInSwitcher=1) — the card was
 //    created for that run. A request that found Cyanide already open never
 //    removes the card: it would close the app in front of the user, and a
@@ -628,6 +665,35 @@ static const double kQuietMinPhase = 0.35;   // a phase stays readable at least 
 }
 
 - (void)handleActionURL:(NSURL *)url completion:(CYLocationRequestCompletion)requester coldLaunched:(BOOL)cold {
+    [self handleActionURL:url completion:requester coldLaunched:cold
+           broughtToFront:cold || !g_scene_visit_user_owned];
+}
+
+// Back to where the request was made: the app that was open, else Home.
+// If iOS doesn't bring the app up, Home as before -- never left sitting on
+// the result. Cyanide stops being active as soon as the switch to the app
+// starts, so only a request that never started shows as "still active";
+// the window leaves room for a slow (cold) relaunch of that app.
+- (void)leaveToApp:(NSString *)bundleID {
+    if (bundleID.length == 0 || !scene_open_app(bundleID)) {
+        if (bundleID.length) NSLog(@"[URL] could not reopen the previous app; going Home");
+        scene_suspend_to_home();
+        return;
+    }
+    NSUInteger generation = self.actionGeneration;
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kSceneReturnAppTimeout * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        typeof(self) me = weakSelf;
+        if (!me || generation != me.actionGeneration || me.actionInProgress) return;
+        if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return;
+        NSLog(@"[URL] previous app did not come up; going Home");
+        scene_suspend_to_home();
+    });
+}
+
+- (void)handleActionURL:(NSURL *)url completion:(CYLocationRequestCompletion)requester coldLaunched:(BOOL)cold
+         broughtToFront:(BOOL)broughtToFront {
     if (![url.host.lowercaseString isEqualToString:@"location-services"]) {
         NSLog(@"[URL] unhandled %@", url);
         if (requester) requester(NO, @"Unsupported link.");
@@ -673,6 +739,10 @@ static const double kQuietMinPhase = 0.35;   // a phase stays readable at least 
     // keepInSwitcher=1 opts even that out). A run that found Cyanide open
     // keeps the card — the app was the user's before the request.
     BOOL removeCard = cold && !keepCard && scene_can_suspend_to_home();
+    // Leave only if this request brought Cyanide to the front; one run while
+    // the user had Cyanide open (Siri or Control Center over it) stays.
+    log_user("[URL] request %s\n", broughtToFront ? "brought Cyanide to the front: will go back afterwards"
+                                                  : "came while Cyanide was open: staying");
     NSUInteger generation = ++self.actionGeneration;
     self.actionInProgress = YES;
     // When the result actually appears on screen (main thread), for the
@@ -708,7 +778,8 @@ static const double kQuietMinPhase = 0.35;   // a phase stays readable at least 
         // "Run Full Exploit". Live or parked kernel access only.
         // removeCard: only a run that cold-launched Cyanide (and did not ask
         // to keep the card) may have the switcher card removed afterwards.
-        settings_location_services_set_async(desired, NO, removeCard, showLog ? kLogResultPause : 0, progress,
+        settings_location_services_set_async(desired, NO, removeCard, broughtToFront,
+                                             showLog ? kLogResultPause : 0, progress,
                                              ^(BOOL ok, NSString *rawMessage, NSTimeInterval resultAge) {
             NSString *message = [rawMessage isEqualToString:kSettingsFullExploitRequiredMessage]
                 ? @"Cyanide has no saved kernel access (for example after a restart). Open Cyanide and run it once, then try again."
@@ -726,6 +797,21 @@ static const double kQuietMinPhase = 0.35;   // a phase stays readable at least 
                 }
                 return;   // the log (log=1) already shows the failure
             }
+            // Where to go: the app the user was in, Home if they were on the
+            // Home Screen or it couldn't be read (as before), or nowhere if
+            // Cyanide was already in front.
+            NSString *returnApp = nil;
+            NSInteger origin = broughtToFront ? settings_location_services_take_origin(&returnApp) : 0;
+            if (!broughtToFront) {
+                if (!showLog) [me hideQuietCover];
+                return;
+            }
+            if (origin != 2) returnApp = nil;
+            if ([returnApp isEqualToString:NSBundle.mainBundle.bundleIdentifier]) {
+                // Never "back" to Cyanide itself: there was nothing to leave.
+                if (!showLog) [me hideQuietCover];
+                return;
+            }
             double wait = 0;
             if (showLog) {
                 double shownFor = resultShownNs
@@ -741,12 +827,13 @@ static const double kQuietMinPhase = 0.35;   // a phase stays readable at least 
                 // Only for this run, and only while still in front.
                 if (!me2 || generation != me2.actionGeneration) return;
                 if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) {
-                    // Briefly inactive (Control Center, a call banner): go
-                    // Home when it is back, instead of staying on the result.
+                    // Briefly inactive (Control Center, a call banner): leave
+                    // when it is back, instead of staying on the result.
                     me2.homeOnNextActivation = YES;
+                    me2.returnAppOnNextActivation = returnApp;
                     return;
                 }
-                scene_suspend_to_home();
+                [me2 leaveToApp:returnApp];
                 // Diagnostic: if this run armed the card removal and Cyanide is
                 // still in front shortly after, the removal will close it in
                 // front of the user (it can't be cancelled; see
@@ -825,13 +912,17 @@ static const double kQuietMinPhase = 0.35;   // a phase stays readable at least 
         NSURL *url = self.pendingActionURL;
         CYLocationRequestCompletion completion = self.pendingActionCompletion;
         BOOL cold = self.pendingActionCold;
+        BOOL broughtToFront = self.pendingActionBroughtToFront;
         self.pendingActionURL = nil;
         self.pendingActionCompletion = nil;
         self.pendingActionCold = NO;
-        [self handleActionURL:url completion:completion coldLaunched:cold];
+        self.pendingActionBroughtToFront = NO;
+        [self handleActionURL:url completion:completion coldLaunched:cold broughtToFront:broughtToFront];
     } else if (self.homeOnNextActivation && !self.actionInProgress) {
         self.homeOnNextActivation = NO;
-        scene_suspend_to_home();
+        NSString *app = self.returnAppOnNextActivation;
+        self.returnAppOnNextActivation = nil;
+        [self leaveToApp:app];
     }
     // Runs every foreground; UpdateChecker enforces a per-process + 24-hour
     // persisted throttle so the API isn't hammered.
@@ -863,6 +954,7 @@ static const double kQuietMinPhase = 0.35;   // a phase stays readable at least 
 
 - (void)sceneWillEnterForeground:(UIScene *)scene {
     cyanide_launch_trace("sceneWillEnterForeground");
+    g_scene_visit_user_owned = NO;
     // A quiet shortcut run that sent Cyanide home leaves its cover behind;
     // a normal reopen must show the app (a new shortcut run puts it back).
     // But keep it when a location request is already waiting for activation:
@@ -877,6 +969,7 @@ static const double kQuietMinPhase = 0.35;   // a phase stays readable at least 
     }
     if (!self.actionInProgress && !pendingQuiet) [self hideQuietCover];
     self.homeOnNextActivation = NO;   // a real reopen: the user wants the app
+    self.returnAppOnNextActivation = nil;
     settings_application_will_enter_foreground();
 }
 

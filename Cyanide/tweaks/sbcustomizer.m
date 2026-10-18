@@ -84,14 +84,17 @@ static bool patch_list_model_grid(uint64_t listView, const char *tag, int cols, 
     return afterGrid == newGrid;
 }
 
-static void patch_dock(uint64_t iconCtrl, int dockIcons)
+// True when at least one lever verifiably took the new size: the model's grid
+// (read back) or the layout configuration's column count (call completed).
+static bool patch_dock(uint64_t iconCtrl, int dockIcons)
 {
+    bool modelOK = false, cfgOK = false;
     uint64_t mgr = try_msg0(iconCtrl, "iconManager");
-    if (!mgr) { printf("[SBC] dock: nil iconManager\n"); return; }
+    if (!mgr) { printf("[SBC] dock: nil iconManager\n"); return false; }
 
     uint64_t dock = try_msg0(mgr, "dockListView");
     if (!dock) dock = try_msg0(iconCtrl, "dockListView");
-    if (!dock) { printf("[SBC] dock: nil dockListView\n"); return; }
+    if (!dock) { printf("[SBC] dock: nil dockListView\n"); return false; }
     disable_list_autofit(dock, "dockListView");
 
     uint64_t model = try_msg0(dock, "model");
@@ -99,9 +102,14 @@ static void patch_dock(uint64_t iconCtrl, int dockIcons)
     if (!model) model = try_msg0(dock, "displayedModel");
     if (model && r_responds(model, "gridSize") && r_responds(model, "setGridSize:")) {
         uint64_t oldGrid = r_msg2(model, "gridSize", 0, 0, 0, 0) & 0xffffffffULL;
-        uint64_t newGrid = (oldGrid & 0xffff0000ULL) | (uint64_t)dockIcons;
-        r_msg2(model, "setGridSize:", newGrid, 0, 0, 0);
-        printf("[SBC] dock: gridSize 0x%llx -> 0x%llx\n", oldGrid, newGrid);
+        if (r_last_call_ok()) {
+            uint64_t newGrid = (oldGrid & 0xffff0000ULL) | (uint64_t)dockIcons;
+            r_msg2(model, "setGridSize:", newGrid, 0, 0, 0);
+            uint64_t afterGrid = r_last_call_ok() ? r_msg2(model, "gridSize", 0, 0, 0, 0) & 0xffffffffULL : 0;
+            modelOK = r_last_call_ok() && afterGrid == newGrid;
+            printf("[SBC] dock: gridSize 0x%llx -> 0x%llx%s\n", oldGrid, afterGrid,
+                   modelOK ? "" : " (NOT verified)");
+        }
     }
 
     uint64_t layout = try_msg0(dock, "layout");
@@ -109,7 +117,8 @@ static void patch_dock(uint64_t iconCtrl, int dockIcons)
         uint64_t cfg = try_msg0(layout, "layoutConfiguration");
         if (cfg && r_responds(cfg, "setNumberOfPortraitColumns:")) {
             r_msg2(cfg, "setNumberOfPortraitColumns:", (uint64_t)dockIcons, 0, 0, 0);
-            printf("[SBC] dock: portraitColumns -> %d\n", dockIcons);
+            cfgOK = r_last_call_ok();
+            printf("[SBC] dock: portraitColumns -> %d%s\n", dockIcons, cfgOK ? "" : " (reply lost)");
         }
     }
 
@@ -117,6 +126,8 @@ static void patch_dock(uint64_t iconCtrl, int dockIcons)
         uint64_t selSetNeedsLayout = r_sel("setNeedsLayout");
         r_perform_main(dock, selSetNeedsLayout, 0, false);
     }
+    if (!modelOK && !cfgOK) printf("[SBC] dock: no lever took the new size\n");
+    return modelOK || cfgOK;
 }
 
 // Icon arrays are transient: changing a grid or moving an icon can replace
@@ -922,10 +933,13 @@ int sbcustomizer_set_dock_labels_in_session(bool show, bool mayForceShowLabels)
     return set_dock_icon_labels(iconCtrl, show, mayForceShowLabels);
 }
 
-static void patch_homescreen_grid(uint64_t iconCtrl, int cols, int rows, bool hideLabels)
+// True when at least one lever took the grid: the layout configuration
+// (call completed) or at least one page model (read back).
+static bool patch_homescreen_grid(uint64_t iconCtrl, int cols, int rows, bool hideLabels)
 {
+    bool providerOK = false;
     uint64_t mgr = try_msg0(iconCtrl, "iconManager");
-    if (!mgr) { printf("[SBC] hs: nil iconManager\n"); return; }
+    if (!mgr) { printf("[SBC] hs: nil iconManager\n"); return false; }
 
     uint64_t provider = try_msg0(mgr, "listLayoutProvider");
     if (provider) {
@@ -947,6 +961,7 @@ static void patch_homescreen_grid(uint64_t iconCtrl, int cols, int rows, bool hi
                     printf("[SBC] hs: cfg lacks setNumberOfPortraitColumns:\n");
                 } else {
                     r_msg2(cfg, "setNumberOfPortraitColumns:", (uint64_t)cols, 0, 0, 0);
+                    providerOK = r_last_call_ok();
                     if (r_responds(cfg, "setNumberOfPortraitRows:"))
                         r_msg2(cfg, "setNumberOfPortraitRows:", (uint64_t)rows, 0, 0, 0);
                     if (r_responds(cfg, "setNumberOfLandscapeColumns:"))
@@ -972,7 +987,9 @@ static void patch_homescreen_grid(uint64_t iconCtrl, int cols, int rows, bool hi
         printf("[SBC] hs: nil listLayoutProvider\n");
     }
 
-    patch_homescreen_list_models_v3(mgr, cols, rows);
+    int pages = patch_homescreen_list_models_v3(mgr, cols, rows);
+    if (!providerOK && pages == 0) printf("[SBC] hs: no lever took the new grid\n");
+    return providerOK || pages > 0;
 }
 
 // 1 = capacity confirmed; 0 = this page can't take it (no model, or the
@@ -1666,14 +1683,14 @@ bool sbcustomizer_apply_in_session(int dockIcons, int hsCols, int hsRows, bool h
         if (!iconCtrl) { printf("[SBC] +sharedInstance nil\n"); break; }
         printf("[SBC] iconCtrl=0x%llx\n", iconCtrl);
 
-        patch_dock(iconCtrl, dockIcons);
+        bool dockOK = patch_dock(iconCtrl, dockIcons);
         bool dockAppOK = true;
         if (autoDockApp && dockIcons > 4) {
             dockAppOK = auto_add_app_to_dock(iconCtrl, dockIcons, dockAppBundleID);
         } else if (autoDockApp) {
             printf("[SBC:DOCKAPP] deferred until Dock capacity is above four\n");
         }
-        patch_homescreen_grid(iconCtrl, hsCols, hsRows, hideLabels);
+        bool gridOK = patch_homescreen_grid(iconCtrl, hsCols, hsRows, hideLabels);
         bool arrangeOK = true;
         if (arrangePages) {
             arrangeOK = arrange_homescreen_pages(
@@ -1683,7 +1700,12 @@ bool sbcustomizer_apply_in_session(int dockIcons, int hsCols, int hsRows, bool h
         // (after RUN 5 / HSSCALE) via sbcustomizer_hide_home_labels_in_session(),
         // so our own relayout can't undo it. The provider-config setShowsLabels:
         // in patch_homescreen_grid still runs (the working lever on iOS 18).
-        ok = arrangeOK && dockAppOK;
+        // Applied only when the dock and the grid each verifiably took the
+        // new size: a run where every setter was missing or lost stays
+        // pending instead of being marked applied.
+        ok = dockOK && gridOK && arrangeOK && dockAppOK;
+        if (!dockOK || !gridOK)
+            printf("[SBC] layout not confirmed: dock=%d grid=%d\n", dockOK, gridOK);
     } while (0);
 
     r_settle_us(oldSettleUS);

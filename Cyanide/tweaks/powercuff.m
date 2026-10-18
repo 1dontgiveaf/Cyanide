@@ -58,8 +58,12 @@ bool powercuff_apply(const char *level)
 
         printf("[POWERCUFF] -[CommonProduct putDeviceInThermalSimulationMode:'%s']\n", level);
         r_msg2(product, "putDeviceInThermalSimulationMode:", modeStr, 0, 0, 0);
-        printf("[POWERCUFF] applied: %s\n", level);
-        ok = true;
+        // Applied only when the call verifiably completed. A lost reply may
+        // or may not have run: report failure rather than "applied" (a
+        // re-apply sets the same mode, so retrying it is harmless).
+        ok = r_last_call_ok();
+        r_dlsym_call(R_TIMEOUT, "CFRelease", modeStr, 0, 0, 0, 0, 0, 0, 0);
+        printf("[POWERCUFF] %s: %s\n", ok ? "applied" : "result unknown (reply lost)", level);
     } while (0);
 
     destroy_remote_call();
