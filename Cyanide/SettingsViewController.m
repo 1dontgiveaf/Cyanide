@@ -2487,11 +2487,22 @@ static void settings_stop_disabled_applied_springboard_tweaks_locked(NSUserDefau
         if (entry->requestStop) entry->requestStop();
         @try {
             bool stopped = g_springboard_rc_ready ? entry->stop(NO) : false;
-            if (entry->forget) entry->forget();
-            settings_mark_tweak_applied(entry->key, NO);
-            printf("[SETTINGS] disabled %s cleanup result=%d\n",
-                   entry->name ?: "tweak",
-                   stopped);
+            if (stopped) {
+                if (entry->forget) entry->forget();
+                settings_mark_tweak_applied(entry->key, NO);
+            }
+            // stop() reporting false means "cleanup incomplete" (e.g. Axon
+            // could not confirm every hidden request was restored). Keep the
+            // applied marker so settings_disabled_applied_springboard_cleanup_needed
+            // stays true and the cleanup is retried on the next pass; dropping
+            // state here would leave those entries unrestored with no retry.
+            if (stopped) {
+                printf("[SETTINGS] disabled %s cleanup result=1\n",
+                       entry->name ?: "tweak");
+            } else {
+                printf("[SETTINGS] disabled %s cleanup incomplete; will retry\n",
+                       entry->name ?: "tweak");
+            }
         } @catch (NSException *e) {
             printf("[SETTINGS] disabled %s cleanup exception: %s\n",
                    entry->name ?: "tweak",
@@ -12410,6 +12421,158 @@ NSData *settings_root_read_file(NSString *path, NSUInteger maxBytes, BOOL *trunc
     return out;
 }
 
+#if DEBUG
+// Debug-only proof: can launchd (root, unsandboxed) exec a process for us?
+//
+// Runs /bin/sh -c "{ echo ...; id; } > <Cyanide tmp>/cyanide-root-exec-proof.txt"
+// through the SAME warm launchd RemoteCall session the File Browser root read
+// uses. No root filesystem writes, no remount: the output lands in Cyanide's
+// own tmp directory. Compiled out of Release; this is a one-shot capability
+// probe, not a shipping feature.
+//
+// The hijacked launchd thread must never block: posix_spawn is bounded to 3 s
+// and the child redirects its output, so launchd does not wait for the shell.
+static BOOL settings_debug_launchd_root_exec(NSString *outPath, NSString **messageOut)
+{
+    __block NSString *error = nil;
+    __block int spawnRC = -1;
+    __block int childPid = 0;
+    __block BOOL callOK = NO;
+    __block BOOL spawned = NO;
+
+    BOOL ran = pm_with_launchd_session("debug launchd root exec", &error, ^(RemoteCallSession *s) {
+        BOOL ok = NO;
+        const uint64_t buf = pm_root_call(s, 1000, "malloc", 0x1000, 0, 0, &ok);
+        if (!ok || !buf) {
+            error = ok ? @"launchd malloc failed." : @"launchd transport failed.";
+            return;
+        }
+        // Scratch layout inside launchd: strings, argv/envp pointer arrays,
+        // and the pid_t result. All offsets are 16-byte aligned.
+        const uint64_t offPath = 0x000, offArg0 = 0x020, offArgC = 0x040, offCmd = 0x060;
+        const uint64_t offArgv = 0x500, offEnvp = 0x540;
+        const uint64_t offEnvPath = 0x580, offEnvHome = 0x600, offPid = 0x680;
+        NSString *cmd = [NSString stringWithFormat:
+            @"{ echo \"shell_uid=$UID shell_euid=$EUID\"; id; echo \"id_exit=$?\"; } > '%@' 2>&1",
+            outPath];
+        BOOL wrote =
+            [s remoteWriteString:buf + offPath value:"/bin/sh"] &&
+            [s remoteWriteString:buf + offArg0 value:"sh"] &&
+            [s remoteWriteString:buf + offArgC value:"-c"] &&
+            [s remoteWriteString:buf + offCmd value:cmd.UTF8String] &&
+            [s remoteWriteString:buf + offEnvPath value:"PATH=/usr/bin:/bin:/usr/sbin:/sbin"] &&
+            [s remoteWriteString:buf + offEnvHome value:"HOME=/var/mobile"];
+        if (wrote) {
+            uint64_t argv[4] = { buf + offArg0, buf + offArgC, buf + offCmd, 0 };
+            uint64_t envp[3] = { buf + offEnvPath, buf + offEnvHome, 0 };
+            wrote = [s remoteWrite:buf + offArgv from:argv size:sizeof(argv)] &&
+                    [s remoteWrite:buf + offEnvp from:envp size:sizeof(envp)];
+        }
+        if (!wrote) {
+            error = @"could not build the launchd argv/envp block.";
+            pm_root_call(s, 1000, "free", buf, 0, 0, &ok);
+            return;
+        }
+
+        uint64_t rc = [s doRemoteCallStableWithTimeout:3000 functionName:"posix_spawn"
+            x0:buf + offPid x1:buf + offPath x2:0 x3:0 x4:buf + offArgv x5:buf + offEnvp x6:0 x7:0];
+        callOK = remote_call_last_call_ok();
+        spawnRC = (int)rc;
+        if (callOK && spawnRC == 0) {
+            int pid = 0;
+            if ([s remoteRead:buf + offPid to:&pid size:sizeof(pid)]) childPid = pid;
+            spawned = YES;
+        }
+        pm_root_call(s, 1000, "free", buf, 0, 0, &ok);
+    });
+
+    if (!ran) {
+        if (messageOut) *messageOut = error ?: @"launchd session unavailable.";
+        return NO;
+    }
+    if (!callOK) {
+        if (messageOut) *messageOut = @"posix_spawn reply was lost; the child may have started. "
+                                      @"No output was checked.";
+        return NO;
+    }
+    if (!spawned || spawnRC != 0) {
+        if (messageOut) *messageOut = [NSString stringWithFormat:
+            @"posix_spawn failed: rc=%d (%s)", spawnRC,
+            spawnRC > 0 ? strerror(spawnRC) : "unknown"];
+        return NO;
+    }
+
+    // Wait up to 5 s for the root shell to write the output file. The child is
+    // independent of the launchd session, which has already been released.
+    NSFileManager *fm = NSFileManager.defaultManager;
+    for (int i = 0; i < 50; i++) {
+        if ([fm fileExistsAtPath:outPath]) break;
+        usleep(100000);
+    }
+    NSString *contents = [NSString stringWithContentsOfFile:outPath
+                                                   encoding:NSUTF8StringEncoding
+                                                      error:nil];
+    if (contents.length == 0) {
+        if (messageOut) *messageOut = [NSString stringWithFormat:
+            @"posix_spawn returned 0 (pid %d), but no output appeared at %@. "
+            @"The shell may have been denied exec or write.", childPid, outPath];
+        return NO;
+    }
+    if (messageOut) *messageOut = [NSString stringWithFormat:
+        @"posix_spawn returned 0 (pid %d).\n\n%@", childPid, contents];
+    return YES;
+}
+
+static void settings_debug_present_root_exec_proof(UIViewController *presenter)
+{
+    NSString *outPath = [NSTemporaryDirectory()
+        stringByAppendingPathComponent:@"cyanide-root-exec-proof.txt"];
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"Launchd Root Exec Proof"
+                         message:[NSString stringWithFormat:
+            @"Debug only. Spawns /bin/sh via launchd (root, unsandboxed) and "
+            @"writes the result to:\n%@\n\nNo root filesystem writes and no "
+            @"remount. A blocked launchd thread can reboot the device; keep "
+            @"Cyanide in the foreground.", outPath]
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    __weak UIViewController *weakPresenter = presenter;
+    [ac addAction:[UIAlertAction actionWithTitle:@"Run Proof"
+                                           style:UIAlertActionStyleDestructive
+                                         handler:^(UIAlertAction *a) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            NSString *message = nil;
+            BOOL ok = NO;
+            if (!settings_try_claim_actions_lock("launchd root exec proof",
+                                                 "[DEBUG] Another action is already running.")) {
+                message = @"Another action is already running.";
+            } else {
+                @try {
+                    [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
+                    ok = settings_debug_launchd_root_exec(outPath, &message);
+                } @finally {
+                    settings_release_actions_lock();
+                }
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                UIViewController *host = weakPresenter;
+                if (!host) return;
+                UIAlertController *result = [UIAlertController
+                    alertControllerWithTitle:ok ? @"Root Exec Proof: SUCCESS"
+                                               : @"Root Exec Proof: FAILED"
+                                     message:message ?: @"No detail."
+                              preferredStyle:UIAlertControllerStyleAlert];
+                [result addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                           style:UIAlertActionStyleDefault
+                                                         handler:nil]];
+                settings_present_controller(result, host);
+            });
+        });
+    }]];
+    settings_present_controller(ac, presenter);
+}
+#endif
+
 - (int)pmForceKillViaLaunchdLocked:(int)pid expectedName:(NSString *)expectedName
                      expectedKproc:(uint64_t)expectedKproc
                       allowRebuild:(BOOL)allowRebuild
@@ -13557,6 +13720,11 @@ static NSUInteger settings_tab_index_for_title(UITabBarController *tab, NSString
         @{ @"key": kSettingsVerboseLoggingEnabled, @"title": @"Verbose logging",
            @"subtitle": @"Logs the full RemoteCall internals for every exploit run, tweak apply and Process Viewer action. Off keeps the log readable; turn it on before reproducing an issue, then share the log." },
         @{ @"key": kSettingsRunSandboxEscape,   @"title": @"Sandbox escape (escape_sbx_demo2)" },
+#if DEBUG
+        @{ @"kind": @"button", @"action": @"debug-root-exec-proof",
+           @"title": @"[Debug] Launchd root exec proof",
+           @"subtitle": @"Debug only: asks launchd to posix_spawn /bin/sh and writes the result to Cyanide's tmp directory. No root filesystem writes or remount." },
+#endif
         @{ @"key": kSettingsLocationServicesLinksEnabled, @"title": @"Location Services links",
            @"subtitle": @"Lets cyanide://location-services links turn Location Services on or off. Any app can open these links without asking, so this is off by default. The Control Center toggle and the Shortcuts action work without it." },
         @{ @"key": kRepoSourcesEnabledKey,      @"title": @"Repo sources",
@@ -18662,6 +18830,17 @@ void cyanide_present_contact(UIViewController *host)
             return;
         }
     }
+
+#if DEBUG
+    if (indexPath.section == SectionLaunch) {
+        NSArray<NSDictionary *> *launchRows = [self rowsForSection:SectionLaunch];
+        if (indexPath.row < (NSInteger)launchRows.count &&
+            [launchRows[indexPath.row][@"action"] isEqualToString:@"debug-root-exec-proof"]) {
+            settings_debug_present_root_exec_proof(self);
+            return;
+        }
+    }
+#endif
 
     if (indexPath.section == SectionActions) {
         if (indexPath.row == 0) {
