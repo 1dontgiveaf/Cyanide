@@ -1008,6 +1008,56 @@ bool repotweaks_apply_in_session(void) {
 static void repotweaks_download_script_capped(NSString *repoURL, NSString *tweakId, NSString *scriptURL,
                                               NSUInteger maxBytes, void (^completion)(BOOL success, NSUInteger bytes));
 
+
+// Review R-03: the 16 MB refresh budget is per refresh, not a total. Old
+// scripts for IDs that disappeared from a repo (or from a deleted source)
+// would otherwise stay in NSUserDefaults forever. Prune only scripts that are
+// not the active QuickLoader source, not enabled, and not recorded as
+// installed; those are the only ones whose removal cannot break a live tweak.
+static void repotweaks_prune_unlisted_scripts(NSUserDefaults *d,
+                                              NSDictionary *caches)
+{
+    NSMutableSet<NSString *> *listed = [NSMutableSet set];
+    for (NSString *repoURL in caches) {
+        id rawRepo = caches[repoURL];
+        if (![rawRepo isKindOfClass:NSDictionary.class]) continue;
+        id rawTweaks = ((NSDictionary *)rawRepo)[@"tweaks"];
+        if (![rawTweaks isKindOfClass:NSArray.class]) continue;
+        for (id rawTweak in (NSArray *)rawTweaks) {
+            if (![rawTweak isKindOfClass:NSDictionary.class]) continue;
+            NSString *tweakID = repotweaks_string_or_empty(((NSDictionary *)rawTweak)[@"id"]);
+            if (tweakID.length == 0) continue;
+            [listed addObject:repotweaks_storage_key(repoURL, tweakID)];
+        }
+    }
+    NSString *activeRepo = [d stringForKey:@"QuickLoaderSourceRepoURL"];
+    NSString *activeID = [d stringForKey:@"QuickLoaderSourceTweakID"];
+    if (activeRepo.length > 0 && activeID.length > 0)
+        [listed addObject:repotweaks_storage_key(activeRepo, activeID)];
+
+    NSUInteger removed = 0;
+    NSDictionary *all = [d dictionaryRepresentation];
+    for (NSString *key in all) {
+        if (![key hasPrefix:@"RepoTweakScript_"]) continue;
+        NSString *storageKey = [key substringFromIndex:@"RepoTweakScript_".length];
+        if ([listed containsObject:storageKey]) continue;
+        NSString *enabledKey = [@"RepoTweakEnabled_" stringByAppendingString:storageKey];
+        NSString *versionKey = [@"RepoTweakInstalledVersion_" stringByAppendingString:storageKey];
+        if ([d boolForKey:enabledKey]) continue;
+        if ([[d stringForKey:versionKey] length] > 0) continue;
+        [d removeObjectForKey:key];
+        [d removeObjectForKey:[@"RepoTweakValues_" stringByAppendingString:storageKey]];
+        [d removeObjectForKey:[@"RepoTweakSeen_" stringByAppendingString:storageKey]];
+        removed++;
+    }
+    if (removed > 0) {
+        [d synchronize];
+        log_user("[RepoTweaks] Pruned %lu stale cached repo script%s no longer "
+                 "listed and not installed.\n",
+                 (unsigned long)removed, removed == 1 ? "" : "s");
+    }
+}
+
 static void repotweaks_fetch_repo(NSString *repoURL, BOOL addIfMissing,
                                   void (^completion)(BOOL success, NSString *message)) {
     void (^finish)(BOOL, NSString *) = ^(BOOL success, NSString *message) {
@@ -1105,6 +1155,7 @@ static void repotweaks_fetch_repo(NSString *repoURL, BOOL addIfMissing,
             caches[repoURL] = sanitized;
             [d setObject:caches forKey:@"RepoTweaksCaches"];
             [d synchronize];
+            repotweaks_prune_unlisted_scripts(d, caches);
 
             NSArray *tweaks = sanitized[@"tweaks"];
             dispatch_group_t group = dispatch_group_create();
