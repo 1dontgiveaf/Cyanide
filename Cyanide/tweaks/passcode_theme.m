@@ -306,6 +306,15 @@ static void pt_save_pending_dir_modes(NSDictionary<NSString *, NSNumber *> *mode
     [d synchronize];
 }
 
+// vnode_apfs_chmod writes the raw mode into the APFS inode; a permissions-only
+// value turns a directory into a typeless inode. Records written by 1.8.1's
+// first cut contain 07777 only, so always rebuild the type from S_IFDIR and
+// OR in the saved permissions. Review P1.
+static mode_t pt_directory_restore_mode(mode_t saved)
+{
+    return S_IFDIR | (saved & 07777);
+}
+
 // Retries every persisted mode still waiting for restore. Returns false only
 // when a folder still exists and its original mode could not be verified; a
 // folder that no longer exists needs no restore and its record is dropped.
@@ -315,17 +324,26 @@ static bool pt_retry_pending_dir_modes(void)
     if (pending.count == 0) return true;
     bool allRestored = true;
     for (NSString *dir in pending.allKeys) {
-        mode_t original = (mode_t)pending[dir].unsignedIntValue;
-        (void)vnode_apfs_chmod(dir.UTF8String, original);
+        mode_t saved = (mode_t)pending[dir].unsignedIntValue;
         struct stat st = {0};
         if (stat(dir.UTF8String, &st) == 0) {
-            if ((st.st_mode & 07777) == (original & 07777)) {
+            // A permissions-only record (or an inode already damaged by the
+            // old restore) has no type bits. Do not write it back raw.
+            mode_t desired = pt_directory_restore_mode(saved);
+            if (S_ISDIR(st.st_mode) && (st.st_mode & 07777) == (saved & 07777)) {
+                [pending removeObjectForKey:dir];
+                continue;
+            }
+            (void)vnode_apfs_chmod(dir.UTF8String, desired);
+            memset(&st, 0, sizeof(st));
+            if (stat(dir.UTF8String, &st) == 0 && S_ISDIR(st.st_mode) &&
+                (st.st_mode & 07777) == (saved & 07777)) {
                 [pending removeObjectForKey:dir];
                 continue;
             }
             allRestored = false;
             log_user("[PASSCODE] Still could not restore the folder mode of %s (want %o).\n",
-                     dir.UTF8String, (unsigned)(original & 07777));
+                     dir.UTF8String, (unsigned)(desired & 07777));
         } else if (errno == ENOENT || errno == ENOTDIR) {
             [pending removeObjectForKey:dir];   // folder is gone; nothing to restore
         } else {
@@ -356,10 +374,32 @@ static bool pt_write_data_to_target(NSData *data,
     if (dir.length == 0) return false;
 
     struct stat dirStat = {0};
-    if (stat(dir.UTF8String, &dirStat) != 0 || !S_ISDIR(dirStat.st_mode)) {
+    if (stat(dir.UTF8String, &dirStat) != 0) {
         log_user("[PASSCODE] Keypad folder is unavailable: %s (errno=%d).\n",
                  dir.UTF8String, errno);
         return false;
+    }
+    if (!S_ISDIR(dirStat.st_mode)) {
+        // A typeless inode is what the first 1.8.1 restore wrote when it
+        // saved permissions only. Repair it before refusing the folder.
+        if ((dirStat.st_mode & S_IFMT) == 0) {
+            log_user("[PASSCODE] Repairing typeless keypad folder %s (mode=%o).\n",
+                     dir.UTF8String, (unsigned)dirStat.st_mode);
+            (void)vnode_apfs_chmod(dir.UTF8String,
+                                   S_IFDIR | (dirStat.st_mode & 07777));
+            memset(&dirStat, 0, sizeof(dirStat));
+            if (stat(dir.UTF8String, &dirStat) == 0 && S_ISDIR(dirStat.st_mode)) {
+                // repaired; continue into the normal widen path
+            } else {
+                log_user("[PASSCODE] Could not repair typeless keypad folder %s.\n",
+                         dir.UTF8String);
+                return false;
+            }
+        } else {
+            log_user("[PASSCODE] Keypad path is not a directory: %s.\n",
+                     dir.UTF8String);
+            return false;
+        }
     }
 
     if (lockedDirs[dir] == nil) {
@@ -368,13 +408,14 @@ static bool pt_write_data_to_target(NSData *data,
         // If a previous restore failed, `recorded` is the only copy of the
         // original mode. Never overwrite it with the already-widened mode.
         mode_t originalMode = recorded != nil ? (mode_t)recorded.unsignedIntValue
-                                               : (dirStat.st_mode & 07777);
+                                               : dirStat.st_mode;   // keep S_IFDIR
         lockedDirs[dir] = @(originalMode);
         if (recorded == nil) {
             pending[dir] = @(originalMode);
             pt_save_pending_dir_modes(pending);
         }
-        mode_t writableDirMode = dirStat.st_mode | S_IWUSR | S_IXUSR;
+        mode_t writableDirMode = S_IFDIR | (dirStat.st_mode & 07777) |
+                                 S_IWUSR | S_IXUSR;
         if ((writableDirMode & 07777) != (dirStat.st_mode & 07777)) {
             // Record the original mode BEFORE the kernel call. vnode_apfs_chmod
             // sets the mode and then verifies it, so it can apply the change and
@@ -458,15 +499,22 @@ static bool pt_restore_directory_modes(NSMutableDictionary<NSString *, NSNumber 
     }
     NSMutableArray<NSString *> *restoredDirs = [NSMutableArray array];
     for (NSString *dir in lockedDirs) {
-        mode_t original = (mode_t)lockedDirs[dir].unsignedIntValue;
-        (void)vnode_apfs_chmod(dir.UTF8String, original);
+        mode_t saved = (mode_t)lockedDirs[dir].unsignedIntValue;
+        mode_t desired = pt_directory_restore_mode(saved);
         struct stat st = {0};
-        if (stat(dir.UTF8String, &st) == 0 &&
-            (st.st_mode & 07777) == (original & 07777)) {
+        if (stat(dir.UTF8String, &st) == 0 && S_ISDIR(st.st_mode) &&
+            (st.st_mode & 07777) == (saved & 07777)) {
+            [restoredDirs addObject:dir];
+            continue;
+        }
+        (void)vnode_apfs_chmod(dir.UTF8String, desired);
+        memset(&st, 0, sizeof(st));
+        if (stat(dir.UTF8String, &st) == 0 && S_ISDIR(st.st_mode) &&
+            (st.st_mode & 07777) == (saved & 07777)) {
             [restoredDirs addObject:dir];
         } else {
             log_user("[PASSCODE] Could not restore the folder mode of %s (want %o).\n",
-                     dir.UTF8String, (unsigned)(original & 07777));
+                     dir.UTF8String, (unsigned)(desired & 07777));
         }
     }
     for (NSString *dir in restoredDirs) [pending removeObjectForKey:dir];
@@ -590,6 +638,22 @@ static NSDictionary<NSString *, NSArray<NSString *> *> *pt_scan_targets(NSString
         out[digit] = [byDigit[digit] sortedArrayUsingSelector:@selector(compare:)];
     }
     return out;
+}
+
+// The first 1.8.1 restore could write a permissions-only mode into a
+// TelephonyUI cache folder, leaving a typeless inode. fileExistsAtPath: can
+// then reject the folder before the normal repair path sees it, so repair the
+// candidate cache roots directly. Review P1.
+static void pt_repair_typeless_telephony_dirs(void)
+{
+    for (NSString *path in pt_telephony_cache_candidates()) {
+        struct stat st = {0};
+        if (stat(path.UTF8String, &st) != 0) continue;
+        if ((st.st_mode & S_IFMT) != 0) continue;
+        log_user("[PASSCODE] Repairing typeless keypad folder %s (mode=%o).\n",
+                 path.UTF8String, (unsigned)st.st_mode);
+        (void)vnode_apfs_chmod(path.UTF8String, S_IFDIR | (st.st_mode & 07777));
+    }
 }
 
 NSString *settings_passcode_telephony_base_path(void)
@@ -1409,6 +1473,7 @@ bool settings_passcode_apply_digits(NSDictionary<NSString *, NSData *> *digits)
     }
     // The unlock changes what is readable, so anything scanned before it is stale.
     settings_passcode_invalidate_caches();
+    pt_repair_typeless_telephony_dirs();
     if (!pt_retry_pending_dir_modes()) {
         pt_set_summary(@"A previously widened keypad folder could not be restored; no new style was written.");
         log_user("[PASSCODE] Failed: a previously widened keypad folder could not be restored.\n");
@@ -1566,6 +1631,7 @@ bool settings_passcode_restore_originals(NSString *basePath)
         return false;
     }
     settings_passcode_invalidate_caches();
+    pt_repair_typeless_telephony_dirs();
     if (!pt_retry_pending_dir_modes()) {
         pt_set_summary(@"A previously widened keypad folder could not be restored; originals were not written.");
         log_user("[PASSCODE] Failed: a previously widened keypad folder could not be restored.\n");
