@@ -27,6 +27,7 @@ static const NSTimeInterval kAutoCheckMinInterval = 24 * 60 * 60; // 24h
 @property (nonatomic, assign) BOOL autoCheckInFlight;
 // A manual check owns the screen: no automatic check or prompt meanwhile.
 @property (nonatomic, assign) BOOL manualCheckInFlight;
+- (void)markAutoCheckTimestamp;
 @end
 
 @implementation UpdateChecker
@@ -74,6 +75,13 @@ static NSString *update_http_failure(NSURLResponse *response)
     NSInteger status = ((NSHTTPURLResponse *)response).statusCode;
     if (status != 200) return [NSString stringWithFormat:@"GitHub returned HTTP %ld.", (long)status];
     return nil;
+}
+
+// Burn the persisted 24 h throttle. Called only when the check has no prompt
+// to show (no update / skipped / snoozed) or has actually presented one.
+- (void)markAutoCheckTimestamp
+{
+    [[NSUserDefaults standardUserDefaults] setObject:[NSDate date] forKey:kUpdateLastCheckAtKey];
 }
 
 - (void)checkForUpdatesIfNeededFrom:(UIViewController *)presenter
@@ -151,28 +159,35 @@ static NSString *update_http_failure(NSURLResponse *response)
             return;
         }
 
-        // From here we have a usable response — burn both gates.
+        // A usable response still only consumes the per-process gate here.
+        // The persisted throttle is burned only when no prompt is owed (no
+        // update / skipped / snoozed) or a prompt is actually presented: a
+        // prompt suppressed by an in-flight manual check must not hide the
+        // update for the next 24 h.
         dispatch_async(dispatch_get_main_queue(), ^{
             strongSelf.didCompleteAutoCheckThisProcess = YES;
         });
-        [[NSUserDefaults standardUserDefaults] setObject:[NSDate date] forKey:kUpdateLastCheckAtKey];
 
         if (!strongSelf) return;
 
         NSString *latest  = [strongSelf normalizeTag:tag];
         NSString *current = [strongSelf currentVersion];
-        if (compare_versions(latest, current) <= 0)
+        if (compare_versions(latest, current) <= 0) {
+            [strongSelf markAutoCheckTimestamp];
             return;
+        }
 
         NSUserDefaults *d2 = [NSUserDefaults standardUserDefaults];
         NSString *skipped = [d2 stringForKey:kUpdateSkippedVersionKey];
         if (skipped && [skipped isEqualToString:latest]) {
             printf("[UPDATE] version %s skipped by user; not prompting\n", latest.UTF8String);
+            [strongSelf markAutoCheckTimestamp];
             return;
         }
         NSDate *snoozeUntil = [d2 objectForKey:kUpdateSnoozeUntilKey];
         if ([snoozeUntil isKindOfClass:NSDate.class] && [snoozeUntil compare:[NSDate date]] == NSOrderedDescending) {
             printf("[UPDATE] snoozed until %s; not prompting\n", snoozeUntil.description.UTF8String);
+            [strongSelf markAutoCheckTimestamp];
             return;
         }
 
@@ -187,6 +202,7 @@ static NSString *update_http_failure(NSURLResponse *response)
             UIViewController *top = presenter;
             while (top.presentedViewController) top = top.presentedViewController;
             if ([top isKindOfClass:UIAlertController.class]) return;
+            [strongSelf markAutoCheckTimestamp];
             [strongSelf presentUpdateAlertFrom:presenter
                                         latest:latest
                                        current:current
