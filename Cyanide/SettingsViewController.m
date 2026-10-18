@@ -1158,12 +1158,17 @@ extern int  escape_sbx_demo3(void);
 
 static BOOL g_kexploit_done = NO;
 static volatile int g_settings_actions_running = 0;
+// Lock owner state, in the same word callers already test as a boolean:
+//   0 = free, 1 = a non-run action, 2 = a chain/run. A run claims 2 atomically;
+// a busy run request therefore knows whether the holder was a run (queue a
+// follow-up) or an action (refuse) without a second racing flag. Review R-07.
+enum {
+    kSettingsLockFree = 0,
+    kSettingsLockAction = 1,
+    kSettingsLockRun = 2,
+};
 static volatile int g_settings_respring_cleanup_running = 0;
 static volatile int g_settings_actions_rerun_requested = 0;
-// Set only while settings_run_actions_internal holds g_settings_actions_running,
-// so the busy path and the SpringBoard-restart handler can tell a run from
-// another action (location services, FastLockX, ...) holding the same lock.
-static volatile int g_settings_run_active = 0;
 // Remembers how the last chain run was invoked so the post-failure "Run Again"
 // alert can re-enter with the same mode (full Apply vs pending-only).
 static volatile BOOL g_settings_actions_last_pending_only = NO;
@@ -1754,7 +1759,7 @@ void settings_note_run_preflight_failure(NSString *message)
 }
 
 // Consumed exactly once, by the completion that is posted.
-static NSString *settings_take_run_preflight_failure(void)
+NSString *settings_take_run_preflight_failure(void)
 {
     @synchronized (settings_preflight_failure_lock()) {
         NSString *message = g_settings_run_preflight_failure;
@@ -2499,7 +2504,7 @@ static void settings_handle_springboard_restart(void)
         settings_notify_remote_call_state_changed();
         // A run in flight was working against the old SpringBoard; its own
         // completion may never come (or would report stale success).
-        if (g_settings_run_active) {
+        if (g_settings_actions_running == kSettingsLockRun) {
             settings_post_actions_complete_async(NO, @"SpringBoard restarted during the run — run it again.");
         }
         // Only now, with the old session dropped: the respring cover waits
@@ -2766,8 +2771,18 @@ static UIBackgroundTaskIdentifier settings_safe_detach_begin(const char *reason)
 {
     UIApplication *app = [UIApplication sharedApplication];
     __block UIBackgroundTaskIdentifier task = UIBackgroundTaskInvalid;
+    __block volatile BOOL expiredBeforeRegistered = NO;
     task = [app beginBackgroundTaskWithName:@"cyanide.safe-detach"
                           expirationHandler:^{
+        @synchronized (settings_bg_lock()) {
+            if (![settings_safe_detach_live_tasks() containsObject:@(task)]) {
+                // The handler can win the race against registration. Do not
+                // end a task id the begin path has not published yet; it will
+                // see this flag and end it after adding. Review R-10.
+                expiredBeforeRegistered = YES;
+                return;
+            }
+        }
         printf("[SETTINGS] safe-detach: background task EXPIRED by iOS — "
                "an in-flight RemoteCall op did not drain in time (wedged "
                "in-kernel); releasing the assertion\n");
@@ -2781,8 +2796,14 @@ static UIBackgroundTaskIdentifier settings_safe_detach_begin(const char *reason)
     @synchronized (settings_bg_lock()) {
         [settings_safe_detach_live_tasks() addObject:@(task)];
         g_safe_detach_task = task;
+        __sync_add_and_fetch(&g_safe_detach_in_flight, 1);
     }
-    __sync_add_and_fetch(&g_safe_detach_in_flight, 1);
+    if (expiredBeforeRegistered) {
+        settings_safe_detach_end_task(task);
+        printf("[SETTINGS] safe-detach: task %lu expired during registration; "
+               "ended without a drain window\n", (unsigned long)task);
+        return UIBackgroundTaskInvalid;
+    }
     printf("[SETTINGS] safe-detach: window open id=%lu (%s)\n",
            (unsigned long)task, reason ?: "backgrounding");
     return task;
@@ -3269,11 +3290,25 @@ static void settings_apply_heartbeat_stop(void)
     });
 }
 
+static int settings_try_claim_action_slot(void)
+{
+    return __sync_val_compare_and_swap(&g_settings_actions_running,
+                                       kSettingsLockFree, kSettingsLockAction);
+}
+
+static int settings_try_claim_run_slot(void)
+{
+    return __sync_val_compare_and_swap(&g_settings_actions_running,
+                                       kSettingsLockFree, kSettingsLockRun);
+}
+
 static BOOL settings_try_claim_actions_lock(const char *owner, const char *busyMessage)
 {
-    if (__sync_lock_test_and_set(&g_settings_actions_running, 1)) {
-        printf("[SETTINGS] %s blocked: actions already running\n",
-               owner ?: "action");
+    int previous = settings_try_claim_action_slot();
+    if (previous != kSettingsLockFree) {
+        printf("[SETTINGS] %s blocked: %s already running\n",
+               owner ?: "action",
+               previous == kSettingsLockRun ? "a run is" : "another action is");
         if (busyMessage) log_user("%s\n", busyMessage);
         return NO;
     }
@@ -3782,7 +3817,7 @@ static BOOL settings_acquire_actions_lock_wait(const char *owner, uint64_t timeo
     uint64_t startUS = settings_now_us();
     BOOL loggedWait = NO;
 
-    while (__sync_lock_test_and_set(&g_settings_actions_running, 1)) {
+    while (settings_try_claim_action_slot() != kSettingsLockFree) {
         if (!loggedWait) {
             printf("[SETTINGS] %s waiting for active action before cleanup\n",
                    owner ?: "cleanup");
@@ -4506,7 +4541,7 @@ void settings_present_hide_home_bar_respring_prompt(UIViewController *host)
                                            style:UIAlertActionStyleDestructive
                                          handler:^(UIAlertAction *_) {
         dispatch_async(dispatch_get_global_queue(0, 0), ^{
-            if (__sync_lock_test_and_set(&g_settings_actions_running, 1)) {
+            if (__sync_val_compare_and_swap(&g_settings_actions_running, kSettingsLockFree, kSettingsLockAction)) {
                 printf("[SETTINGS] hide home bar respring blocked: actions already running\n");
                 log_user("[RESPRING] Another action is still running. Try Respring again in a moment.\n");
                 return;
@@ -4648,7 +4683,7 @@ static bool settings_apply_lock_screen_duration_body(long long seconds)
 
 static BOOL settings_apply_lock_screen_duration(long long seconds)
 {
-    if (__sync_lock_test_and_set(&g_settings_actions_running, 1)) {
+    if (__sync_val_compare_and_swap(&g_settings_actions_running, kSettingsLockFree, kSettingsLockAction)) {
         printf("[LSD] actions already running; ignoring request\n");
         log_user("[LSD] Another action is already running.\n");
         return NO;
@@ -4665,7 +4700,7 @@ static BOOL settings_apply_lock_screen_duration(long long seconds)
 //   -3 = another action is running, -2 = no kernel access, -1 = channel/read error.
 static long long settings_read_lock_screen_duration(void)
 {
-    if (__sync_lock_test_and_set(&g_settings_actions_running, 1)) {
+    if (__sync_val_compare_and_swap(&g_settings_actions_running, kSettingsLockFree, kSettingsLockAction)) {
         printf("[LSD] actions already running; ignoring read request\n");
         return -3;
     }
@@ -4967,13 +5002,58 @@ static void settings_themer_import_fail(NSError **error, NSString *message)
 
 // Moves a fully staged import over `target`. The old item is set aside first
 // and restored if the move fails, so a failure never leaves neither in place.
-static BOOL settings_themer_swap_into_place(NSString *staging, NSString *target, NSError **error)
+// Crash recovery for the two-step swap below. Backups are named with the kind
+// (folder/plist) so a folder backup can never be restored as a plist. If the
+// target is missing, the newest matching backup is put back; if the target
+// exists, stale backups from an interrupted earlier swap are removed. Review R-09.
+static void settings_themer_recover_swap(NSString *target, NSString *kind)
 {
     NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *parent = target.stringByDeletingLastPathComponent;
+    NSString *prefix = @".Imported-backup-";
+    NSString *suffix = [@"-" stringByAppendingString:kind];
+    NSArray<NSString *> *names = [fm contentsOfDirectoryAtPath:parent error:nil];
+    NSMutableArray<NSString *> *matches = [NSMutableArray array];
+    for (NSString *name in names) {
+        if ([name hasPrefix:prefix] && [name hasSuffix:suffix])
+            [matches addObject:name];
+    }
+    if (matches.count == 0) return;
+    BOOL targetExists = [fm fileExistsAtPath:target];
+    if (targetExists) {
+        for (NSString *name in matches)
+            [fm removeItemAtPath:[parent stringByAppendingPathComponent:name] error:nil];
+        return;
+    }
+    NSString *newest = nil;
+    NSDate *newestDate = nil;
+    for (NSString *name in matches) {
+        NSString *path = [parent stringByAppendingPathComponent:name];
+        NSDate *date = [fm attributesOfItemAtPath:path error:nil].fileModificationDate;
+        if (!newest || (date && (!newestDate || [date compare:newestDate] == NSOrderedDescending))) {
+            newest = path;
+            newestDate = date;
+        }
+    }
+    if (newest) {
+        [fm moveItemAtPath:newest toPath:target error:nil];
+        printf("[THEMER] recovered an interrupted import swap for %s\n", target.lastPathComponent.UTF8String);
+    }
+    for (NSString *name in matches) {
+        NSString *path = [parent stringByAppendingPathComponent:name];
+        if (![path isEqualToString:newest]) [fm removeItemAtPath:path error:nil];
+    }
+}
+
+static BOOL settings_themer_swap_into_place(NSString *staging, NSString *target,
+                                            NSString *kind, NSError **error)
+{
+    NSFileManager *fm = [NSFileManager defaultManager];
+    settings_themer_recover_swap(target, kind);
     NSString *backup = nil;
     if ([fm fileExistsAtPath:target]) {
         backup = [[target stringByDeletingLastPathComponent] stringByAppendingPathComponent:
-            [NSString stringWithFormat:@".Imported-backup-%@", NSUUID.UUID.UUIDString]];
+            [NSString stringWithFormat:@".Imported-backup-%@-%@", NSUUID.UUID.UUIDString, kind]];
         if (![fm moveItemAtPath:target toPath:backup error:error]) return NO;
     }
     if (![fm moveItemAtPath:staging toPath:target error:error]) {
@@ -5019,7 +5099,7 @@ static NSDictionary<NSString *, NSData *> *settings_themer_load_plist_theme(NSSt
         if (![key isKindOfClass:NSString.class] ||
             ![value isKindOfClass:NSData.class] ||
             [(NSData *)value length] == 0 ||
-            [(NSData *)value length] > SBLMaxImageFileBytes ||
+            [(NSData *)value length] > THEMER_MAX_ICON_BYTES ||
             !SBLImageDataPassesPixelPreflight(value)) {
             continue;
         }
@@ -5137,7 +5217,7 @@ static bool settings_apply_ota_disabled_body(BOOL disable)
 // queue; settings_run_ota_action() below is the only caller.
 static BOOL settings_apply_ota_disabled(BOOL disable)
 {
-    if (__sync_lock_test_and_set(&g_settings_actions_running, 1)) {
+    if (__sync_val_compare_and_swap(&g_settings_actions_running, kSettingsLockFree, kSettingsLockAction)) {
         printf("[SETTINGS] actions already running; ignoring OTA request\n");
         log_user("[OTA] Another action is already running.\n");
         return NO;
@@ -5154,7 +5234,7 @@ static BOOL settings_apply_ota_disabled(BOOL disable)
 // -1 = filesystem access denied / read failed.
 static int settings_read_ota_status(void)
 {
-    if (__sync_lock_test_and_set(&g_settings_actions_running, 1)) {
+    if (__sync_val_compare_and_swap(&g_settings_actions_running, kSettingsLockFree, kSettingsLockAction)) {
         printf("[SETTINGS] actions already running; ignoring OTA status read\n");
         return -3;
     }
@@ -8025,7 +8105,7 @@ static void settings_schedule_live_apply_for_key(NSString *key)
             return;
         }
         dispatch_async(dispatch_get_global_queue(0, 0), ^{
-            if (__sync_lock_test_and_set(&g_settings_actions_running, 1)) {
+            if (__sync_val_compare_and_swap(&g_settings_actions_running, kSettingsLockFree, kSettingsLockAction)) {
                 log_user("[LOCSIM] Location update deferred: Apply Tweaks is still running.\n");
                 settings_post_actions_complete_async(NO, @"Location refresh deferred while Apply Tweaks is running.");
                 settings_notify_package_queue_changed_async();
@@ -8446,7 +8526,7 @@ void settings_register_defaults(void)
         // acquired on A18: it did, 12 times. See kexploit_opa334.m.
         // Must be spelled out as a registered default because reinstalling a
         // sideloaded build wipes NSUserDefaults.
-        kSettingsA18ExploitPath:     @1,
+        kSettingsA18ExploitPath:     @2,
         // Off by default: baseline bulk-spray + forward-scan is the proven pe_v1
         // path (~4/7). Interleave+reverse-scan (approach A) pins the find to the
         // mapping tail but has not measured a better panic rate, so it is opt-in.
@@ -8465,7 +8545,7 @@ void settings_register_defaults(void)
         // the search at 4 passes and returns a clean retry instead of grinding,
         // which can otherwise end in an aperture panic on a device that never
         // lands the PCB.
-        kSettingsA18BoundedSearch:   @NO,
+        kSettingsA18BoundedSearch:   @YES,
         kSettingsRemoteSettleMode:   @2,
         kSettingsRunSandboxEscape:   @YES,
         kSettingsRunPatchSandboxExt: @NO,
@@ -8718,10 +8798,11 @@ static void settings_run_actions_internal(BOOL pendingOnly)
 
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        if (__sync_lock_test_and_set(&g_settings_actions_running, 1)) {
+        int previous = settings_try_claim_run_slot();
+        if (previous != kSettingsLockFree) {
             // The follow-up flag is only consumed by a run's @finally; a
             // non-run lock holder would drop it and leave the sheet spinning.
-            if (!g_settings_run_active) {
+            if (previous == kSettingsLockAction) {
                 // This refusal is the completion that gets posted: consume
                 // any installer preflight note so it can't ride into a later run.
                 (void)settings_take_run_preflight_failure();
@@ -8735,7 +8816,6 @@ static void settings_run_actions_internal(BOOL pendingOnly)
             log_user("[RUN] Already running. Queued one follow-up run for the latest package state.\n");
             return;
         }
-        __sync_lock_test_and_set(&g_settings_run_active, 1);
         dispatch_sync(dispatch_get_main_queue(), ^{
             if (!g_settings_actions_idle_held) {
                 g_settings_actions_idle_was_disabled = UIApplication.sharedApplication.idleTimerDisabled;
@@ -9449,7 +9529,6 @@ static void settings_run_actions_internal(BOOL pendingOnly)
             // (idle parking, live-tweak loops) still lands in the shareable log.
             // The next run's log_session_begin() rotates the file.
             log_session_flush();
-            __sync_lock_release(&g_settings_run_active);
             __sync_lock_release(&g_settings_actions_running);
             settings_reconcile_applied_from_defaults();
             // Auto-retry: a clean KRW-acquire miss is fully re-entrant in the
@@ -12986,7 +13065,7 @@ NSData *settings_root_read_file(NSString *path, NSUInteger maxBytes, BOOL *trunc
                                            style:UIAlertActionStyleDestructive
                                          handler:^(UIAlertAction *_) {
         dispatch_async(dispatch_get_global_queue(0, 0), ^{
-            if (__sync_lock_test_and_set(&g_settings_actions_running, 1)) {
+            if (__sync_val_compare_and_swap(&g_settings_actions_running, kSettingsLockFree, kSettingsLockAction)) {
                 printf("[SETTINGS] respring blocked: actions already running\n");
                 return;
             }
@@ -13345,7 +13424,7 @@ static NSUInteger settings_tab_index_for_title(UITabBarController *tab, NSString
            @"subtitle": @"Experimental. On interleaves the socket spray with search-mapping allocation and scans each mapping tail-first, aiming to find the PCB in fewer reads. Off uses the proven bulk-spray + forward-scan path. A18/M4 only; effective on the next fresh chain run." },
         @{ @"kind": @"a18shape", @"key": kSettingsA18MemoryShaping, @"peV1Only": @YES, @"a18Only": @YES, @"title": @"A18 memory shaping" },
         @{ @"key": kSettingsA18BoundedSearch, @"peV1Only": @YES, @"a18Only": @YES, @"title": @"A18 bounded search",
-           @"subtitle": @"On stops after 4 search passes and reports a clean retry instead of grinding — which can otherwise end in an aperture panic on a device that never lands the PCB. Off (default, matches 1.5.5) grinds until the exploit acquires. A18/M4 only; effective on the next fresh chain run." },
+           @"subtitle": @"On stops after 4 search passes and reports a clean retry instead of grinding — which can otherwise end in an aperture panic on a device that never lands the PCB. On (default) stops; Off (legacy, matches 1.5.5) grinds until the exploit acquires. A18/M4 only; effective on the next fresh chain run." },
         @{ @"key": kSettingsRunAutoRetry, @"title": @"Auto-retry failed chain runs",
            @"subtitle": @"On re-runs the chain automatically when the exploit misses, up to the attempt cap below — the progress screen just keeps spinning until it lands or the cap is hit. Never retries a wedged injection. Every attempt is an independent panic dice roll, so the cap bounds your exposure per tap." },
         @{ @"kind": @"stepper", @"key": kSettingsRunAutoRetryMaxAttempts, @"title": @"Auto-retry attempt cap",
@@ -15597,7 +15676,7 @@ didFinishPicking:(NSArray<PHPickerResult *> *)results
     uint64_t totalBytes = 0;
     for (NSURL *png in pngs) {
         uint64_t size = 0;
-        if (!SBLImageFilePassesPreflight(png.path, SBLMaxImageFileBytes, &size)) {
+        if (!SBLImageFilePassesPreflight(png.path, THEMER_MAX_ICON_BYTES, &size)) {
             printf("[THEMER] import: skipped %s (not a regular PNG within the size/pixel caps)\n",
                    png.lastPathComponent.UTF8String);
             continue;
@@ -15633,7 +15712,7 @@ didFinishPicking:(NSArray<PHPickerResult *> *)results
                 return NO;
             }
         }
-        if (!settings_themer_swap_into_place(staging, target, error)) {
+        if (!settings_themer_swap_into_place(staging, target, @"folder", error)) {
             [fm removeItemAtPath:staging error:nil];
             return NO;
         }
@@ -15681,7 +15760,7 @@ didFinishPicking:(NSArray<PHPickerResult *> *)results
             [fm removeItemAtPath:staging error:nil];
             return NO;
         }
-        if (!settings_themer_swap_into_place(staging, target, error)) {
+        if (!settings_themer_swap_into_place(staging, target, @"plist", error)) {
             [fm removeItemAtPath:staging error:nil];
             return NO;
         }
@@ -17223,7 +17302,7 @@ void cyanide_present_contact(UIViewController *host)
         title.translatesAutoresizingMaskIntoConstraints = NO;
 
         UISegmentedControl *seg =
-            [[UISegmentedControl alloc] initWithItems:@[@"pe_v1 (default)", @"pe_v2", @"pe_v3"]];
+            [[UISegmentedControl alloc] initWithItems:@[@"pe_v1 (compat.)", @"pe_v2", @"pe_v3 (default)"]];
         seg.translatesAutoresizingMaskIntoConstraints = NO;
         // Display order is pe_v1 first, but the stored value is unchanged
         // (1 = pe_v1, 0 = pe_v2, 2 = pe_v3) so existing preferences keep their meaning.
@@ -17238,13 +17317,11 @@ void cyanide_present_contact(UIViewController *host)
         note.font = [UIFont systemFontOfSize:12.0];
         note.textColor = UIColor.secondaryLabelColor;
         note.text = settings_device_is_a18_above()
-            ? @"A18/M4 only. pe_v1 is the default (~50% per attempt; parked state makes it a "
-               "one-time cost per boot). pe_v2 stages 2 GB as 131,072 separate IOSurfaces, but iOS "
-               "caps a process at 16,384 — so most fail and it has not acquired reliably in "
-               "testing. pe_v3 uses pe_v2's staging but hunts only one mapping, retries on "
-               "already-proven pages instead of re-hunting, and stops early instead of reading "
-               "memory likely to panic the device (~50% per attempt in testing) — so it probably "
-               "causes fewer reboots."
+            ? @"A18/M4 only. pe_v3 is the default: it stages 2 GB, hunts one mapping, stops "
+               "after a bounded number of unproven reads, and retries on already-proven pages "
+               "instead of re-hunting — the hunt is where every aperture panic has occurred. "
+               "pe_v1 is kept as an explicit compatibility/debug option; it now has a bounded "
+               "search and foreign-read cap. pe_v2 is the legacy fallback."
             : @"A18/M4 devices only. This device uses pe_v1 already.";
         note.translatesAutoresizingMaskIntoConstraints = NO;
 
@@ -18309,7 +18386,7 @@ void cyanide_present_contact(UIViewController *host)
     [[NSUserDefaults standardUserDefaults] synchronize];
     log_user("[KRW] A18 exploit path set to %s. Takes effect on the next fresh chain run "
              "(a parked/recovered session skips the exploit entirely).\n",
-             path == 1 ? "pe_v1 (default)"
+             path == 1 ? "pe_v1 (compatibility)"
              : path == 2 ? "pe_v3 (single-hunt)"
                          : "pe_v2 (fallback)");
     // The pe_v1-only options (shaping/interleave/bounded) enable/disable with the
@@ -18480,7 +18557,7 @@ void cyanide_present_contact(UIViewController *host)
                                                    style:UIAlertActionStyleDestructive
                                                  handler:^(UIAlertAction *_) {
                 dispatch_async(dispatch_get_global_queue(0, 0), ^{
-                    if (__sync_lock_test_and_set(&g_settings_actions_running, 1)) {
+                    if (__sync_val_compare_and_swap(&g_settings_actions_running, kSettingsLockFree, kSettingsLockAction)) {
                         printf("[SETTINGS] respring blocked: actions already running\n");
                         return;
                     }
