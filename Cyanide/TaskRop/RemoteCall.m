@@ -899,17 +899,155 @@ bool rc_session_pac_keys(uint64_t *outA, uint64_t *outB)
 // when the LAST ref drops, i.e. after every session on that task has
 // un-armed and drained. Fail-closed rule: a leaked ref leaves DELIVER until
 // app death (the pre-registry failure mode), never anything worse.
-#define RC_EXCGUARD_MAX 8
+//
+// Hardening (follow-up): holders are tracked per entry (the RemoteCallState
+// pointers that hold a ref — used as opaque tokens, never dereferenced), so
+// an entry can tell "refs held by live sessions" from "refs whose state was
+// freed/re-inited without a release" (orphans). The original is written back
+// ONLY when no live holder remains AND the task is verified to still be the
+// same live process (pid -> proc -> task). A release that cannot write (KRW
+// dead) keeps the entry as restorePending instead of dropping it; the sweep
+// (session init, a full table, remote_call_retry_pending_cleanup) retries
+// it. Entries whose task is verifiably dead are dropped without any write;
+// an unverifiable liveness read keeps the entry.
+#define RC_EXCGUARD_MAX 16
+#define RC_EXCGUARD_HOLDERS_MAX 4
 typedef struct {
     uint64_t taskAddr;     // 0 = free slot
     uint32_t pid;          // incarnation check against task-address reuse
     uint32_t origFlags;
-    uint32_t refs;
     uint64_t id;           // never reused; a release names the entry it holds
+    const void *holders[RC_EXCGUARD_HOLDERS_MAX];   // live RemoteCallStates
+    int nHolders;          // == refs
+    bool restorePending;   // no holder left, original not yet written back
 } RcExcGuardEntry;
 static RcExcGuardEntry g_rc_excguard[RC_EXCGUARD_MAX];
 static uint64_t g_rc_excguard_next_id = 0;
 static pthread_mutex_t g_rc_excguard_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Caller holds g_rc_excguard_mutex.
+static int rc_excguard_slot_for_id_locked(uint64_t id)
+{
+    if (!id) return -1;
+    for (int i = 0; i < RC_EXCGUARD_MAX; i++)
+        if (g_rc_excguard[i].taskAddr && g_rc_excguard[i].id == id) return i;
+    return -1;
+}
+
+// Caller holds g_rc_excguard_mutex. Removes `holder` from the entry; true if
+// it was a holder.
+static bool rc_excguard_drop_holder_locked(int slot, const void *holder)
+{
+    RcExcGuardEntry *e = &g_rc_excguard[slot];
+    for (int i = 0; i < e->nHolders; i++) {
+        if (e->holders[i] == holder) {
+            e->holders[i] = e->holders[--e->nHolders];
+            e->holders[e->nHolders] = NULL;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Is `task` still the task of live process `pid`? One allproc walk + the
+// proc->task read (the existing proc_find/proc_task lookups), judged by the
+// KRW op-error counter: any failed-safe (zero-filled) read during the check
+// makes the answer UNKNOWN, never DEAD. Caller has verified KRW is ready.
+typedef enum {
+    RC_TASK_ALIVE = 0,
+    RC_TASK_DEAD,
+    RC_TASK_UNKNOWN,
+} RcTaskLiveness;
+
+static RcTaskLiveness rc_task_liveness(uint32_t pid, uint64_t task)
+{
+    if (!task || !pid) return RC_TASK_UNKNOWN;
+    uint64_t errorsBefore = krw_op_error_count();
+    krw_set_nonfatal(true);
+    uint64_t proc = proc_find((pid_t)pid);
+    uint64_t procTask = (proc && is_kaddr_valid(proc)) ? proc_task(proc) : 0;
+    krw_set_nonfatal(false);
+    if (krw_op_error_count() != errorsBefore) return RC_TASK_UNKNOWN;
+    if (!proc) return RC_TASK_DEAD;                  // pid not in allproc
+    if (procTask == task) return RC_TASK_ALIVE;
+    if (procTask && is_kaddr_valid(procTask)) return RC_TASK_DEAD;   // pid reused
+    return RC_TASK_UNKNOWN;
+}
+
+// Drop dead-task entries; write back the original for entries with no live
+// holder (restorePending) whose task is verified alive. Never writes while a
+// live holder exists, never writes into a task not verified alive.
+static void rc_excguard_sweep(const char *where)
+{
+    struct { uint64_t id; uint64_t task; uint32_t pid; } snap[RC_EXCGUARD_MAX];
+    int n = 0;
+    pthread_mutex_lock(&g_rc_excguard_mutex);
+    for (int i = 0; i < RC_EXCGUARD_MAX; i++) {
+        if (!g_rc_excguard[i].taskAddr) continue;
+        snap[n].id = g_rc_excguard[i].id;
+        snap[n].task = g_rc_excguard[i].taskAddr;
+        snap[n].pid = g_rc_excguard[i].pid;
+        n++;
+    }
+    pthread_mutex_unlock(&g_rc_excguard_mutex);
+    if (n == 0) return;   // nothing registered: no kernel access at all
+    if (!kexploit_krw_ready()) {
+        printf("[RC] task_exc_guard sweep (%s): KRW not ready — %d entr%s "
+               "kept for a later sweep\n", where, n, n == 1 ? "y" : "ies");
+        return;
+    }
+    for (int k = 0; k < n; k++) {
+        RcTaskLiveness live = rc_task_liveness(snap[k].pid, snap[k].task);
+        pthread_mutex_lock(&g_rc_excguard_mutex);
+        int slot = rc_excguard_slot_for_id_locked(snap[k].id);
+        if (slot < 0 || g_rc_excguard[slot].taskAddr != snap[k].task) {
+            pthread_mutex_unlock(&g_rc_excguard_mutex);
+            continue;   // released/replaced meanwhile
+        }
+        RcExcGuardEntry *e = &g_rc_excguard[slot];
+        if (live == RC_TASK_DEAD) {
+            printf("[RC] task_exc_guard sweep (%s): task=%#llx pid=%u is dead "
+                   "— entry dropped (holders=%d, pending=%d), nothing written\n",
+                   where, e->taskAddr, e->pid, e->nHolders, e->restorePending);
+            memset(e, 0, sizeof(*e));
+        } else if (live == RC_TASK_ALIVE && e->nHolders == 0 && e->restorePending) {
+            uint32_t orig = e->origFlags;
+            uint64_t task = e->taskAddr;
+            if (restore_excguard_kill(task, orig) == 0) {
+                printf("[RC] task_exc_guard sweep (%s): pending restore DONE for "
+                       "task=%#llx pid=%u (no live holder)\n", where, task, e->pid);
+                memset(e, 0, sizeof(*e));
+            } else {
+                printf("[RC] task_exc_guard sweep (%s): pending restore FAILED "
+                       "for task=%#llx — kept pending\n", where, task);
+            }
+        }
+        // ALIVE with live holders, or UNKNOWN: keep untouched.
+        pthread_mutex_unlock(&g_rc_excguard_mutex);
+    }
+}
+
+// The ref `st` holds on entry `id` lost its owner without a release (state
+// freed, or re-inited without teardown). Remove the holder; with no live
+// holder left the entry becomes restorePending — written back only by the
+// sweep, after verifying the task is still alive. Caller has claimed
+// excGuardHeld.
+static void rc_excguard_orphan(const void *st, uint64_t task, uint64_t id,
+                               const char *where)
+{
+    pthread_mutex_lock(&g_rc_excguard_mutex);
+    int slot = rc_excguard_slot_for_id_locked(id);
+    if (slot >= 0 && g_rc_excguard[slot].taskAddr == task &&
+        rc_excguard_drop_holder_locked(slot, st)) {
+        if (g_rc_excguard[slot].nHolders == 0)
+            g_rc_excguard[slot].restorePending = true;
+        printf("[RC] task_exc_guard (%s): ref on task=%#llx orphaned (holders "
+               "left=%d) — %s\n", where, task, g_rc_excguard[slot].nHolders,
+               g_rc_excguard[slot].nHolders ? "DELIVER kept"
+                                           : "restore pending (next sweep)");
+    }
+    pthread_mutex_unlock(&g_rc_excguard_mutex);
+}
 
 // Init side: patch (first session) or join (later sessions) the task's
 // task_exc_guard and record this state's ref. 0 = ref taken and DELIVER
@@ -917,99 +1055,128 @@ static pthread_mutex_t g_rc_excguard_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int rc_excguard_acquire(RemoteCallState *st, uint64_t task, uint32_t pid,
                                const char *process)
 {
-    if (atomic_load_explicit(&st->excGuardHeld, memory_order_acquire)) {
+    if (atomic_exchange_explicit(&st->excGuardHeld, false, memory_order_acq_rel)) {
         // A previous init on this state never released its ref (no teardown
-        // ran). Its threads may still be armed, so restoring is NOT safe:
-        // leak it (that task keeps DELIVER until app death — the old
-        // failure mode) and track only the new ref from here on.
+        // ran). Never restore here: hand it to the orphan path (restored only
+        // by a sweep once no live holder remains and the task is verified).
         printf("[RC] task_exc_guard: stale ref from a previous init on this "
-               "state (task=%#llx id=%llu) — leaked, not restored\n",
+               "state (task=%#llx id=%llu) — orphaned, not restored here\n",
                st->excGuardTask, st->excGuardId);
-        atomic_store_explicit(&st->excGuardHeld, false, memory_order_release);
+        rc_excguard_orphan(st, st->excGuardTask, st->excGuardId, "re-init");
     }
     int ret = -1;
-    pthread_mutex_lock(&g_rc_excguard_mutex);
-    int slot = -1, freeSlot = -1;
-    for (int i = 0; i < RC_EXCGUARD_MAX; i++) {
-        if (g_rc_excguard[i].taskAddr == task && g_rc_excguard[i].refs > 0) {
-            slot = i;
-        } else if (!g_rc_excguard[i].taskAddr && freeSlot < 0) {
-            freeSlot = i;
+    for (int pass = 0; pass < 2; pass++) {
+        pthread_mutex_lock(&g_rc_excguard_mutex);
+        int slot = -1, freeSlot = -1;
+        for (int i = 0; i < RC_EXCGUARD_MAX; i++) {
+            if (g_rc_excguard[i].taskAddr == task) {
+                slot = i;
+            } else if (!g_rc_excguard[i].taskAddr && freeSlot < 0) {
+                freeSlot = i;
+            }
         }
-    }
-    if (slot >= 0 && g_rc_excguard[slot].pid != pid) {
-        // Same task address, different process: the recorded task died and
-        // its address was reused. Its "original" belongs to a dead task —
-        // never write it into this one. Replace the entry (fresh id); the
-        // old holders' releases then match nothing and restore nothing.
-        printf("[RC] task_exc_guard: registry entry task=%#llx pid=%u is stale "
-               "(now pid=%u) — replacing, old refs=%u orphaned\n",
-               task, g_rc_excguard[slot].pid, pid, g_rc_excguard[slot].refs);
-        freeSlot = slot;
-        slot = -1;
-    }
-    if (slot >= 0) {
-        // Already patched by a live session: re-assert DELIVER (idempotent,
-        // the same verified write every init did before) but keep the entry's
-        // REAL original — the value read now is our own patch.
-        uint32_t ignored = 0;
-        if (disable_excguard_kill_save(task, &ignored) == 0) {
-            g_rc_excguard[slot].refs++;
-            st->excGuardTask = task;
-            st->excGuardId = g_rc_excguard[slot].id;
-            atomic_store_explicit(&st->excGuardHeld, true, memory_order_release);
-            printf("[RC] task_exc_guard: %s task=%#llx already patched — "
-                   "joined (refs=%u, original %#x kept)\n", process ?: "?",
-                   task, g_rc_excguard[slot].refs, g_rc_excguard[slot].origFlags);
-            ret = 0;
+        if (slot >= 0 && g_rc_excguard[slot].pid != pid) {
+            // Same task address, different process: the recorded task died and
+            // its address was reused. Its "original" belongs to a dead task —
+            // never write it into this one. Replace the entry (fresh id); the
+            // old holders' releases then match nothing and restore nothing.
+            printf("[RC] task_exc_guard: registry entry task=%#llx pid=%u is stale "
+                   "(now pid=%u) — replacing, old holders=%d orphaned\n",
+                   task, g_rc_excguard[slot].pid, pid, g_rc_excguard[slot].nHolders);
+            memset(&g_rc_excguard[slot], 0, sizeof(g_rc_excguard[slot]));
+            freeSlot = slot;
+            slot = -1;
         }
-    } else if (freeSlot < 0) {
-        // Fail closed BEFORE patching: with no slot the original could not
-        // be restored later.
-        printf("[RC] task_exc_guard: registry full (%d tasks) — refusing to "
-               "patch %s task=%#llx\n", RC_EXCGUARD_MAX, process ?: "?", task);
-    } else {
-        uint32_t orig = 0;
-        if (disable_excguard_kill_save(task, &orig) == 0) {
-            g_rc_excguard[freeSlot].taskAddr = task;
-            g_rc_excguard[freeSlot].pid = pid;
-            g_rc_excguard[freeSlot].origFlags = orig;
-            g_rc_excguard[freeSlot].refs = 1;
-            g_rc_excguard[freeSlot].id = ++g_rc_excguard_next_id;
-            st->excGuardTask = task;
-            st->excGuardId = g_rc_excguard[freeSlot].id;
-            atomic_store_explicit(&st->excGuardHeld, true, memory_order_release);
-            ret = 0;
+        if (slot >= 0) {
+            // Already patched (live holders, or a pending restore): re-assert
+            // DELIVER (idempotent, the same verified write every init did
+            // before) but keep the entry's REAL original — the value read now
+            // is our own patch. Holder capacity is checked BEFORE the write.
+            RcExcGuardEntry *e = &g_rc_excguard[slot];
+            uint32_t ignored = 0;
+            if (e->nHolders >= RC_EXCGUARD_HOLDERS_MAX) {
+                printf("[RC] task_exc_guard: %d holders on task=%#llx — refusing "
+                       "another %s session\n", e->nHolders, task, process ?: "?");
+            } else if (disable_excguard_kill_save(task, &ignored) == 0) {
+                e->holders[e->nHolders++] = st;
+                bool wasPending = e->restorePending;
+                e->restorePending = false;
+                st->excGuardTask = task;
+                st->excGuardId = e->id;
+                atomic_store_explicit(&st->excGuardHeld, true, memory_order_release);
+                printf("[RC] task_exc_guard: %s task=%#llx already patched — "
+                       "joined (refs=%d, original %#x kept%s)\n", process ?: "?",
+                       task, e->nHolders, e->origFlags,
+                       wasPending ? ", pending restore cancelled" : "");
+                ret = 0;
+            }
+        } else if (freeSlot < 0) {
+            if (pass == 0) {
+                // Table full: sweep dead-task / pending entries, then retry once.
+                pthread_mutex_unlock(&g_rc_excguard_mutex);
+                rc_excguard_sweep("table full");
+                continue;
+            }
+            // Fail closed BEFORE patching: with no slot the original could not
+            // be restored later.
+            printf("[RC] task_exc_guard: registry full (%d tasks) — refusing to "
+                   "patch %s task=%#llx\n", RC_EXCGUARD_MAX, process ?: "?", task);
+        } else {
+            uint32_t orig = 0;
+            if (disable_excguard_kill_save(task, &orig) == 0) {
+                RcExcGuardEntry *e = &g_rc_excguard[freeSlot];
+                memset(e, 0, sizeof(*e));
+                e->taskAddr = task;
+                e->pid = pid;
+                e->origFlags = orig;
+                e->id = ++g_rc_excguard_next_id;
+                e->holders[0] = st;
+                e->nHolders = 1;
+                st->excGuardTask = task;
+                st->excGuardId = e->id;
+                atomic_store_explicit(&st->excGuardHeld, true, memory_order_release);
+                ret = 0;
+            }
         }
+        pthread_mutex_unlock(&g_rc_excguard_mutex);
+        break;
     }
-    pthread_mutex_unlock(&g_rc_excguard_mutex);
     return ret;
 }
 
-// Drop one ref on registry entry `id` (task `task`). The CALLER has already
-// claimed the ref (atomic_exchange on excGuardHeld), so this runs once per
-// ref. Restores the original flags only when the last ref drops.
-static void rc_excguard_release(uint64_t task, uint64_t id, const char *where)
+// Drop `holder`'s ref on registry entry `id` (task `task`). The CALLER has
+// already claimed the ref (atomic_exchange on excGuardHeld), so this runs once
+// per ref. Restores the original flags only when the last live holder drops;
+// if it cannot write (KRW dead / write failed) the entry stays restorePending.
+static void rc_excguard_release(uint64_t task, uint64_t id, const void *holder,
+                                const char *where)
 {
-    // Validate BEFORE touching the registry: a release that cannot restore
-    // must not consume the entry another session still relies on.
-    if (!task || !is_kaddr_valid(task)) {
-        printf("[RC] task_exc_guard restore skipped (%s): no valid target task "
-               "(%#llx) — entry kept (task keeps DELIVER until app death)\n",
-               where, task);
-        return;
-    }
-    bool krwLive = kexploit_krw_ready();
+    bool taskValid = task && is_kaddr_valid(task);
+    bool krwLive = taskValid && kexploit_krw_ready();
     pthread_mutex_lock(&g_rc_excguard_mutex);
-    int slot = -1;
-    for (int i = 0; i < RC_EXCGUARD_MAX; i++) {
-        if (g_rc_excguard[i].taskAddr && g_rc_excguard[i].id == id) { slot = i; break; }
-    }
+    int slot = rc_excguard_slot_for_id_locked(id);
     if (slot < 0 || g_rc_excguard[slot].taskAddr != task) {
         pthread_mutex_unlock(&g_rc_excguard_mutex);
         printf("[RC] task_exc_guard restore skipped (%s): registry entry "
                "id=%llu for task=%#llx is gone (dropped or replaced) — nothing "
                "to restore\n", where, id, task);
+        return;
+    }
+    RcExcGuardEntry *e = &g_rc_excguard[slot];
+    (void)rc_excguard_drop_holder_locked(slot, holder);
+    if (e->nHolders > 0) {
+        printf("[RC] task_exc_guard (%s): task=%#llx still held by %d other "
+               "session(s) — DELIVER kept, original restored by the last one\n",
+               where, task, e->nHolders);
+        pthread_mutex_unlock(&g_rc_excguard_mutex);
+        return;
+    }
+    if (!taskValid) {
+        e->restorePending = true;
+        pthread_mutex_unlock(&g_rc_excguard_mutex);
+        printf("[RC] task_exc_guard restore skipped (%s): no valid target task "
+               "(%#llx) — kept pending (the sweep verifies the task first)\n",
+               where, task);
         return;
     }
     if (!krwLive) {
@@ -1020,31 +1187,26 @@ static void rc_excguard_release(uint64_t task, uint64_t id, const char *where)
         // a later guard violation there wedges on dead ports ~22 s after app
         // death. Surface it in the USER log (it survives in the UI / exported
         // log even when the live printf stream is lost with the process).
-        // F-02: drop the entry — its original can never be written with this
-        // KRW, and other holders' releases then match nothing.
-        memset(&g_rc_excguard[slot], 0, sizeof(g_rc_excguard[slot]));
+        // Hardening: keep the entry as restorePending — a KRW recovery
+        // (remote_call_retry_pending_cleanup / next init sweep) writes it back.
+        e->restorePending = true;
         pthread_mutex_unlock(&g_rc_excguard_mutex);
         printf("[RC] CRITICAL: task_exc_guard restore IMPOSSIBLE (%s): KRW dead — remote "
                "task keeps EXC_GUARD-DELIVER; a future guard violation there "
-               "may wedge on our dead ports\n", where);
+               "may wedge on our dead ports (kept pending: retried if KRW "
+               "recovers)\n", where);
         log_user("[WARN] task_exc_guard restore failed (%s): KRW dead — launchd "
                  "keeps EXC_GUARD-DELIVER to our dying ports; residual "
                  "initproc-exit risk\n", where);
         return;
     }
-    if (g_rc_excguard[slot].refs > 1) {
-        g_rc_excguard[slot].refs--;
-        printf("[RC] task_exc_guard (%s): task=%#llx still held by %u other "
-               "session(s) — DELIVER kept, original restored by the last one\n",
-               where, task, g_rc_excguard[slot].refs);
-        pthread_mutex_unlock(&g_rc_excguard_mutex);
-        return;
-    }
-    uint32_t orig = g_rc_excguard[slot].origFlags;
-    memset(&g_rc_excguard[slot], 0, sizeof(g_rc_excguard[slot]));
-    if (restore_excguard_kill(task, orig) != 0) {
+    uint32_t orig = e->origFlags;
+    if (restore_excguard_kill(task, orig) == 0) {
+        memset(e, 0, sizeof(*e));
+    } else {
+        e->restorePending = true;
         printf("[RC] task_exc_guard restore FAILED (%s) — residual launchd "
-               "wedge risk on future guard violations\n", where);
+               "wedge risk on future guard violations (kept pending)\n", where);
     }
     pthread_mutex_unlock(&g_rc_excguard_mutex);
 }
@@ -1054,7 +1216,7 @@ static void rc_restore_task_exc_guard_state(RemoteCallState *st, const char *whe
 {
     if (!st || !atomic_exchange_explicit(&st->excGuardHeld, false, memory_order_acq_rel))
         return;
-    rc_excguard_release(st->excGuardTask, st->excGuardId, where);
+    rc_excguard_release(st->excGuardTask, st->excGuardId, st, where);
 }
 
 static void rc_restore_task_exc_guard(const char *where)
@@ -2936,9 +3098,8 @@ typedef enum {
     RC_SYNTH_UNKNOWN,
 } RcSyntheticThreadState;
 
-static RcSyntheticThreadState rc_synthetic_thread_state(void)
+static RcSyntheticThreadState rc_thread_owner_state(uint64_t thread, uint64_t task)
 {
-    uint64_t thread = g_RC_callThreadAddr;
     if (!thread) return RC_SYNTH_GONE;
     if (!kexploit_krw_peek_live()) return RC_SYNTH_UNKNOWN;
     if (!is_kaddr_valid(thread)) return RC_SYNTH_GONE;
@@ -2955,16 +3116,202 @@ static RcSyntheticThreadState rc_synthetic_thread_state(void)
             result = RC_SYNTH_GONE;
         } else if (early_kread_checked(tro + off_thread_ro_tro_task,
                                        &owner, sizeof(owner))) {
-            result = owner == g_RC_taskAddr ? RC_SYNTH_ALIVE : RC_SYNTH_GONE;
+            result = owner == task ? RC_SYNTH_ALIVE : RC_SYNTH_GONE;
         }
     }
     krw_set_nonfatal(false);
     return result;
 }
 
+static RcSyntheticThreadState rc_synthetic_thread_state(void)
+{
+    return rc_thread_owner_state(g_RC_callThreadAddr, g_RC_taskAddr);
+}
+
 static bool rc_synthetic_thread_gone(void)
 {
     return rc_synthetic_thread_state() == RC_SYNTH_GONE;
+}
+
+// ---------------------------------------------------------------------------
+// Hardening (F-09 follow-up): "verify later" list. A teardown that could not
+// verify its synthetic thread (UNKNOWN: KRW down or a read failed) used to
+// leave it to luck. It is recorded here and re-checked once KRW is confirmed
+// working — after a successful session init (next to the landmine sweep) and
+// from remote_call_retry_pending_cleanup() (parked-KRW recovery, Clean Up,
+// termination cleanup):
+//   GONE    -> unregistered from the synthetic registry, dropped;
+//   ALIVE   -> thread_terminate'd, but ONLY from inside a live session on the
+//              SAME task+pid, only through the thread's own port name whose
+//              kobject is re-verified to be exactly this thread, and only
+//              while its saved PC reads as a protocol sentinel (the landmine
+//              sweep's rule — a legitimate thread never sits there), so a
+//              freed-and-reused thread address or port name can never hit an
+//              innocent thread; without such a session it simply waits;
+//   UNKNOWN -> kept, attempts++; after RC_SYNTH_PENDING_MAX_ATTEMPTS one
+//              CRITICAL line and dropped (it stays in the synthetic registry,
+//              so it is never armed; the launchd landmine sweep still covers
+//              a sentinel-parked one).
+// ---------------------------------------------------------------------------
+#define RC_SYNTH_PENDING_MAX 8
+#define RC_SYNTH_PENDING_MAX_ATTEMPTS 5
+typedef struct {
+    uint64_t taskAddr;
+    uint64_t threadAddr;
+    uint64_t threadPort;   // name in the target (0 = none recorded)
+    uint32_t pid;
+    int attempts;
+} RcSynthPending;
+static RcSynthPending g_rc_synth_pending[RC_SYNTH_PENDING_MAX];
+static int g_rc_synth_pending_count = 0;
+static pthread_mutex_t g_rc_synth_pending_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void rc_synth_pending_add(uint64_t task, uint64_t thread, uint64_t port,
+                                 uint32_t pid, const char *where)
+{
+    if (!thread) return;
+    pthread_mutex_lock(&g_rc_synth_pending_mutex);
+    for (int i = 0; i < g_rc_synth_pending_count; i++) {
+        if (g_rc_synth_pending[i].threadAddr == thread) {
+            pthread_mutex_unlock(&g_rc_synth_pending_mutex);
+            return;
+        }
+    }
+    if (g_rc_synth_pending_count >= RC_SYNTH_PENDING_MAX) {
+        RcSynthPending old = g_rc_synth_pending[0];
+        memmove(&g_rc_synth_pending[0], &g_rc_synth_pending[1],
+                sizeof(g_rc_synth_pending[0]) * (RC_SYNTH_PENDING_MAX - 1));
+        g_rc_synth_pending_count--;
+        printf("[RC] CRITICAL: verify-later list full — dropping oldest "
+               "unverified synthetic thread %#llx (task=%#llx pid=%u); it "
+               "stays in the synthetic registry (never armed)\n",
+               old.threadAddr, old.taskAddr, old.pid);
+    }
+    g_rc_synth_pending[g_rc_synth_pending_count++] = (RcSynthPending){
+        .taskAddr = task, .threadAddr = thread, .threadPort = port,
+        .pid = pid, .attempts = 0 };
+    pthread_mutex_unlock(&g_rc_synth_pending_mutex);
+    printf("[RC] synthetic call thread %#llx state UNKNOWN (%s) — queued for "
+           "verify-later (retried when KRW is confirmed working)\n", thread, where);
+}
+
+static bool rc_synth_pending_has_work(void)
+{
+    pthread_mutex_lock(&g_rc_synth_pending_mutex);
+    bool any = g_rc_synth_pending_count > 0;
+    pthread_mutex_unlock(&g_rc_synth_pending_mutex);
+    return any;
+}
+
+static bool rc_live_parked_contains(uint64_t thread);
+
+// In-session terminate of a verify-later thread (see the list header for the
+// gates). Runs only with the session on that task pushed and KRW verified.
+static bool rc_synth_pending_terminate_in_session(const RcSynthPending *p)
+{
+    if (!p->threadPort || p->threadPort > 0xffffffffULL || !g_RC_trojanMem)
+        return false;
+    mach_port_t name = (mach_port_t)p->threadPort;
+    if (task_get_ipc_port_kobject(g_RC_taskAddr, name) != p->threadAddr)
+        return false;
+    uint64_t scratch = g_RC_trojanMem;   // same scratch layout as the sweep
+    uint32_t stateCnt = ARM_THREAD_STATE64_COUNT;
+    if (!remote_write(scratch + 0x130, &stateCnt, sizeof(stateCnt)))
+        return false;
+    int gkr = (int)(int32_t)do_remote_call_stable(200, "thread_get_state",
+                                                  name, ARM_THREAD_STATE64,
+                                                  scratch + 0x10, scratch + 0x130,
+                                                  0, 0, 0, 0);
+    if (gkr != 0) return false;
+    uint64_t pc = remote_read64(scratch + 0x10 + 0x100);
+    if (!rc_pc_is_sentinel(pc)) {
+        printf("[RC] verify-later: thread %#llx saved PC %#llx is not a "
+               "protocol sentinel — NOT terminating\n",
+               p->threadAddr, (unsigned long long)pc);
+        return false;
+    }
+    // Re-verify the name right before the terminate.
+    if (task_get_ipc_port_kobject(g_RC_taskAddr, name) != p->threadAddr)
+        return false;
+    int tkr = (int)(int32_t)do_remote_call_stable(200, "thread_terminate",
+                                                  name, 0, 0, 0, 0, 0, 0, 0);
+    printf("[RC] verify-later: thread_terminate(%#x) for sentinel-parked "
+           "thread %#llx kr=%d\n", name, p->threadAddr, tkr);
+    if (tkr != 0) return false;
+    usleep(50000);
+    return true;
+}
+
+// inSession: called from init_remote_call with the new session's state pushed
+// (enables the ALIVE terminate for entries on that task+pid).
+static void rc_synth_pending_retry(bool inSession, const char *where)
+{
+    RcSynthPending snap[RC_SYNTH_PENDING_MAX];
+    pthread_mutex_lock(&g_rc_synth_pending_mutex);
+    int n = g_rc_synth_pending_count;
+    memcpy(snap, g_rc_synth_pending, sizeof(snap[0]) * (size_t)n);
+    pthread_mutex_unlock(&g_rc_synth_pending_mutex);
+    if (n == 0) return;
+    if (!kexploit_krw_ready()) return;
+
+    for (int k = 0; k < n; k++) {
+        RcSynthPending *p = &snap[k];
+        bool drop = false, bump = false;
+        if (rc_live_parked_contains(p->threadAddr) ||
+            (inSession && (p->threadAddr == g_RC_callThreadAddr ||
+                           p->threadAddr == g_RC_trojanThreadAddr))) {
+            // The address now belongs to a LIVE session's thread: the old
+            // thread is gone. Drop without touching the registries (they now
+            // describe the live thread).
+            printf("[RC] verify-later (%s): %#llx now belongs to a live "
+                   "session — old thread gone, entry dropped\n", where, p->threadAddr);
+            drop = true;
+        } else {
+            RcSyntheticThreadState st = rc_thread_owner_state(p->threadAddr, p->taskAddr);
+            if (st == RC_SYNTH_ALIVE && inSession && g_RC_taskAddr == p->taskAddr &&
+                (uint32_t)g_RC_pid == p->pid) {
+                if (rc_synth_pending_terminate_in_session(p))
+                    st = rc_thread_owner_state(p->threadAddr, p->taskAddr);
+                if (st != RC_SYNTH_GONE) bump = true;
+            } else if (st == RC_SYNTH_UNKNOWN) {
+                bump = true;
+            }
+            if (st == RC_SYNTH_GONE) {
+                printf("[RC] verify-later (%s): synthetic call thread %#llx "
+                       "exit CONFIRMED (deferred)\n", where, p->threadAddr);
+                rc_synthetic_unregister(p->threadAddr);
+                drop = true;
+            }
+        }
+        if (bump && ++p->attempts >= RC_SYNTH_PENDING_MAX_ATTEMPTS) {
+            printf("[RC] CRITICAL: synthetic call thread %#llx (task=%#llx "
+                   "pid=%u) still unverified after %d attempts — giving up; it "
+                   "stays in the synthetic registry (never armed); a "
+                   "sentinel-parked one is still covered by the launchd "
+                   "landmine sweep\n", p->threadAddr, p->taskAddr, p->pid,
+                   p->attempts);
+            drop = true;
+        }
+        pthread_mutex_lock(&g_rc_synth_pending_mutex);
+        for (int i = 0; i < g_rc_synth_pending_count; i++) {
+            if (g_rc_synth_pending[i].threadAddr != p->threadAddr) continue;
+            if (drop)
+                g_rc_synth_pending[i] = g_rc_synth_pending[--g_rc_synth_pending_count];
+            else
+                g_rc_synth_pending[i].attempts = p->attempts;
+            break;
+        }
+        pthread_mutex_unlock(&g_rc_synth_pending_mutex);
+    }
+}
+
+// Teardown: record the current synthetic thread for verify-later when its
+// state could not be determined.
+static void rc_synth_pending_note_if_unknown(const char *where)
+{
+    if (g_RC_callThreadAddr && rc_synthetic_thread_state() == RC_SYNTH_UNKNOWN)
+        rc_synth_pending_add(g_RC_taskAddr, g_RC_callThreadAddr,
+                             g_RC_callThreadPort, (uint32_t)g_RC_pid, where);
 }
 
 // One exit-dispatch attempt: consume the synthetic thread's park trap on the
@@ -3082,6 +3429,7 @@ static bool rc_exit_synthetic_confirmed(const char *where)
         log_user("[WARN] synthetic call thread still parked at sentinel (%s) — "
                  "landmine remains; next session's landmine sweep will reap "
                  "it\n", where);
+        rc_synth_pending_note_if_unknown(where);
         return false;
     }
 
@@ -3093,6 +3441,7 @@ static bool rc_exit_synthetic_confirmed(const char *where)
     log_user("[WARN] synthetic call thread could not be exited (%s) — left "
              "parked; will be reaped by the next session's landmine sweep\n",
              where);
+    rc_synth_pending_note_if_unknown(where);
     return false;
 }
 
@@ -4191,8 +4540,9 @@ static void *rc_init_watchdog_main(void *arg) {
 
     // 3: task_exc_guard flags back (no-op if a racing teardown already did it:
     // the ref was claimed above, so exactly one of us releases it).
+    // (`st` is passed only as the registry's holder token — not dereferenced.)
     if (wdGuardHeld)
-        rc_excguard_release(wdGuardTask, wdGuardId, "init-watchdog");
+        rc_excguard_release(wdGuardTask, wdGuardId, st, "init-watchdog");
 
     // 3b: forensic autopsy — the wedged thread is frozen mid-deadlock and KRW
     // is live; dump both tasks' thread stacks (read-only) so the chain log
@@ -4257,6 +4607,28 @@ static uint64_t rc_process_generation_for(int pid, uint64_t taskAddr)
 uint64_t remote_call_current_process_generation(void)
 {
     return g_RC_processGeneration;
+}
+
+// Hardening: retry deferred cleanup once KRW is confirmed working again —
+// verify-later synthetic threads (GONE -> unregister; no session context, so
+// an ALIVE one waits for a same-task session) and pending task_exc_guard
+// restores (only for entries with no live holder, task verified alive).
+// Cheap no-op (no kernel access) when nothing is pending.
+void remote_call_retry_pending_cleanup(void)
+{
+    bool synth = rc_synth_pending_has_work();
+    bool guard = false;
+    pthread_mutex_lock(&g_rc_excguard_mutex);
+    for (int i = 0; i < RC_EXCGUARD_MAX && !guard; i++)
+        guard = g_rc_excguard[i].taskAddr && g_rc_excguard[i].restorePending;
+    pthread_mutex_unlock(&g_rc_excguard_mutex);
+    if (!synth && !guard) return;
+    if (!kexploit_krw_ready()) {
+        printf("[RC] retry pending cleanup: KRW not ready — kept for later\n");
+        return;
+    }
+    if (synth) rc_synth_pending_retry(false, "retry");
+    if (guard) rc_excguard_sweep("retry");
 }
 
 int init_remote_call(const char* process, bool useMigFilterBypass) {
@@ -4339,6 +4711,9 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         rc_sweep_leaked_landmines();
         rc_live_parked_add(g_RC_trojanThreadAddr);
         rc_live_parked_add(g_RC_callThreadAddr);
+        // Hardening: re-check verify-later threads now that KRW and a fresh
+        // session are proven working (no-op when the list is empty).
+        rc_synth_pending_retry(true, "init");
     }
     pthread_mutex_unlock(&g_rc_init_mutex);
     remote_call_inflight_end("init-hijack");
@@ -4405,6 +4780,10 @@ static int init_remote_call_internal(const char* process, bool useMigFilterBypas
         remote_call_note_init_failure(RemoteCallInitFailureHelperWedged, 0);
         return -1;
     }
+
+    // Hardening: drop task_exc_guard registry entries of dead tasks and retry
+    // pending restores (no live holder). Empty registry = no kernel access.
+    rc_excguard_sweep("init");
 
     uint64_t procAddr;
     if (g_RC_targetProcOverride) {
@@ -5597,6 +5976,13 @@ int init_remote_call_original_thread_only_with_first_exception_timeout(const cha
         destroy_remote_call();
     }
     remote_call_pop_state(previous);
+    // Hardening: a task_exc_guard ref still held here was never released
+    // (teardown skipped it). The state dies with this object, so it can no
+    // longer be a live holder: orphan it (written back only by a sweep, once
+    // no live holder remains and the task is verified alive).
+    if (atomic_exchange_explicit(&_state.excGuardHeld, false, memory_order_acq_rel))
+        rc_excguard_orphan(&_state, _state.excGuardTask, _state.excGuardId,
+                           "session dealloc");
 }
 
 - (uint64_t)taskAddr

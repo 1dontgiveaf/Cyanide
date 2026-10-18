@@ -163,6 +163,12 @@ bool remote_call_stop_requested(void);
 // so every later init refuses fast instead of queueing behind it forever.
 // Latched for the process lifetime — the only full recovery is an app restart.
 bool remote_call_init_wedged(void);
+// Retries deferred RemoteCall cleanup once kernel access is confirmed working
+// again: synthetic threads whose exit could not be verified, and
+// task_exc_guard restores that could not be written (KRW was dead). No-op
+// without kernel access when nothing is pending. Safe to call from any
+// non-main thread outside a RemoteCall session.
+void remote_call_retry_pending_cleanup(void);
 
 // Posted (main queue) when the init watchdog fires, so the UI can offer a
 // guided restart instead of leaving the user with a silently dead channel.

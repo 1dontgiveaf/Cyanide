@@ -3337,6 +3337,9 @@ static BOOL settings_handle_stale_krw(const char *why)
     g_kexploit_done = recovered;
     settings_notify_remote_call_state_changed();
     printf("[SETTINGS] %s: kernel access %s\n", why, recovered ? "recovered from the parked state" : "not recoverable");
+    // KRW is back: retry RemoteCall cleanup deferred while it was dead
+    // (pending task_exc_guard restores, unverified synthetic threads).
+    if (recovered) remote_call_retry_pending_cleanup();
     return recovered;
 }
 
@@ -3414,6 +3417,9 @@ static BOOL settings_ensure_kexploit_for_read(void)
     }
     g_kexploit_done = YES;
     settings_notify_remote_call_state_changed();
+    // Parked KRW recovered: retry deferred RemoteCall cleanup (no-op when
+    // nothing is pending).
+    remote_call_retry_pending_cleanup();
     return YES;
 }
 
@@ -3736,6 +3742,11 @@ static void settings_terminal_kexploit_cleanup_sync_internal(const char *reason)
         settings_notify_remote_call_state_changed();
         return;
     }
+
+    // Last chance (Clean Up and app termination both land here) to write back
+    // deferred task_exc_guard restores / verify unconfirmed synthetic threads
+    // while KRW is still in our hands. Best effort; no-op when nothing pends.
+    remote_call_retry_pending_cleanup();
 
     bool parked = kexploit_terminal_cleanup();
     printf("[SETTINGS] terminal KRW cleanup result parked=%d\n", parked);
