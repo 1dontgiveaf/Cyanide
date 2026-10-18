@@ -152,13 +152,27 @@ static NSArray<SIApp *> *si_scan_apps(void)
         apps[bid] = app;
     }
     NSString *data = @"/var/mobile/Containers/Data/Application";
-    for (NSString *uuid in [fm contentsOfDirectoryAtPath:data error:nil]) {
+    NSArray<NSString *> *dataUUIDs = [fm contentsOfDirectoryAtPath:data error:nil];
+    // A missing listing or an unreadable metadata file means part of the data
+    // usage could not be attributed. Marking the rows incomplete is the only
+    // truthful option: silently showing 0 bytes as a complete size understates
+    // the app (the footer promises "≥" for sizes that are a minimum).
+    BOOL dataUnresolved = (dataUUIDs == nil);
+    for (NSString *uuid in dataUUIDs) {
         NSString *container = [data stringByAppendingPathComponent:uuid];
-        SIApp *app = apps[si_container_identifier(container) ?: @""];
-        if (!app) continue;   // system apps' data, or metadata that couldn't be read
+        NSString *bid = si_container_identifier(container);
+        if (!bid) {
+            dataUnresolved = YES;
+            continue;
+        }
+        SIApp *app = apps[bid];
+        if (!app) continue;   // system apps' data is intentionally not listed
         BOOL complete = YES;
         app.dataBytes += si_tree_bytes(container, &complete);
         if (!complete) app.incomplete = YES;
+    }
+    if (dataUnresolved) {
+        for (SIApp *app in apps.allValues) app.incomplete = YES;
     }
     return [apps.allValues sortedArrayUsingComparator:^NSComparisonResult(SIApp *a, SIApp *b) {
         unsigned long long ta = a.appBytes + a.dataBytes, tb = b.appBytes + b.dataBytes;
