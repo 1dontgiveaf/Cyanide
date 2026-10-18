@@ -12642,9 +12642,28 @@ static BOOL settings_debug_launchd_root_exec(NSString *outPath, NSString **messa
                                                    encoding:NSUTF8StringEncoding
                                                       error:nil];
     if (contents.length == 0) {
+        // main.m writes a root-only marker at the first line of main, before
+        // any argv check. Read it through launchd root read: its presence
+        // proves the child reached main even when it cannot write the app
+        // container.
+        NSString *markerPath = [NSString stringWithFormat:
+            @"/private/var/tmp/cyanide-root-child-%d.txt", childPid];
+        BOOL markerTrunc = NO;
+        NSString *markerErr = nil;
+        NSData *markerData = settings_root_read_file(markerPath, 4096,
+                                                     &markerTrunc, &markerErr);
+        NSString *marker = markerData.length
+            ? [[NSString alloc] initWithData:markerData encoding:NSUTF8StringEncoding]
+            : nil;
+        if (marker.length) {
+            if (messageOut) *messageOut = [NSString stringWithFormat:
+                @"Child reached main (pid %d).\n\n%@", childPid, marker];
+            return YES;
+        }
         if (messageOut) *messageOut = [NSString stringWithFormat:
-            @"posix_spawn returned 0 (pid %d), but no output appeared at %@. "
-            @"The child may have been denied exec or write.", childPid, outPath];
+            @"posix_spawn returned 0 (pid %d), but no output appeared at %@ "
+            @"and no launch marker was readable (%@).", childPid, outPath,
+            markerErr ?: (markerData ? @"empty marker" : @"marker missing")];
         return NO;
     }
     if (messageOut) *messageOut = [NSString stringWithFormat:
