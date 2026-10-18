@@ -277,6 +277,67 @@ static NSData *pt_read_file(NSString *path)
 // Writes `data` over `targetPath` through a temp file that carries the target's
 // ownership and permissions before the rename.
 //
+// Review R-04: a widened folder mode is persistent state, but `lockedDirs`
+// only lived for one call. If the restore failed, the next run saw the already
+// widened mode and had no record of the original. Persist the pending original
+// modes and retry them before the next apply/restore; remove an entry only
+// after stat verifies the mode is back.
+static NSString * const kPTPendingDirModesKey = @"PasscodePendingFolderModes";
+
+static NSMutableDictionary<NSString *, NSNumber *> *pt_pending_dir_modes(void)
+{
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    id raw = [d dictionaryForKey:kPTPendingDirModesKey];
+    if (![raw isKindOfClass:NSDictionary.class]) return [NSMutableDictionary dictionary];
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    [(NSDictionary *)raw enumerateKeysAndObjectsUsingBlock:^(id key, id obj, BOOL *stop) {
+        (void)stop;
+        if ([key isKindOfClass:NSString.class] && [obj isKindOfClass:NSNumber.class])
+            out[key] = obj;
+    }];
+    return out;
+}
+
+static void pt_save_pending_dir_modes(NSDictionary<NSString *, NSNumber *> *modes)
+{
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    if (modes.count == 0) [d removeObjectForKey:kPTPendingDirModesKey];
+    else [d setObject:modes forKey:kPTPendingDirModesKey];
+    [d synchronize];
+}
+
+// Retries every persisted mode still waiting for restore. Returns false only
+// when a folder still exists and its original mode could not be verified; a
+// folder that no longer exists needs no restore and its record is dropped.
+static bool pt_retry_pending_dir_modes(void)
+{
+    NSMutableDictionary<NSString *, NSNumber *> *pending = pt_pending_dir_modes();
+    if (pending.count == 0) return true;
+    bool allRestored = true;
+    for (NSString *dir in pending.allKeys) {
+        mode_t original = (mode_t)pending[dir].unsignedIntValue;
+        (void)vnode_apfs_chmod(dir.UTF8String, original);
+        struct stat st = {0};
+        if (stat(dir.UTF8String, &st) == 0) {
+            if ((st.st_mode & 07777) == (original & 07777)) {
+                [pending removeObjectForKey:dir];
+                continue;
+            }
+            allRestored = false;
+            log_user("[PASSCODE] Still could not restore the folder mode of %s (want %o).\n",
+                     dir.UTF8String, (unsigned)(original & 07777));
+        } else if (errno == ENOENT || errno == ENOTDIR) {
+            [pending removeObjectForKey:dir];   // folder is gone; nothing to restore
+        } else {
+            allRestored = false;
+            log_user("[PASSCODE] Could not inspect the widened folder %s (errno=%d).\n",
+                     dir.UTF8String, errno);
+        }
+    }
+    pt_save_pending_dir_modes(pending);
+    return allRestored;
+}
+
 // Performance notes, because a keypad cache holds dozens of files and the
 // kernel chown/chmod calls each run six global sync() operations internally:
 //  - a folder's mode is widened once per run (recorded in `lockedDirs`) instead
@@ -302,13 +363,23 @@ static bool pt_write_data_to_target(NSData *data,
     }
 
     if (!lockedDirs[dir]) {
+        NSMutableDictionary<NSString *, NSNumber *> *pending = pt_pending_dir_modes();
+        NSNumber *recorded = pending[dir];
+        // If a previous restore failed, `recorded` is the only copy of the
+        // original mode. Never overwrite it with the already-widened mode.
+        mode_t originalMode = recorded ? (mode_t)recorded.unsignedIntValue
+                                       : (dirStat.st_mode & 07777);
+        lockedDirs[dir] = @(originalMode);
+        if (!recorded) {
+            pending[dir] = @(originalMode);
+            pt_save_pending_dir_modes(pending);
+        }
         mode_t writableDirMode = dirStat.st_mode | S_IWUSR | S_IXUSR;
         if ((writableDirMode & 07777) != (dirStat.st_mode & 07777)) {
             // Record the original mode BEFORE the kernel call. vnode_apfs_chmod
             // sets the mode and then verifies it, so it can apply the change and
             // still report failure — which would leave the folder widened with
             // nothing recorded to restore.
-            lockedDirs[dir] = @(dirStat.st_mode);
             if (vnode_apfs_chmod(dir.UTF8String, writableDirMode) != 0) {
                 log_user("[PASSCODE] Could not unlock the keypad folder for writing: %s.\n",
                          dir.UTF8String);
@@ -381,6 +452,10 @@ static bool pt_write_data_to_target(NSData *data,
 // not come back are kept; returns false if any folder is still widened.
 static bool pt_restore_directory_modes(NSMutableDictionary<NSString *, NSNumber *> *lockedDirs)
 {
+    NSMutableDictionary<NSString *, NSNumber *> *pending = pt_pending_dir_modes();
+    for (NSString *dir in pending) {
+        if (!lockedDirs[dir]) lockedDirs[dir] = pending[dir];
+    }
     NSMutableArray<NSString *> *restoredDirs = [NSMutableArray array];
     for (NSString *dir in lockedDirs) {
         mode_t original = (mode_t)lockedDirs[dir].unsignedIntValue;
@@ -394,7 +469,9 @@ static bool pt_restore_directory_modes(NSMutableDictionary<NSString *, NSNumber 
                      dir.UTF8String, (unsigned)(original & 07777));
         }
     }
+    for (NSString *dir in restoredDirs) [pending removeObjectForKey:dir];
     [lockedDirs removeObjectsForKeys:restoredDirs];
+    pt_save_pending_dir_modes(pending);
     return lockedDirs.count == 0;
 }
 
@@ -791,8 +868,10 @@ NSUInteger settings_passcode_import_backup_items(NSArray<NSURL *> *items,
     // tiny *.orig entries cannot grow this list without bound; the overflow
     // entry trips the budget check below.
     NSMutableArray<NSURL *> *sources = [NSMutableArray array];
+    NSUInteger visitedEntries = 0;
+    BOOL entryBudgetHit = NO;
     for (NSURL *item in items) {
-        if (sources.count > SBLMaxImportFileCount) break;
+        if (sources.count > SBLMaxImportFileCount || entryBudgetHit) break;
         BOOL isDir = NO;
         if (![fm fileExistsAtPath:item.path isDirectory:&isDir]) continue;
         if (!isDir) {
@@ -807,6 +886,15 @@ NSUInteger settings_passcode_import_backup_items(NSArray<NSURL *> *items,
                         options:NSDirectoryEnumerationSkipsHiddenFiles
                    errorHandler:nil];
         for (NSURL *found in en) {
+            // A folder of millions of non-.orig files is still work; bound the
+            // traversal independently of the number of matches.
+            if (++visitedEntries > SBLMaxImportFileCount * 4) {
+                entryBudgetHit = YES;
+                log_user("[PASSCODE] The import walks more than %lu entries; "
+                         "the remaining files were skipped.\n",
+                         (unsigned long)(SBLMaxImportFileCount * 4));
+                break;
+            }
             if ([found.pathExtension.lowercaseString isEqualToString:@"orig"]) {
                 [sources addObject:found];
                 if (sources.count > SBLMaxImportFileCount) break;
@@ -1321,6 +1409,11 @@ bool settings_passcode_apply_digits(NSDictionary<NSString *, NSData *> *digits)
     }
     // The unlock changes what is readable, so anything scanned before it is stale.
     settings_passcode_invalidate_caches();
+    if (!pt_retry_pending_dir_modes()) {
+        pt_set_summary(@"A previously widened keypad folder could not be restored; no new style was written.");
+        log_user("[PASSCODE] Failed: a previously widened keypad folder could not be restored.\n");
+        return false;
+    }
 
     NSString *basePath = settings_passcode_telephony_base_path();
     if (basePath.length == 0) {
@@ -1473,6 +1566,11 @@ bool settings_passcode_restore_originals(NSString *basePath)
         return false;
     }
     settings_passcode_invalidate_caches();
+    if (!pt_retry_pending_dir_modes()) {
+        pt_set_summary(@"A previously widened keypad folder could not be restored; originals were not written.");
+        log_user("[PASSCODE] Failed: a previously widened keypad folder could not be restored.\n");
+        return false;
+    }
 
     if (basePath.length == 0) {
         basePath = settings_passcode_telephony_base_path();
