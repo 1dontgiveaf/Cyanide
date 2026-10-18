@@ -9630,6 +9630,11 @@ void settings_run_pending_actions(void)
     settings_run_actions_internal(YES);
 }
 
+BOOL settings_run_in_flight(void)
+{
+    return g_settings_actions_running == kSettingsLockRun;
+}
+
 void settings_rerun_last_actions(void)
 {
     g_settings_actions_auto_retry_attempt = 0;

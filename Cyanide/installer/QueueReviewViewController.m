@@ -527,7 +527,9 @@ static BOOL QueuePackageIsHideHomeBar(Package *pkg)
         return;
     }
 
-    if ([PackageQueue sharedQueue].isCommitting) {
+    // isCommitting covers the commit work; settings_run_in_flight covers the
+    // run that commit handed off to (the queue no longer owns that phase).
+    if ([PackageQueue sharedQueue].isCommitting || settings_run_in_flight()) {
         [self presentInstallStillRunningAlert];
         return;
     }

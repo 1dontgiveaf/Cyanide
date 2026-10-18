@@ -235,6 +235,8 @@ BOOL settings_apply_passcode_theme_now(BOOL apply);
 
 void settings_run_actions(void);
 void settings_run_pending_actions(void);
+// YES while a chain/run (not an ordinary action) owns the actions lock.
+BOOL settings_run_in_flight(void);
 // Records a pre-run failure (e.g. an installer package whose apply failed
 // before the run started) to be folded into the next run's completion, so a
 // failed install can't end with the progress screen showing "Done".

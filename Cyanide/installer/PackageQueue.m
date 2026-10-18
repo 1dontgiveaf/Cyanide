@@ -15,10 +15,13 @@ NSString * const PackageQueueDidChangeNotification = @"PackageQueueDidChangeNoti
 @interface PackageQueue ()
 @property (nonatomic, strong) NSMutableArray<Package *> *installs;
 @property (nonatomic, strong) NSMutableArray<Package *> *uninstalls;
-// YES from commit until the queue's own apply work is done (handed to
-// settings_run_pending_actions, which has its own actions lock, or the
-// completion notification is posted). A second commit meanwhile is refused.
+// YES from commit until its own apply work and (when it starts one) the
+// resulting run are done. A second commit meanwhile is refused.
 @property (nonatomic, assign) BOOL isCommitting;
+// A commit that handed off to settings_run_pending_actions keeps isCommitting
+// YES until that run posts its completion (or the handoff timeout expires), so
+// isCommitting really means "until its run finishes".
+@property (nonatomic, assign) BOOL awaitingRunCompletion;
 @end
 
 static BOOL PackageIsThemer(Package *package)
@@ -107,8 +110,32 @@ static BOOL PackageShouldAutoQueueForApply(Package *package)
     if ((self = [super init])) {
         _installs   = [NSMutableArray array];
         _uninstalls = [NSMutableArray array];
+        [[NSNotificationCenter defaultCenter] addObserver:self
+                                                 selector:@selector(actionsDidComplete:)
+                                                     name:kSettingsActionsDidCompleteNotification
+                                                   object:nil];
     }
     return self;
+}
+
+- (void)dealloc
+{
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+
+// The run handed off by -commit finished (or a refusal/auto-retry chain did).
+// Only then may another commit start.
+- (void)actionsDidComplete:(NSNotification *)note
+{
+    (void)note;
+    if (!self.awaitingRunCompletion) return;
+    // A completion from an unrelated action while our run is still applying
+    // must not unlock the queue. The run's own completion is posted after it
+    // releases the actions lock, so it sees no run in flight.
+    if (settings_run_in_flight()) return;
+    self.awaitingRunCompletion = NO;
+    self.isCommitting = NO;
+    printf("[INSTALLER] commit-run handoff complete; queue unlocked\n");
 }
 
 - (NSArray<Package *> *)queuedInstalls
@@ -356,11 +383,12 @@ static BOOL PackageShouldAutoQueueForApply(Package *package)
 
 - (BOOL)commit
 {
-    if (self.isCommitting) {
-        log_user("[INSTALLER] A queue commit is already running; ignoring this one.\n");
+    if (self.isCommitting || settings_run_in_flight()) {
+        log_user("[INSTALLER] A queue commit or its run is already active; ignoring this one.\n");
         return NO;
     }
     self.isCommitting = YES;
+    self.awaitingRunCompletion = NO;
 
     NSArray<Package *> *toInstall   = self.queuedInstalls;
     NSArray<Package *> *toUninstall = self.queuedUninstalls;
@@ -428,7 +456,6 @@ static BOOL PackageShouldAutoQueueForApply(Package *package)
 // treats a missing success key as success.
 - (void)finishCommitRunningActions:(BOOL)needsRunActions allApplied:(BOOL)allApplied
 {
-    self.isCommitting = NO;
     if (needsRunActions) {
         if (!allApplied) {
             log_user("[INSTALLER] Some queued packages failed to apply (see above); applying the rest.\n");
@@ -438,9 +465,27 @@ static BOOL PackageShouldAutoQueueForApply(Package *package)
             // whenever the rest of the run succeeds.
             settings_note_run_preflight_failure(@"Some packages failed to apply — check the log above.");
         }
+        // Keep the queue locked until the run we start reports completion.
+        // Clearing it here let a second commit begin while this run was still
+        // applying packages, and that commit's no-run completion could consume
+        // this run's preflight note or finish its progress screen.
+        self.awaitingRunCompletion = YES;
+        self.isCommitting = YES;
+        __weak typeof(self) weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(600 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            typeof(self) strongSelf = weakSelf;
+            if (!strongSelf || !strongSelf.awaitingRunCompletion) return;
+            printf("[INSTALLER] commit-run handoff timed out after 10 min; unlocking the queue\n");
+            log_user("[INSTALLER] The last run did not report completion; the install queue is unlocked.\n");
+            strongSelf.awaitingRunCompletion = NO;
+            strongSelf.isCommitting = NO;
+        });
         settings_run_pending_actions();
         return;
     }
+    self.isCommitting = NO;
+    self.awaitingRunCompletion = NO;
     // A NanoRegistry/heavy package can fail its ancillary step without
     // starting a run. Consume the preflight note here so it cannot surface in
     // an unrelated later run (review R-06).
