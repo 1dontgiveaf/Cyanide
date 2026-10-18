@@ -50,6 +50,7 @@
 #import <sys/time.h>
 #import <sys/sysctl.h>
 #import <signal.h>
+#import <notify.h>
 #import <errno.h>
 #import <mach/mach.h>
 #import <mach/mach_host.h>
@@ -12432,6 +12433,22 @@ NSData *settings_root_read_file(NSString *path, NSUInteger maxBytes, BOOL *trunc
 //
 // The hijacked launchd thread must never block: posix_spawn is bounded to 3 s
 // and the child redirects its output, so launchd does not wait for the shell.
+static volatile int g_settings_debug_root_child_notified = 0;
+static int g_settings_debug_root_child_notify_token = 0;
+
+static void settings_debug_install_root_child_notify(void)
+{
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        notify_register_dispatch("com.cyanide.rootexec.reached",
+                                 &g_settings_debug_root_child_notify_token,
+                                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                                 ^(int token) {
+            g_settings_debug_root_child_notified = 1;
+        });
+    });
+}
+
 static BOOL settings_debug_launchd_spawn(NSString *exePath,
                                          NSArray<NSString *> *arguments,
                                          NSString *outPath,
@@ -12532,6 +12549,11 @@ static BOOL settings_debug_launchd_spawn(NSString *exePath,
         if ([fm fileExistsAtPath:outPath]) break;
         usleep(100000);
     }
+    if (g_settings_debug_root_child_notified) {
+        if (messageOut) *messageOut = @"Child reached main (Darwin notification). "
+                                      @"It could not write the app-container output.";
+        return YES;
+    }
     NSString *contents = [NSString stringWithContentsOfFile:outPath
                                                    encoding:NSUTF8StringEncoding
                                                       error:nil];
@@ -12553,10 +12575,19 @@ static BOOL settings_debug_launchd_spawn(NSString *exePath,
                 @"Child reached main (pid %d).\n\n%@", childPid, marker];
             return YES;
         }
+        int alive = -1, aliveErrno = 0;
+        if (childPid > 0) {
+            errno = 0;
+            int r = kill(childPid, 0);
+            alive = (r == 0 || (r < 0 && errno == EPERM)) ? 1 : 0;
+            aliveErrno = errno;
+        }
         if (messageOut) *messageOut = [NSString stringWithFormat:
-            @"posix_spawn returned 0 (pid %d), but no output appeared at %@ "
-            @"and no launch marker was readable (%@).", childPid, outPath,
-            markerErr ?: (markerData ? @"empty marker" : @"marker missing")];
+            @"posix_spawn returned 0 (pid %d), but no output appeared at %@, "
+            @"no launch marker was readable (%@), notify=%d, alive=%d "
+            @"(kill errno=%d).", childPid, outPath,
+            markerErr ?: (markerData ? @"empty marker" : @"marker missing"),
+            g_settings_debug_root_child_notified, alive, aliveErrno];
         return NO;
     }
     if (messageOut) *messageOut = [NSString stringWithFormat:
@@ -12569,6 +12600,8 @@ static BOOL settings_debug_launchd_spawn(NSString *exePath,
 // this side and the child stopped writing its output file.
 static BOOL settings_debug_launchd_root_exec(NSString *outPath, NSString **messageOut)
 {
+    g_settings_debug_root_child_notified = 0;
+    settings_debug_install_root_child_notify();
     __block NSString *error = nil;
     __block int spawnRC = -1;
     __block int childPid = 0;
@@ -12638,6 +12671,11 @@ static BOOL settings_debug_launchd_root_exec(NSString *outPath, NSString **messa
         if ([fm fileExistsAtPath:outPath]) break;
         usleep(100000);
     }
+    if (g_settings_debug_root_child_notified) {
+        if (messageOut) *messageOut = @"Child reached main (Darwin notification). "
+                                      @"It could not write the app-container output.";
+        return YES;
+    }
     NSString *contents = [NSString stringWithContentsOfFile:outPath
                                                    encoding:NSUTF8StringEncoding
                                                       error:nil];
@@ -12660,10 +12698,19 @@ static BOOL settings_debug_launchd_root_exec(NSString *outPath, NSString **messa
                 @"Child reached main (pid %d).\n\n%@", childPid, marker];
             return YES;
         }
+        int alive = -1, aliveErrno = 0;
+        if (childPid > 0) {
+            errno = 0;
+            int r = kill(childPid, 0);
+            alive = (r == 0 || (r < 0 && errno == EPERM)) ? 1 : 0;
+            aliveErrno = errno;
+        }
         if (messageOut) *messageOut = [NSString stringWithFormat:
-            @"posix_spawn returned 0 (pid %d), but no output appeared at %@ "
-            @"and no launch marker was readable (%@).", childPid, outPath,
-            markerErr ?: (markerData ? @"empty marker" : @"marker missing")];
+            @"posix_spawn returned 0 (pid %d), but no output appeared at %@, "
+            @"no launch marker was readable (%@), notify=%d, alive=%d "
+            @"(kill errno=%d).", childPid, outPath,
+            markerErr ?: (markerData ? @"empty marker" : @"marker missing"),
+            g_settings_debug_root_child_notified, alive, aliveErrno];
         return NO;
     }
     if (messageOut) *messageOut = [NSString stringWithFormat:

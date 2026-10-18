@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <string.h>
 #include <unistd.h>
+#include <notify.h>
 #endif
 
 #if DEBUG
@@ -19,6 +20,9 @@
 // through launchd root read. This distinguishes "child never reached main"
 // (no marker) from "child ran but could not write the app-container output".
 static void cyanide_debug_root_child_marker(int argc, char **argv) {
+    // Darwin notification: proves main was reached even if every file write is
+    // denied. The parent installs the observer before spawning.
+    notify_post("com.cyanide.rootexec.reached");
     char path[160];
     snprintf(path, sizeof(path), "/private/var/tmp/cyanide-root-child-%d.txt", getpid());
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
