@@ -976,8 +976,12 @@ static bool r_msg2_main_async_args(uint64_t obj, const char *selName,
     r_msg2(inv, "release", 0, 0, 0, 0);
 
     // Fire-and-forget: the main thread may still be running this when we
-    // return, so the next remote interaction owes a settle.
-    if (ok) r_settle_owe();
+    // return, so the next remote interaction owes a settle. Record the debt
+    // for an UNKNOWN outcome too: a lost reply can mean the invocation is
+    // still queued on the main thread, and an unsettled dependent read or
+    // mutation would race it. A debt for a call that truly never ran only
+    // costs one settle delay — the safe side.
+    r_settle_owe();
     return ok;
 }
 
@@ -1172,7 +1176,14 @@ uint64_t r_perform_main(uint64_t obj, uint64_t sel, uint64_t object, bool wait)
 
     uint64_t performSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
     if (!performSel) return 0;
-    return r_msg(obj, performSel, sel, object, wait ? 1 : 0, 0);
+    uint64_t ret = r_msg(obj, performSel, sel, object, wait ? 1 : 0, 0);
+    if (!wait) {
+        // No-wait is fire-and-forget (r_msg2_main_async without the
+        // invocation): the selector may run after we return — even when the
+        // reply was lost — so the next remote interaction owes a settle.
+        r_settle_owe();
+    }
+    return ret;
 }
 
 uint64_t r_cfstr(const char *s)

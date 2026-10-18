@@ -3236,6 +3236,7 @@ bool axonlite_stop_in_session(void)
 
     int restored = 0;
     int restoreSkipped = 0;
+    int restoreUnconfirmed = 0;
     gAxonSelectedBundle[0] = '\0';
 
     uint64_t model = r_is_objc_ptr(gAxonListModel) ? gAxonListModel : 0;
@@ -3248,8 +3249,17 @@ bool axonlite_stop_in_session(void)
             continue;
         }
         r_msg2_main(model, "_insertNotificationRequest:", entry->request, 0, 0, 0);
-        entry->hiddenByAxon = false;
-        restored++;
+        if (r_last_main_ok()) {
+            entry->hiddenByAxon = false;
+            restored++;
+        } else {
+            // The insert may or may not have run: keep the entry hidden so
+            // the registry below keeps it (and its retained request) for a
+            // later restore attempt, instead of dropping a notification that
+            // is still hidden in SpringBoard's model. A re-insert of a
+            // request that did land only shows an already-visible request.
+            restoreUnconfirmed++;
+        }
     }
     if (restored > 0 && gAxonModelCanNotifyContentChange) {
         r_msg2_main(model, "_notificationListDidChangeContent", 0, 0, 0, 0);
@@ -3267,18 +3277,34 @@ bool axonlite_stop_in_session(void)
         axn_release_remote_obj(gAxonWindow);
         gAxonWindow = 0;
     }
+    // Compact the registry instead of wiping it: entries still hidden
+    // (restore skipped or unconfirmed) stay registered WITH their retained
+    // request, so a later start's tick can restore them — the tick's restore
+    // loop re-inserts anything still hiddenByAxon. Everything else (visible,
+    // restored, or a dead pointer) is released and dropped. The forget paths
+    // (SpringBoard respawn, safe-detach) still wipe the registry wholesale,
+    // which is correct there: the pointers are stale and SpringBoard reloads
+    // its notifications from the bulletin service anyway.
+    int kept = 0;
     for (int i = 0; i < gAxonRequestCount; i++) {
-        if (gAxonRequests[i].retained) axn_release_remote_obj(gAxonRequests[i].request);
+        AXNRequestEntry *entry = &gAxonRequests[i];
+        if (entry->hiddenByAxon && r_is_objc_ptr(entry->request)) {
+            gAxonRequests[kept++] = *entry;
+            continue;
+        }
+        if (entry->retained) axn_release_remote_obj(entry->request);
     }
+    if (kept < gAxonRequestCount)
+        memset(gAxonRequests + kept, 0,
+               (gAxonRequestCount - kept) * sizeof(gAxonRequests[0]));
+    gAxonRequestCount = kept;
     for (int i = 0; i < gAxonIconCacheCount; i++) {
         if (r_is_objc_ptr(gAxonIconCache[i].image)) {
             axn_release_remote_obj(gAxonIconCache[i].image);
         }
     }
 
-    memset(gAxonRequests, 0, sizeof(gAxonRequests));
     memset(gAxonIconCache, 0, sizeof(gAxonIconCache));
-    gAxonRequestCount = 0;
     gAxonIconCacheCount = 0;
     gAxonLastAppliedFilter[0] = '\0';
     gAxonFilterLoggedOnce = false;
@@ -3330,10 +3356,14 @@ bool axonlite_stop_in_session(void)
     gAxonSegmentSignature[0] = '\0';
     gAxonBadgeSignature[0] = '\0';
     gAxonLoggedControllerMiss = false;
-    printf("[AXONLITE] stopped clvc=0x%llx restored=%d skipped=%d\n",
-           clvc, restored, restoreSkipped);
+    printf("[AXONLITE] stopped clvc=0x%llx restored=%d skipped=%d unconfirmed=%d kept=%d\n",
+           clvc, restored, restoreSkipped, restoreUnconfirmed, gAxonRequestCount);
+    if (gAxonRequestCount > 0)
+        printf("[AXONLITE] %d hidden notification(s) could not be restored; "
+               "they stay registered and will be restored when Axon runs again "
+               "(a respring also brings them back)\n", gAxonRequestCount);
     r_settle_us(oldSettleUS);
-    return true;
+    return gAxonRequestCount == 0;   // false: restoration incomplete, retry state kept
 }
 
 bool axonlite_stop_in_session_fast(void)
