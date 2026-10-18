@@ -349,12 +349,17 @@ BOOL settings_sbl_import_folder_theme_named(NSURL *url,
                 budgetFailure = @"This theme has too many icons to import.";
                 break;
             }
+            // Same per-icon cap the themer apply path uses (THEMER_MAX_ICON_BYTES),
+            // not the archive-wide 8 MB image allowance: an icon imported here must
+            // also survive themer_apply_in_session, or a "complete" theme renders
+            // partly stock.
             uint64_t fileBytes = 0;
-            if (!SBLImageFilePassesPreflight(fileURL.path, SBLMaxImageFileBytes, &fileBytes)) {
+            if (!SBLImageFilePassesPreflight(fileURL.path, THEMER_MAX_ICON_BYTES, &fileBytes)) {
                 skipped++;
                 if (skippedSamples.count < 8) {
-                    [skippedSamples addObject:[NSString stringWithFormat:@"%@ (too large or unreadable)",
-                                               fileURL.lastPathComponent ?: @"unknown.png"]];
+                    [skippedSamples addObject:[NSString stringWithFormat:@"%@ (over %u bytes or unreadable)",
+                                               fileURL.lastPathComponent ?: @"unknown.png",
+                                               (unsigned)THEMER_MAX_ICON_BYTES]];
                 }
                 continue;
             }
