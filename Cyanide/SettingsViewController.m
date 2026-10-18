@@ -4017,13 +4017,15 @@ void settings_detach_krw_for_background(void)
     if (!g_kexploit_done) return;
     // Round 25 (A): hold the exception-port teardown bypass for the WHOLE
     // background-detach episode — the fastkill teardown below, the stop
-    // request, the gate drain-wait, and the detach itself. The responder's
-    // re-park/dispatch signs funnel through excport_gate_blocked_for_caller(),
-    // which consults the process-wide depth, so holding it here lets late
-    // traps be re-parked (signed) instead of refused → replied-unmodified →
-    // re-fault ping-pong (live 28.log 15:16:48.360-.363: 16 crash-backlog
-    // messages from exactly that refusal window). Depth-counted, so the
-    // destroy/abandon internal bypass nests harmlessly.
+    // request, the gate drain-wait, and the detach itself. The bypass is
+    // PER-THREAD (owner model, F-04/F-07): excport_gate_blocked_for_caller()
+    // admits only exception-port ops/signs issued on the thread that holds
+    // it, so this hold covers the teardown work THIS thread runs (and the
+    // destroy/abandon internals it calls, which nest — depth-counted). Any
+    // other thread — a live tweak call, or the first-port responder, which
+    // only replies own-state and never signs — stays refused behind the
+    // closed gate (the runningboardd ABBA window); its late traps fall back
+    // to replied-unmodified and are repaired by the teardown drain.
     excport_teardown_bypass_begin("background-detach");
     // Round 6: a suspended app is SIGKILLed without applicationWillTerminate,
     // so the warm fastkill session must not outlive ANY backgrounding or screen
@@ -5006,16 +5008,33 @@ static void settings_themer_import_fail(NSError **error, NSString *message)
 // (folder/plist) so a folder backup can never be restored as a plist. If the
 // target is missing, the newest matching backup is put back; if the target
 // exists, stale backups from an interrupted earlier swap are removed. Review R-09.
+// Legacy backups (".Imported-backup-<UUID>", before the kind suffix) are
+// matched too, but only when the item's on-disk type agrees with `kind`
+// (directory = folder, regular file = plist). Runs at launch
+// (settings_register_defaults) and before every same-kind import.
 static void settings_themer_recover_swap(NSString *target, NSString *kind)
 {
+    if (target.length == 0 || kind.length == 0) return;
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *parent = target.stringByDeletingLastPathComponent;
     NSString *prefix = @".Imported-backup-";
     NSString *suffix = [@"-" stringByAppendingString:kind];
+    BOOL wantDir = [kind isEqualToString:@"folder"];
     NSArray<NSString *> *names = [fm contentsOfDirectoryAtPath:parent error:nil];
     NSMutableArray<NSString *> *matches = [NSMutableArray array];
     for (NSString *name in names) {
-        if ([name hasPrefix:prefix] && [name hasSuffix:suffix])
+        if (![name hasPrefix:prefix]) continue;
+        if ([name hasSuffix:suffix]) {
+            [matches addObject:name];
+            continue;
+        }
+        NSString *rest = [name substringFromIndex:prefix.length];
+        if (![[NSUUID alloc] initWithUUIDString:rest]) continue;   // not legacy
+        NSDictionary *attrs = [fm attributesOfItemAtPath:
+            [parent stringByAppendingPathComponent:name] error:nil];
+        NSString *type = attrs.fileType;
+        if (wantDir ? [type isEqualToString:NSFileTypeDirectory]
+                    : [type isEqualToString:NSFileTypeRegular])
             [matches addObject:name];
     }
     if (matches.count == 0) return;
@@ -8758,6 +8777,12 @@ void settings_register_defaults(void)
         }
         if (changed) [defaults synchronize];
     }
+    // R-09: finish (or clean up after) an import swap interrupted by a crash
+    // or kill, instead of waiting for the next same-kind import. Same-volume
+    // renames/removes of a small Documents/Themes subtree; nothing else can
+    // be importing this early in launch.
+    settings_themer_recover_swap(settings_themer_imported_theme_dir(), @"folder");
+    settings_themer_recover_swap(settings_themer_imported_plist_path(), @"plist");
     if ([defaults boolForKey:kSettingsThemerEnabled]) {
         [defaults setBool:NO forKey:kSettingsThemerEnabled];
         [defaults synchronize];
@@ -11700,16 +11725,16 @@ static void pm_teardown_fastkill_session_for_terminate(const char *reason)
     // is the caller (it clears pending first).
     pm_idle_disarm_cancel(reason);
     // Round 25 (A): hold the exception-port teardown bypass for the WHOLE
-    // teardown episode — including the PRE-LOCK stop + un-arm below and every
-    // concurrent responder re-park/dispatch sign while it runs. All signing
-    // funnels through excport_gate_blocked_for_caller(), which consults the
-    // process-wide depth, so the responder needs no code change: it passes the
-    // gate for the episode's duration (live 28.log 15:16:48.359-.363: the
-    // pre-lock stop ran OUTSIDE the round-24 bypass, the responder's re-park
-    // signs were refused, and the thread re-fault ping-pong filled the crash
-    // backlog the dead-KRW abandon then could not repair). Depth-counted —
-    // nests with the destroy/abandon internal bypass and with the
-    // "background-detach" episode hold on the call paths that have one.
+    // teardown episode — including the PRE-LOCK stop + un-arm below (live
+    // 28.log 15:16:48.359-.363: the pre-lock stop ran OUTSIDE the round-24
+    // bypass). The bypass is PER-THREAD (owner model, F-04/F-07): all signing
+    // funnels through excport_gate_blocked_for_caller(), which admits only the
+    // thread holding the bypass. So this hold covers the stop/un-arm and the
+    // teardown THIS thread runs; other threads (live tweak calls, the
+    // first-port responder — own-state replies only, no signs) are NOT
+    // admitted and stay behind the closed gate. Depth-counted — nests with the
+    // destroy/abandon internal bypass and with the "background-detach"
+    // episode hold on the call paths that have one.
     excport_teardown_bypass_begin("fastkill-teardown");
     // Round 20: a kill's on-demand warm-up HOLDS pm_kill_lock across its
     // whole init (single-flight). An in-flight warm-up must still be
