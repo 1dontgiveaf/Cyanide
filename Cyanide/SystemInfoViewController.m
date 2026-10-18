@@ -84,9 +84,12 @@ static unsigned long long si_tree_bytes(NSString *path, BOOL *complete)
 static UIImage *si_app_icon(NSString *appDir, NSDictionary *info, NSString *bundleID)
 {
     NSMutableArray<NSString *> *names = [NSMutableArray array];
-    NSArray *files = info[@"CFBundleIcons"][@"CFBundlePrimaryIcon"][@"CFBundleIconFiles"];
+    // Any level can be malformed in a third-party Info.plist: check each type.
+    NSDictionary *icons = [info[@"CFBundleIcons"] isKindOfClass:NSDictionary.class] ? info[@"CFBundleIcons"] : nil;
+    NSDictionary *primary = [icons[@"CFBundlePrimaryIcon"] isKindOfClass:NSDictionary.class] ? icons[@"CFBundlePrimaryIcon"] : nil;
+    NSArray *files = primary[@"CFBundleIconFiles"];
     if ([files isKindOfClass:NSArray.class]) [names addObjectsFromArray:files];
-    NSString *iconName = info[@"CFBundleIcons"][@"CFBundlePrimaryIcon"][@"CFBundleIconName"];
+    NSString *iconName = primary[@"CFBundleIconName"];
     if ([iconName isKindOfClass:NSString.class]) [names addObject:iconName];
     UIImage *best = nil;
     for (NSString *file in [NSFileManager.defaultManager contentsOfDirectoryAtPath:appDir error:nil]) {

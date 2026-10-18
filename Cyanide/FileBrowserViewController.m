@@ -2116,8 +2116,10 @@ static NSString *fb_related_title(FBAppContainer *c)
         self.shown = self.entries;
     } else {
         NSPredicate *p = [NSPredicate predicateWithBlock:^BOOL(FBEntry *e, NSDictionary *b) {
-            return [e.name rangeOfString:q options:NSCaseInsensitiveSearch].location != NSNotFound ||
-                   [e.container.displayName rangeOfString:q options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            if ([e.name rangeOfString:q options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+            // Messaging nil gives location 0, which would match everything.
+            if (!e.container) return NO;
+            return [e.container.displayName rangeOfString:q options:NSCaseInsensitiveSearch].location != NSNotFound ||
                    [e.container.identifier rangeOfString:q options:NSCaseInsensitiveSearch].location != NSNotFound;
         }];
         self.shown = [self.entries filteredArrayUsingPredicate:p];

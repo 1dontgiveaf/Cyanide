@@ -82,9 +82,12 @@ static UIImage *fb_app_icon(NSString *appPath, NSString *bundleID)
 {
     NSDictionary *info = fb_read_plist([appPath stringByAppendingPathComponent:@"Info.plist"], NO);
     NSMutableArray<NSString *> *names = [NSMutableArray array];
-    NSArray *files = info[@"CFBundleIcons"][@"CFBundlePrimaryIcon"][@"CFBundleIconFiles"];
+    // Any level can be malformed in a third-party Info.plist: check each type.
+    NSDictionary *icons = [info[@"CFBundleIcons"] isKindOfClass:NSDictionary.class] ? info[@"CFBundleIcons"] : nil;
+    NSDictionary *primary = [icons[@"CFBundlePrimaryIcon"] isKindOfClass:NSDictionary.class] ? icons[@"CFBundlePrimaryIcon"] : nil;
+    NSArray *files = primary[@"CFBundleIconFiles"];
     if ([files isKindOfClass:NSArray.class]) [names addObjectsFromArray:files];
-    NSString *iconName = info[@"CFBundleIcons"][@"CFBundlePrimaryIcon"][@"CFBundleIconName"];
+    NSString *iconName = primary[@"CFBundleIconName"];
     if ([iconName isKindOfClass:NSString.class]) [names addObject:iconName];
     UIImage *best = nil;
     for (NSString *file in [NSFileManager.defaultManager contentsOfDirectoryAtPath:appPath error:nil]) {
