@@ -1160,6 +1160,10 @@ static BOOL g_kexploit_done = NO;
 static volatile int g_settings_actions_running = 0;
 static volatile int g_settings_respring_cleanup_running = 0;
 static volatile int g_settings_actions_rerun_requested = 0;
+// Set only while settings_run_actions_internal holds g_settings_actions_running,
+// so the busy path and the SpringBoard-restart handler can tell a run from
+// another action (location services, FastLockX, ...) holding the same lock.
+static volatile int g_settings_run_active = 0;
 // Remembers how the last chain run was invoked so the post-failure "Run Again"
 // alert can re-enter with the same mode (full Apply vs pending-only).
 static volatile BOOL g_settings_actions_last_pending_only = NO;
@@ -1172,6 +1176,8 @@ static volatile int g_settings_actions_auto_retry_attempt = 0;
 static BOOL g_settings_actions_idle_held = NO;
 static BOOL g_settings_actions_idle_was_disabled = NO;
 static volatile int g_springboard_rc_ready = 0;
+// Sticky: this process has opened a SpringBoard session at least once.
+static volatile int g_springboard_session_seen = 0;
 static volatile int g_springboard_sandbox_escaped = 0;
 static volatile int g_statbar_live_running = 0;
 static volatile int g_statbar_live_stop_requested = 0;
@@ -1892,6 +1898,11 @@ static BOOL settings_clear_all_applied_locked(void)
             changed = YES;
         }
     }
+    // The persisted markers describe a previous process's SpringBoard state.
+    // A not-ready notify before this process ever opened a SpringBoard session
+    // (launch, KRW acquire) says nothing about that state — keep them; the pid
+    // check in settings_persisted_applied() drops them once a session exists.
+    if (!g_springboard_session_seen) return changed;
     for (NSString *key in @[ kSettingsSBCEnabled ]) {
         if (settings_persisted_applied(key)) {
             settings_set_persisted_applied(key, NO);
@@ -2486,6 +2497,11 @@ static void settings_handle_springboard_restart(void)
             log_user("[APP] SpringBoard restarted; tweak sessions cleared. Hit Run to rebuild.\n");
         }
         settings_notify_remote_call_state_changed();
+        // A run in flight was working against the old SpringBoard; its own
+        // completion may never come (or would report stale success).
+        if (g_settings_run_active) {
+            settings_post_actions_complete_async(NO, @"SpringBoard restarted during the run — run it again.");
+        }
         // Only now, with the old session dropped: the respring cover waits
         // for this, so nothing can reuse stale SpringBoard state meanwhile.
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -2714,7 +2730,37 @@ static void settings_begin_statbar_background_task_async(const char *reason)
 // freeze. If the wait times out, the op is genuinely wedged in-kernel (the
 // irreducible floor) and we release anyway — no worse than before.
 static UIBackgroundTaskIdentifier g_safe_detach_task = (UIBackgroundTaskIdentifier)-1;
+// Number of safe-detach windows open. Overlapping backgrounding (quick
+// background → foreground → background) can open a second window before the
+// first drain finishes; each one is tracked and ended on its own.
 static volatile int g_safe_detach_in_flight = 0;
+
+// Under settings_bg_lock(): the ids begun and not yet ended.
+static NSMutableSet<NSNumber *> *settings_safe_detach_live_tasks(void)
+{
+    static NSMutableSet<NSNumber *> *live = nil;
+    if (!live) live = [NSMutableSet set];
+    return live;
+}
+
+// Ends `task` exactly once, whichever of the drain and the expiration handler
+// gets there first. The global only tracks the newest window.
+static void settings_safe_detach_end_task(UIBackgroundTaskIdentifier task)
+{
+    if (task == UIBackgroundTaskInvalid) return;
+    BOOL end = NO;
+    @synchronized (settings_bg_lock()) {
+        NSNumber *key = @(task);
+        if ([settings_safe_detach_live_tasks() containsObject:key]) {
+            [settings_safe_detach_live_tasks() removeObject:key];
+            end = YES;
+        }
+        if (g_safe_detach_task == task) g_safe_detach_task = UIBackgroundTaskInvalid;
+    }
+    if (!end) return;
+    [[UIApplication sharedApplication] endBackgroundTask:task];
+    __sync_sub_and_fetch(&g_safe_detach_in_flight, 1);
+}
 
 static UIBackgroundTaskIdentifier settings_safe_detach_begin(const char *reason)
 {
@@ -2722,24 +2768,21 @@ static UIBackgroundTaskIdentifier settings_safe_detach_begin(const char *reason)
     __block UIBackgroundTaskIdentifier task = UIBackgroundTaskInvalid;
     task = [app beginBackgroundTaskWithName:@"cyanide.safe-detach"
                           expirationHandler:^{
-        @synchronized (settings_bg_lock()) {
-            if (task != UIBackgroundTaskInvalid && g_safe_detach_task == task) {
-                printf("[SETTINGS] safe-detach: background task EXPIRED by iOS — "
-                       "an in-flight RemoteCall op did not drain in time (wedged "
-                       "in-kernel); releasing the assertion\n");
-                [[UIApplication sharedApplication] endBackgroundTask:task];
-                g_safe_detach_task = UIBackgroundTaskInvalid;
-                __sync_lock_release(&g_safe_detach_in_flight);
-            }
-        }
+        printf("[SETTINGS] safe-detach: background task EXPIRED by iOS — "
+               "an in-flight RemoteCall op did not drain in time (wedged "
+               "in-kernel); releasing the assertion\n");
+        settings_safe_detach_end_task(task);
     }];
     if (task == UIBackgroundTaskInvalid) {
         printf("[SETTINGS] safe-detach: background task unavailable (%s) — teardown "
                "runs without an extended window\n", reason ?: "backgrounding");
         return UIBackgroundTaskInvalid;
     }
-    @synchronized (settings_bg_lock()) { g_safe_detach_task = task; }
-    __sync_lock_test_and_set(&g_safe_detach_in_flight, 1);
+    @synchronized (settings_bg_lock()) {
+        [settings_safe_detach_live_tasks() addObject:@(task)];
+        g_safe_detach_task = task;
+    }
+    __sync_add_and_fetch(&g_safe_detach_in_flight, 1);
     printf("[SETTINGS] safe-detach: window open id=%lu (%s)\n",
            (unsigned long)task, reason ?: "backgrounding");
     return task;
@@ -2754,7 +2797,6 @@ static void settings_safe_detach_drain_and_end(UIBackgroundTaskIdentifier task,
                                                const char *reason)
 {
     if (task == UIBackgroundTaskInvalid) {
-        __sync_lock_release(&g_safe_detach_in_flight);
         // No assertion was taken, so nothing was drained: not a confirmed safe point.
         locsvc_switcher_note_safe(NO);
         return;
@@ -2796,13 +2838,7 @@ static void settings_safe_detach_drain_and_end(UIBackgroundTaskIdentifier task,
         // the background teardown/hand-off and this drain are all done.
         locsvc_switcher_note_safe(remote_call_inflight_count() == 0 &&
                                   remote_call_helper_unaccounted_count() == 0);
-        @synchronized (settings_bg_lock()) {
-            if (g_safe_detach_task == task) {
-                [[UIApplication sharedApplication] endBackgroundTask:task];
-                g_safe_detach_task = UIBackgroundTaskInvalid;
-            }
-        }
-        __sync_lock_release(&g_safe_detach_in_flight);
+        settings_safe_detach_end_task(task);
     });
 }
 
@@ -2822,10 +2858,11 @@ static void settings_notify_remote_call_state_changed_preserving_applied(BOOL pr
         [[NSNotificationCenter defaultCenter] postNotificationName:kSettingsRemoteCallStateDidChangeNotification
                                                             object:nil];
         if (cleared) {
+            // Not a run completion: posting one here (no success key) turned
+            // an open progress screen green mid-run. A run lost to a
+            // SpringBoard restart reports failure from that handler instead.
             [[NSNotificationCenter defaultCenter] postNotificationName:PackageQueueDidChangeNotification
                                                                 object:[PackageQueue sharedQueue]];
-            [[NSNotificationCenter defaultCenter] postNotificationName:kSettingsActionsDidCompleteNotification
-                                                                object:nil];
         }
     });
 }
@@ -3500,6 +3537,7 @@ static BOOL settings_ensure_springboard_remote_call_locked(void)
                                                           false,
                                                           timeoutMS) == 0) {
             g_springboard_rc_ready = 1;
+            g_springboard_session_seen = 1;
             g_springboard_sandbox_escaped = 0;
             settings_notify_remote_call_state_changed();
             return YES;
@@ -4882,9 +4920,46 @@ NSString *settings_themer_selected_theme_display_name(void)
     return @"None";
 }
 
+static void settings_themer_import_fail(NSError **error, NSString *message)
+{
+    if (error && !*error) {
+        *error = [NSError errorWithDomain:@"CyanideThemerImport"
+                                     code:1
+                                 userInfo:@{ NSLocalizedDescriptionKey: message ?: @"Import failed." }];
+    }
+}
+
+// Moves a fully staged import over `target`. The old item is set aside first
+// and restored if the move fails, so a failure never leaves neither in place.
+static BOOL settings_themer_swap_into_place(NSString *staging, NSString *target, NSError **error)
+{
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *backup = nil;
+    if ([fm fileExistsAtPath:target]) {
+        backup = [[target stringByDeletingLastPathComponent] stringByAppendingPathComponent:
+            [NSString stringWithFormat:@".Imported-backup-%@", NSUUID.UUID.UUIDString]];
+        if (![fm moveItemAtPath:target toPath:backup error:error]) return NO;
+    }
+    if (![fm moveItemAtPath:staging toPath:target error:error]) {
+        if (backup) [fm moveItemAtPath:backup toPath:target error:nil];
+        return NO;
+    }
+    if (backup) [fm removeItemAtPath:backup error:nil];
+    return YES;
+}
+
 static NSDictionary<NSString *, NSData *> *settings_themer_load_plist_theme(NSString *plistPath)
 {
     NSError *err = nil;
+    // Size first: the whole plist is read into memory and every entry is
+    // later decoded, so an oversized file is refused before any of that.
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:plistPath error:&err];
+    if (!attrs || ![attrs.fileType isEqualToString:NSFileTypeRegular] ||
+        attrs.fileSize == 0 || attrs.fileSize > SBLMaxImportTotalBytes) {
+        printf("[THEMER] resolve: plist rejected (missing, not a regular file, or %llu bytes over the %llu cap)\n",
+               (unsigned long long)attrs.fileSize, (unsigned long long)SBLMaxImportTotalBytes);
+        return nil;
+    }
     NSData *raw = [NSData dataWithContentsOfFile:plistPath options:0 error:&err];
     if (!raw) {
         printf("[THEMER] resolve: failed to read plist err=%s\n",
@@ -4907,10 +4982,13 @@ static NSDictionary<NSString *, NSData *> *settings_themer_load_plist_theme(NSSt
         id value = dict[key];
         if (![key isKindOfClass:NSString.class] ||
             ![value isKindOfClass:NSData.class] ||
-            [(NSData *)value length] == 0) {
+            [(NSData *)value length] == 0 ||
+            [(NSData *)value length] > SBLMaxImageFileBytes ||
+            !SBLImageDataPassesPixelPreflight(value)) {
             continue;
         }
         out[key] = value;
+        if (out.count >= SBLMaxImportFileCount) break;
     }
     printf("[THEMER] resolve: loaded plist theme entries=%lu size=%lu path=%s\n",
            (unsigned long)out.count,
@@ -5108,11 +5186,18 @@ static void settings_nano_load_from_plist_into_defaults(BOOL logResult)
     }
 }
 
+static NSString * const kSettingsNanoCachePushFailedMessage =
+    @"Watch pairing override was written, but cfprefsd's cache could not be updated — "
+    @"it may revert. Apply it again if it does.";
+
 // Synchronous entry point used by both the Settings UI buttons and the
 // Installer's PackageQueue commit path. Logs progress to the in-app log so
 // the InstallProgressViewController shows real lines during the apply.
-BOOL settings_apply_nano_registry_now(BOOL apply)
+// *cachePushedOut is NO when the plist was written but the cfprefsd push
+// failed: the override is in place but may be reverted (partial result).
+static BOOL settings_apply_nano_registry_internal(BOOL apply, BOOL *cachePushedOut)
 {
+    if (cachePushedOut) *cachePushedOut = YES;
     if (!settings_try_claim_actions_lock("NanoRegistry apply",
                                          "[NANO] Another action is already running.")) {
         return NO;
@@ -5158,6 +5243,7 @@ BOOL settings_apply_nano_registry_now(BOOL apply)
             bool pushed = nano_registry_push_to_cfprefsd(&values, apply ? true : false);
             if (!pushed) {
                 log_user("[NANO] cfprefsd push failed; on-disk override may be overwritten by cfprefsd's stale cache.\n");
+                if (cachePushedOut) *cachePushedOut = NO;
             }
         }
 
@@ -5165,6 +5251,33 @@ BOOL settings_apply_nano_registry_now(BOOL apply)
     } @finally {
         settings_release_actions_lock();
     }
+}
+
+// Installer path: still YES when only the cfprefsd push failed (the write
+// succeeded; re-queueing would not help), but the run's completion reports it
+// through the preflight note instead of a clean "Done".
+BOOL settings_apply_nano_registry_now(BOOL apply)
+{
+    BOOL pushed = YES;
+    BOOL ok = settings_apply_nano_registry_internal(apply, &pushed);
+    if (ok && !pushed) settings_note_run_preflight_failure(kSettingsNanoCachePushFailedMessage);
+    return ok;
+}
+
+static void settings_post_nano_action_complete(BOOL ok, BOOL pushed)
+{
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSDictionary *info = @{
+            kSettingsActionsDidCompleteSuccessKey: @(ok),
+            kSettingsActionsDidCompletePartialKey: @(ok && !pushed),
+            kSettingsActionsDidCompleteMessageKey: !ok ? @"Watch pairing override failed. Check the log."
+                                                 : (pushed ? @"" : kSettingsNanoCachePushFailedMessage)
+        };
+        [[NSNotificationCenter defaultCenter]
+            postNotificationName:kSettingsActionsDidCompleteNotification
+                          object:nil
+                        userInfo:info];
+    });
 }
 
 BOOL settings_apply_call_recording_sound_disabled(BOOL disabled)
@@ -5255,24 +5368,18 @@ BOOL settings_apply_hide_home_bar_hidden(BOOL hidden)
 static void settings_run_nano_apply_action(void)
 {
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        (void)settings_apply_nano_registry_now(YES);
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [[NSNotificationCenter defaultCenter]
-                postNotificationName:kSettingsActionsDidCompleteNotification
-                              object:nil];
-        });
+        BOOL pushed = YES;
+        BOOL ok = settings_apply_nano_registry_internal(YES, &pushed);
+        settings_post_nano_action_complete(ok, pushed);
     });
 }
 
 static void settings_run_nano_clear_action(void)
 {
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
-        (void)settings_apply_nano_registry_now(NO);
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [[NSNotificationCenter defaultCenter]
-                postNotificationName:kSettingsActionsDidCompleteNotification
-                              object:nil];
-        });
+        BOOL pushed = YES;
+        BOOL ok = settings_apply_nano_registry_internal(NO, &pushed);
+        settings_post_nano_action_complete(ok, pushed);
     });
 }
 
@@ -6279,7 +6386,7 @@ static void settings_schedule_themer_repair_burst_internal(const char *reason, B
                    !settings_themer_dynamic_updates_blocked_by_stage(d) &&
                    !settings_cleanup_in_progress() &&
                    !g_themer_live_stop_requested &&
-                   tick < 1) {
+                   tick < 8) {   // hard cap; quietTicks >= 2 normally ends it
                 settings_live_loop_sleep_interruptible(0,
                                                        tick == 0
                                                            ? kThemerRepairInitialDelayUS
@@ -6288,10 +6395,12 @@ static void settings_schedule_themer_repair_burst_internal(const char *reason, B
                 if (g_themer_live_stop_requested) break;
 
                 bool ok = false;
+                BOOL deferredForActions = NO;
                 @synchronized (settings_rc_lock()) {
                     if (!g_springboard_rc_ready || !g_kexploit_done ||
                         g_settings_actions_running) {
                         ok = true;
+                        deferredForActions = (g_settings_actions_running != 0);
                     } else {
                         ok = themer_repaint_visible_theme_views_in_session();
                     }
@@ -6302,7 +6411,9 @@ static void settings_schedule_themer_repair_burst_internal(const char *reason, B
                 if (currentGeneration != seenGeneration) {
                     seenGeneration = currentGeneration;
                     quietTicks = 0;
-                } else {
+                } else if (!deferredForActions) {
+                    // A tick that never repainted (actions held the lock) is
+                    // not evidence the icons are settled.
                     quietTicks++;
                     if (quietTicks >= 2) break;
                 }
@@ -6826,6 +6937,15 @@ void settings_location_services_set_async(int desired, BOOL allowFullExploit,
                 if (settings_any_registered_live_loop_running() || settings_has_persistent_springboard_remote_call_user()) {
                     message = @"SpringBoard didn't change it, and the Preferences fallback would need the "
                               @"SpringBoard channel closed while live tweaks use it. Stop them and try again.";
+                    return;
+                }
+                // SpringBoard may have been refused because the activation
+                // settle window was re-extended, the app is backgrounding or a
+                // cleanup is running: a fresh Preferences hijack now would
+                // reopen the AMFI/runningboardd deadlock the window prevents.
+                if (clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) < g_activation_settle_until_ns ||
+                    g_app_in_background || settings_cleanup_in_progress()) {
+                    message = @"Cyanide was busy — try again in a moment.";
                     return;
                 }
                 // Fallback: Preferences, only if it's already running (see
@@ -8311,7 +8431,6 @@ void settings_register_defaults(void)
         // lands the PCB.
         kSettingsA18BoundedSearch:   @NO,
         kSettingsRemoteSettleMode:   @2,
-        kSettingsAutoRunKexploit:    @NO,
         kSettingsRunSandboxEscape:   @YES,
         kSettingsRunPatchSandboxExt: @NO,
         kSettingsKeepAlive:          @YES,
@@ -8564,11 +8683,23 @@ static void settings_run_actions_internal(BOOL pendingOnly)
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
         if (__sync_lock_test_and_set(&g_settings_actions_running, 1)) {
+            // The follow-up flag is only consumed by a run's @finally; a
+            // non-run lock holder would drop it and leave the sheet spinning.
+            if (!g_settings_run_active) {
+                // This refusal is the completion that gets posted: consume
+                // any installer preflight note so it can't ride into a later run.
+                (void)settings_take_run_preflight_failure();
+                printf("[SETTINGS] another (non-run) action holds the lock; run refused\n");
+                log_user("[RUN] Another action is running. Try again when it has finished.\n");
+                settings_post_actions_complete_async(NO, @"Another action is running. Try again when it has finished.");
+                return;
+            }
             __sync_lock_test_and_set(&g_settings_actions_rerun_requested, 1);
             printf("[SETTINGS] actions already running; queued one follow-up run\n");
             log_user("[RUN] Already running. Queued one follow-up run for the latest package state.\n");
             return;
         }
+        __sync_lock_test_and_set(&g_settings_run_active, 1);
         dispatch_sync(dispatch_get_main_queue(), ^{
             if (!g_settings_actions_idle_held) {
                 g_settings_actions_idle_was_disabled = UIApplication.sharedApplication.idleTimerDisabled;
@@ -9282,6 +9413,7 @@ static void settings_run_actions_internal(BOOL pendingOnly)
             // (idle parking, live-tweak loops) still lands in the shareable log.
             // The next run's log_session_begin() rotates the file.
             log_session_flush();
+            __sync_lock_release(&g_settings_run_active);
             __sync_lock_release(&g_settings_actions_running);
             settings_reconcile_applied_from_defaults();
             // Auto-retry: a clean KRW-acquire miss is fully re-entrant in the
@@ -13188,7 +13320,6 @@ static NSUInteger settings_tab_index_for_title(UITabBarController *tab, NSString
         @{ @"kind": @"settlemode", @"key": kSettingsRemoteSettleMode, @"title": @"Tweak apply speed" },
         @{ @"key": kSettingsVerboseLoggingEnabled, @"title": @"Verbose logging",
            @"subtitle": @"Logs the full RemoteCall internals for every exploit run, tweak apply and Process Viewer action. Off keeps the log readable; turn it on before reproducing an issue, then share the log." },
-        @{ @"key": kSettingsAutoRunKexploit,    @"title": @"Auto-run kexploit on launch" },
         @{ @"key": kSettingsRunSandboxEscape,   @"title": @"Sandbox escape (escape_sbx_demo2)" },
         @{ @"key": kSettingsLocationServicesLinksEnabled, @"title": @"Location Services links",
            @"subtitle": @"Lets cyanide://location-services links turn Location Services on or off. Any app can open these links without asking, so this is off by default. The Control Center toggle and the Shortcuts action work without it." },
@@ -15415,19 +15546,63 @@ didFinishPicking:(NSArray<PHPickerResult *> *)results
             [pngs addObject:file];
         }
     }
-    if (pngs.count == 0) return NO;
+    if (pngs.count == 0) {
+        settings_themer_import_fail(error, @"The folder contains no PNG icons.");
+        return NO;
+    }
+    if (pngs.count > SBLMaxImportFileCount) {
+        settings_themer_import_fail(error, @"The folder contains too many files to import.");
+        return NO;
+    }
 
-    [fm removeItemAtPath:target error:nil];
-    [fm createDirectoryAtPath:target withIntermediateDirectories:YES attributes:nil error:error];
-    if (error && *error) return NO;
-    [fm removeItemAtPath:settings_themer_imported_plist_path() error:nil];
-
+    // Header-only preflight (nothing is decoded): a bad file is skipped the
+    // same way the themer skips it at apply time; the totals bound the import.
+    NSMutableArray<NSURL *> *accepted = [NSMutableArray array];
+    uint64_t totalBytes = 0;
     for (NSURL *png in pngs) {
-        NSString *dst = [target stringByAppendingPathComponent:png.lastPathComponent];
-        if (![fm copyItemAtURL:png toURL:[NSURL fileURLWithPath:dst] error:error]) {
+        uint64_t size = 0;
+        if (!SBLImageFilePassesPreflight(png.path, SBLMaxImageFileBytes, &size)) {
+            printf("[THEMER] import: skipped %s (not a regular PNG within the size/pixel caps)\n",
+                   png.lastPathComponent.UTF8String);
+            continue;
+        }
+        totalBytes += size;
+        if (totalBytes > SBLMaxImportTotalBytes) {
+            settings_themer_import_fail(error, @"The theme is too large to import.");
+            return NO;
+        }
+        [accepted addObject:png];
+    }
+    if (accepted.count == 0) {
+        settings_themer_import_fail(error, @"None of the PNG icons could be used (too large or unreadable).");
+        return NO;
+    }
+
+    // Picked the imported theme itself: it is already in place, so there is
+    // nothing to copy — and removing the target would delete the source.
+    BOOL sourceIsTarget = [url.URLByStandardizingPath.URLByResolvingSymlinksInPath.path
+        isEqualToString:[NSURL fileURLWithPath:target].URLByStandardizingPath.URLByResolvingSymlinksInPath.path];
+    if (!sourceIsTarget) {
+        // Stage next to the target and swap only once every copy succeeded:
+        // a failed import leaves the previous theme and selection untouched.
+        NSString *staging = [root stringByAppendingPathComponent:
+            [NSString stringWithFormat:@".Imported-staging-%@", NSUUID.UUID.UUIDString]];
+        if (![fm createDirectoryAtPath:staging withIntermediateDirectories:YES attributes:nil error:error]) {
+            return NO;
+        }
+        for (NSURL *png in accepted) {
+            NSString *dst = [staging stringByAppendingPathComponent:png.lastPathComponent];
+            if (![fm copyItemAtURL:png toURL:[NSURL fileURLWithPath:dst] error:error]) {
+                [fm removeItemAtPath:staging error:nil];
+                return NO;
+            }
+        }
+        if (!settings_themer_swap_into_place(staging, target, error)) {
+            [fm removeItemAtPath:staging error:nil];
             return NO;
         }
     }
+    [fm removeItemAtPath:settings_themer_imported_plist_path() error:nil];
 
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     [d setObject:kThemerThemeCustom forKey:kSettingsThemerThemeID];
@@ -15436,14 +15611,21 @@ didFinishPicking:(NSArray<PHPickerResult *> *)results
           forKey:kSettingsThemerCustomThemeName];
     [d synchronize];
     log_user("[THEMER] Imported custom folder theme: %lu PNG file(s).\n",
-             (unsigned long)pngs.count);
+             (unsigned long)accepted.count);
+    if (accepted.count < pngs.count) {
+        log_user("[THEMER] Skipped %lu PNG file(s) over the size/pixel limits.\n",
+                 (unsigned long)(pngs.count - accepted.count));
+    }
     return YES;
 }
 
 - (BOOL)importThemerPlistAtURL:(NSURL *)url error:(NSError **)error
 {
     NSDictionary *dict = settings_themer_load_plist_theme(url.path);
-    if (dict.count == 0) return NO;
+    if (dict.count == 0) {
+        settings_themer_import_fail(error, @"The plist contains no usable icon entries.");
+        return NO;
+    }
 
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *root = settings_themer_documents_theme_root();
@@ -15451,11 +15633,24 @@ didFinishPicking:(NSArray<PHPickerResult *> *)results
     if (!root || !target) return NO;
     [fm createDirectoryAtPath:root withIntermediateDirectories:YES attributes:nil error:error];
     if (error && *error) return NO;
-    [fm removeItemAtPath:target error:nil];
-    [fm removeItemAtPath:settings_themer_imported_theme_dir() error:nil];
-    if (![fm copyItemAtURL:url toURL:[NSURL fileURLWithPath:target] error:error]) {
-        return NO;
+
+    // Same staging/swap as the folder import; picking Imported.plist itself
+    // keeps it as is instead of deleting it before the copy.
+    BOOL sourceIsTarget = [url.URLByStandardizingPath.URLByResolvingSymlinksInPath.path
+        isEqualToString:[NSURL fileURLWithPath:target].URLByStandardizingPath.URLByResolvingSymlinksInPath.path];
+    if (!sourceIsTarget) {
+        NSString *staging = [root stringByAppendingPathComponent:
+            [NSString stringWithFormat:@".Imported-staging-%@.plist", NSUUID.UUID.UUIDString]];
+        if (![fm copyItemAtURL:url toURL:[NSURL fileURLWithPath:staging] error:error]) {
+            [fm removeItemAtPath:staging error:nil];
+            return NO;
+        }
+        if (!settings_themer_swap_into_place(staging, target, error)) {
+            [fm removeItemAtPath:staging error:nil];
+            return NO;
+        }
     }
+    [fm removeItemAtPath:settings_themer_imported_theme_dir() error:nil];
 
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     [d setObject:kThemerThemeCustom forKey:kSettingsThemerThemeID];
@@ -18497,18 +18692,23 @@ void cyanide_present_contact(UIViewController *host)
 
         __weak typeof(self) weakSelf = self;
         dispatch_async(dispatch_get_global_queue(0, 0), ^{
+            // Result for the progress sheet: a bare completion reads as success.
+            __block BOOL flxOK = NO;
+            __block NSString *flxMessage = @"FastLockX Lite request failed. Check the log for details.";
             BOOL actionLockAcquired = settings_try_claim_actions_lock("FastLockX Lite",
                                                                      "[FLX] Another action is already running.");
             if (!actionLockAcquired) {
                 if (bgTask != UIBackgroundTaskInvalid) {
                     [[UIApplication sharedApplication] endBackgroundTask:bgTask];
                 }
+                settings_post_actions_complete_async(NO, @"Another action is already running. Try again when it has finished.");
                 return;
             }
 
             @try {
                 if (!settings_ensure_kexploit()) {
                     log_user("[FLX] Failed: kernel primitives not acquired. Run the chain, then try again.\n");
+                    flxMessage = @"Kernel primitives not acquired. Run the chain, then try again.";
                     return;
                 }
 
@@ -18516,6 +18716,7 @@ void cyanide_present_contact(UIViewController *host)
                 @synchronized (settings_rc_lock()) {
                     if (!settings_ensure_springboard_remote_call_locked()) {
                         log_user("[FLX] SpringBoard not reachable; cannot send FastLockX Lite request.\n");
+                        flxMessage = @"SpringBoard not reachable; cannot send FastLockX Lite request.";
                         return;
                     }
 
@@ -18524,6 +18725,9 @@ void cyanide_present_contact(UIViewController *host)
                         log_user("%s FastLockX Lite probe %s.\n",
                                  ok ? "[OK]" : "[WARN]",
                                  ok ? "found usable primitives" : "did not find enough primitives");
+                        flxOK = ok;
+                        flxMessage = ok ? @"FastLockX Lite probe found usable primitives."
+                                        : @"FastLockX Lite probe did not find enough primitives.";
                         return;
                     }
 
@@ -18540,6 +18744,9 @@ void cyanide_present_contact(UIViewController *host)
                         log_user("%s FastLockX Lite Always On %s.\n",
                                  ok ? "[OK]" : "[WARN]",
                                  ok ? "disabled" : "could not be disabled; respring will stop it");
+                        flxOK = ok;
+                        flxMessage = ok ? @"FastLockX Lite Always On disabled."
+                                        : @"FastLockX Lite Always On could not be disabled; respring will stop it.";
                     } else if (enableAlways) {
                         [d setBool:YES forKey:kSettingsFastLockXLiteEnabled];
                         [d synchronize];
@@ -18566,13 +18773,18 @@ void cyanide_present_contact(UIViewController *host)
                         log_user("%s FastLockX Lite Always On %s.\n",
                                  ok ? "[OK]" : "[WARN]",
                                  ok ? "enabled" : "failed to enable");
+                        flxOK = ok;
+                        flxMessage = ok ? @"FastLockX Lite Always On enabled."
+                                        : @"FastLockX Lite Always On failed to enable.";
                     } else if (window) {
                         NSTimeInterval deadline = [NSDate timeIntervalSinceReferenceDate] + 15.0;
                         int tick = 0;
+                        BOOL stoppedForCleanup = NO;
                         log_user("[FLX] 15s auto-unlock window started. Lock the device now and let Face ID authenticate.\n");
                         while ([NSDate timeIntervalSinceReferenceDate] < deadline) {
                             if (settings_cleanup_in_progress()) {
                                 log_user("[FLX] Stopping window: cleanup started.\n");
+                                stoppedForCleanup = YES;
                                 break;
                             }
                             FastLockXLiteConfig config = settings_fastlockx_lite_config_from_defaults(d, YES, YES);
@@ -18588,12 +18800,18 @@ void cyanide_present_contact(UIViewController *host)
                             usleep(300000);
                         }
                         log_user("[FLX] 15s auto-unlock window stopped.\n");
+                        flxOK = !stoppedForCleanup;
+                        flxMessage = stoppedForCleanup ? @"Auto-unlock window stopped: cleanup started."
+                                                       : @"15s auto-unlock window finished.";
                     } else {
                         FastLockXLiteConfig config = settings_fastlockx_lite_config_from_defaults(d, pulse, unlock);
                         bool ok = fastlockx_lite_run_in_session(config);
                         log_user("%s FastLockX Lite request %s.\n",
                                  ok ? "[OK]" : "[WARN]",
                                  ok ? "completed" : "did not complete");
+                        flxOK = ok;
+                        flxMessage = ok ? @"FastLockX Lite request completed."
+                                        : @"FastLockX Lite request did not complete.";
                     }
                 }
             } @finally {
@@ -18604,10 +18822,8 @@ void cyanide_present_contact(UIViewController *host)
                 dispatch_async(dispatch_get_main_queue(), ^{
                     __strong typeof(weakSelf) strongSelf = weakSelf;
                     [strongSelf reloadSectionOrAll:SectionFastLockXLite];
-                    [[NSNotificationCenter defaultCenter]
-                        postNotificationName:kSettingsActionsDidCompleteNotification
-                                      object:nil];
                 });
+                settings_post_actions_complete_async(flxOK, flxMessage);
             }
         });
         return;
