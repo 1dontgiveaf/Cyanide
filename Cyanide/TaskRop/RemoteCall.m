@@ -2249,10 +2249,12 @@ static void rc_reply_crash_repark(ExceptionMessage *e, uint64_t parkPC,
            (unsigned long long)e->codeFirst, (unsigned long long)e->codeSecond,
            (unsigned long long)e->threadState.__pc,
            (unsigned long long)parkPC, (unsigned long long)parkLR);
-    // Teardown-owned repair may run on the late-trap responder thread, which
-    // is not the thread that began destroy/abandon. Enter the owner-scoped
-    // bypass on this thread for the one sign it needs (F-04/F-07).
-    excport_teardown_bypass_begin("crash-repark");
+    // No teardown bypass here: this helper also serves LIVE calls (temp-call,
+    // call-stable-addr), which must stay refused behind a closed gate (F-04
+    // runningboardd ABBA window). Teardown-owned callers enter the per-thread
+    // bypass themselves (destroy/abandon internals, abort restore); when the
+    // gate refuses the sign we reply the unmodified state below, which still
+    // re-traps to our port.
     arm_thread_state64_internal st = e->threadState;
     if (sign_state(g_RC_trojanThreadAddr, &st, parkPC, parkLR)) {
         reply_with_state(e, &st);
@@ -2261,7 +2263,6 @@ static void rc_reply_crash_repark(ExceptionMessage *e, uint64_t parkPC,
                "re-trap returns to our port\n");
         reply_with_state(e, &e->threadState);
     }
-    excport_teardown_bypass_end("crash-repark");
     g_RC_success = false;
 }
 
@@ -2656,20 +2657,12 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     return retValue;
 }
 
-static bool restore_trojan_thread_internal(arm_thread_state64_internal *state);
-
-// Teardown-owned restore may run from init abort paths as well as destroy.
-// Enter the owner-scoped bypass on this thread so its PAC re-sign is admitted
-// even after the lifecycle gate has closed (F-04/F-07).
+// No teardown bypass of its own (F-04/F-07): the destroy caller already holds
+// the per-thread bypass from destroy_remote_call_internal, and the init
+// handoff caller is a normal (non-teardown) path that must stay refused
+// behind a closed gate. A refused re-sign falls back to the RAW original
+// state below, which still restores the thread.
 bool restore_trojan_thread(arm_thread_state64_internal *state)
-{
-    excport_teardown_bypass_begin("restore-trojan");
-    bool result = restore_trojan_thread_internal(state);
-    excport_teardown_bypass_end("restore-trojan");
-    return result;
-}
-
-static bool restore_trojan_thread_internal(arm_thread_state64_internal *state)
 {
     int restoreTimeoutMS = g_RC_stableExceptionTimeoutFloorMS > 0 ? g_RC_stableExceptionTimeoutFloorMS : 20000;
     if (restoreTimeoutMS < 1000) restoreTimeoutMS = 1000;
@@ -3119,8 +3112,10 @@ typedef enum {
 // ksafe is a boot-time snapshot. A thread allocated after it reads as "not
 // mapped"; the landmine sweep refreshes once and re-checks before ending its
 // walk for exactly that reason. Do the same here, but keep the answer
-// three-valued: if the refresh itself cannot run (rate limit / KRW), the
-// address is UNKNOWN, never GONE. Review R-01.
+// three-valued: if no fresh snapshot is available (refresh failed / KRW, or
+// rate-limited without a successful refresh inside the window), the address
+// is UNKNOWN, never GONE. A refresh that succeeded inside the 500 ms rate
+// window is as authoritative as one taken now. Review R-01.
 typedef enum {
     RC_KS_MAPPED,
     RC_KS_UNMAPPED,
@@ -3131,7 +3126,7 @@ static RcKsafeRegion rc_ksafe_region(uint64_t addr, size_t len)
 {
     if (!ksafe_available()) return RC_KS_MAPPED;   // no map = no gate
     if (kaddr_is_mapped(addr, len)) return RC_KS_MAPPED;
-    if (!ksafe_refresh()) return RC_KS_UNKNOWN;
+    if (ksafe_refresh_status() == KSAFE_REFRESH_FAILED) return RC_KS_UNKNOWN;
     return kaddr_is_mapped(addr, len) ? RC_KS_MAPPED : RC_KS_UNMAPPED;
 }
 
@@ -4292,8 +4287,14 @@ static void rc_restore_trapped_thread_for_abort(mach_port_t port, int trapStage,
                 reply_with_state(&rex, &rex.threadState);
                 continue;
             }
+            // Init-abort repair is teardown-owned (every caller proceeds to
+            // abandon/destroy), so admit this one sign through the per-thread
+            // bypass. rc_reply_crash_repark itself no longer enters it: it
+            // also serves live calls (F-04/F-07).
+            excport_teardown_bypass_begin("abort-repark");
             rc_reply_crash_repark(&rex, FAKE_PC_TROJAN_CREATOR, FAKE_LR_TROJAN_CREATOR,
                                   "abort restore");
+            excport_teardown_bypass_end("abort-repark");
         }
     }
     // Round 34 (panic-full-2026-10-03-215535: launchd thread 17081 parked on
@@ -4375,10 +4376,15 @@ static void rc_restore_trapped_thread_for_abort(mach_port_t port, int trapStage,
 #define RC_INIT_WATCHDOG_SECONDS 12
 
 static _Atomic uint64_t g_rc_init_watchdog_gen = 0;
-// Set immediately after init_remote_call_internal() returns (before the gen is
-// retired under the mutex). The watchdog checks it under the same mutex so an
-// init returning at the 12 s boundary is not treated as wedged. Review R-08.
-static _Atomic uint64_t g_rc_init_completed_gen = 0;
+// Review R-08: one decision word per watched init, (gen << 2) | outcome. The
+// init arms it RUNNING; on return the init CASes RUNNING->DONE and the
+// watchdog CASes RUNNING->WEDGED. Exactly one CAS can win, so an init
+// returning at the 12 s boundary is either healthy (watchdog backs off) or
+// wedged (watchdog repairs; the init reports failure and does not publish).
+#define RC_INIT_WATCH_RUNNING 1ULL
+#define RC_INIT_WATCH_DONE    2ULL
+#define RC_INIT_WATCH_WEDGED  3ULL
+static _Atomic uint64_t g_rc_init_watch_word = 0;
 static _Atomic bool g_rc_init_wedged = false;
 // Review F-01: the watchdog is a fresh pthread with no pushed RemoteCallState,
 // so the g_RC_* macros there resolved to g_RC_defaultState — it drained
@@ -4523,10 +4529,19 @@ static void *rc_init_watchdog_main(void *arg) {
     // be freed as soon as init returns). The task_exc_guard ref is claimed
     // here too (atomic, exactly once vs a racing teardown).
     pthread_mutex_lock(&g_rc_init_watchdog_mutex);
-    if (atomic_load_explicit(&g_rc_init_watchdog_gen, memory_order_acquire) != gen ||
-        atomic_load_explicit(&g_rc_init_completed_gen, memory_order_acquire) == gen) {
+    if (atomic_load_explicit(&g_rc_init_watchdog_gen, memory_order_acquire) != gen) {
         pthread_mutex_unlock(&g_rc_init_watchdog_mutex);
         return NULL;   // init returned while we were waking — healthy
+    }
+    // R-08: decide atomically against the init's own completion CAS. Losing
+    // means the init already published DONE — healthy, nothing to do.
+    uint64_t wdExpected = (gen << 2) | RC_INIT_WATCH_RUNNING;
+    if (!atomic_compare_exchange_strong_explicit(&g_rc_init_watch_word, &wdExpected,
+                                                 (gen << 2) | RC_INIT_WATCH_WEDGED,
+                                                 memory_order_acq_rel,
+                                                 memory_order_acquire)) {
+        pthread_mutex_unlock(&g_rc_init_watchdog_mutex);
+        return NULL;   // init completed at the boundary — healthy
     }
     RemoteCallState *st = wdArg.st;
     mach_port_t wdFirstPort = st ? st->firstExceptionPort : MACH_PORT_NULL;
@@ -4727,6 +4742,9 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     // spawn one). Retired by bumping the generation the moment init returns.
     uint64_t wdGen = atomic_fetch_add_explicit(&g_rc_init_watchdog_gen, 1,
                                                memory_order_acq_rel) + 1;
+    // R-08: arm this init's decision word before the watchdog can exist.
+    atomic_store_explicit(&g_rc_init_watch_word, (wdGen << 2) | RC_INIT_WATCH_RUNNING,
+                          memory_order_release);
     // F-01: hand the watchdog THIS init's state (the session object's _state
     // is pushed only on this thread), not just the generation.
     RcInitWatchdogArg *wdArg = malloc(sizeof(*wdArg));
@@ -4744,10 +4762,21 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     }
     g_RC_processGeneration = 0;
     int rc = init_remote_call_internal(process, useMigFilterBypass);
-    // R-08: publish completion before taking the retirement mutex. If the
-    // watchdog already holds it, it will see this flag and not repair a healthy
-    // init that returned at the boundary.
-    atomic_store_explicit(&g_rc_init_completed_gen, wdGen, memory_order_release);
+    // R-08: claim completion with the same CAS the watchdog races. Win: the
+    // watchdog backs off. Lose: the watchdog already declared this init
+    // wedged and owns the abort (stop latch, drain, guard restore) — do not
+    // publish a session into its teardown; report failure instead.
+    uint64_t initExpected = (wdGen << 2) | RC_INIT_WATCH_RUNNING;
+    bool watchdogOwnsAbort = !atomic_compare_exchange_strong_explicit(
+        &g_rc_init_watch_word, &initExpected,
+        (wdGen << 2) | RC_INIT_WATCH_DONE,
+        memory_order_acq_rel, memory_order_acquire);
+    if (watchdogOwnsAbort) {
+        printf("[RemoteCall] INIT WATCHDOG: init returned (rc=%d) after the "
+               "watchdog declared it wedged — the watchdog's abort stands; "
+               "not publishing this session\n", rc);
+        rc = -1;
+    }
     // F-01: retire the generation under the watchdog's snapshot mutex — after
     // this the watchdog cannot be (or start) reading this state.
     pthread_mutex_lock(&g_rc_init_watchdog_mutex);
