@@ -2438,9 +2438,23 @@ static bool themer_unthem_model_icon(const char *bundle)
     if (!clsName[0]) return false;
 
     // Class first, so SpringBoard never dispatches the themed getter after its
-    // associated image is gone.
-    r_dlsym_call(R_TIMEOUT, "object_setClass",
-                 icon, baseClass, 0, 0, 0, 0, 0, 0);
+    // associated image is gone. But if the swap cannot be confirmed, clearing
+    // the associations would leave a CNDThemed getter with no image (blank
+    // icons) instead of the previous art. Only clear once the class is verified.
+    uint64_t oldClass = r_dlsym_call(R_TIMEOUT, "object_setClass",
+                                     icon, baseClass, 0, 0, 0, 0, 0, 0);
+    bool swapConfirmed = r_last_call_ok() && oldClass == themedClass;
+    if (swapConfirmed) {
+        uint64_t nowClass = r_dlsym_call(R_TIMEOUT, "object_getClass",
+                                         icon, 0, 0, 0, 0, 0, 0, 0);
+        swapConfirmed = r_last_call_ok() && nowClass == baseClass;
+    }
+    if (!swapConfirmed) {
+        printf("[THEMER] un-them: class swap NOT confirmed for %s; keeping the "
+               "associated image (previous theme stays until respring)\n",
+               bundle ?: "?");
+        return false;
+    }
     static const char *imageSels[] = {
         "makeIconImageWithInfo:traitCollection:context:options:",
         "iconImageWithInfo:traitCollection:context:options:",
