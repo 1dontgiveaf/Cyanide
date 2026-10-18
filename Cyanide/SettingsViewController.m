@@ -2814,13 +2814,18 @@ static UIBackgroundTaskIdentifier settings_safe_detach_begin(const char *reason)
                "runs without an extended window\n", reason ?: "backgrounding");
         return UIBackgroundTaskInvalid;
     }
+    BOOL stillLive = NO;
     @synchronized (settings_bg_lock()) {
         [settings_safe_detach_live_tasks() addObject:@(task)];
         g_safe_detach_task = task;
         __sync_add_and_fetch(&g_safe_detach_in_flight, 1);
+        // Re-check under the same lock: the expiration handler may have run
+        // between publication and this point, seen the task and ended it. Do
+        // not hand back an assertion that no longer exists.
+        stillLive = [settings_safe_detach_live_tasks() containsObject:@(task)];
     }
-    if (expiredBeforeRegistered) {
-        settings_safe_detach_end_task(task);
+    if (!stillLive || expiredBeforeRegistered) {
+        settings_safe_detach_end_task(task);   // no-op if the handler won
         printf("[SETTINGS] safe-detach: task %lu expired during registration; "
                "ended without a drain window\n", (unsigned long)task);
         return UIBackgroundTaskInvalid;
