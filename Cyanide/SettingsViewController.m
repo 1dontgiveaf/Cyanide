@@ -799,6 +799,7 @@ static NSString * const kSettingsSpringBoardRestartedNotification = @"CYSpringBo
 @property (nonatomic, strong) id restartObserver;
 @property (nonatomic, strong) WKWebView *webView;
 @property (nonatomic, assign) BOOL didLoadPayload;
+@property (nonatomic, assign) BOOL didLoadWebKitFallback;
 @end
 
 @implementation DSRespringOverlayView
@@ -872,8 +873,12 @@ static NSString * const kSettingsSpringBoardRestartedNotification = @"CYSpringBo
     self.didLoadPayload = YES;
     if (self.direct) {
         printf("[RESPRING] waiting for SpringBoard to restart\n");
-        // Cyanide usually survives this respring: take the cover away once
-        // SpringBoard is back, or after a while if that isn't noticed.
+        // The direct request may have been scheduled, may be late, or its reply
+        // may have been lost (ASRemovalUnknown is treated as scheduled because
+        // the timer may exist). Keep a real fallback: if SpringBoard has not
+        // restarted a few seconds after the scheduled time, load the WebKit
+        // payload instead of leaving the user with a cover that silently
+        // disappears without a respring.
         __weak typeof(self) weakSelf = self;
         id observer = [NSNotificationCenter.defaultCenter
             addObserverForName:kSettingsSpringBoardRestartedNotification object:nil
@@ -882,9 +887,17 @@ static NSString * const kSettingsSpringBoardRestartedNotification = @"CYSpringBo
             [weakSelf removeFromSuperview];
         }];
         self.restartObserver = observer;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (!weakSelf.superview || weakSelf.webView) return;
+            printf("[RESPRING] no SpringBoard restart seen 6 s after the request; "
+                   "using the WebKit fallback\n");
+            for (UIView *v in weakSelf.subviews)
+                if ([v isKindOfClass:UIActivityIndicatorView.class]) [v removeFromSuperview];
+            [weakSelf loadWebKitFallback];
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             if (!weakSelf.superview) return;
-            printf("[RESPRING] no SpringBoard restart seen after 15 s; removing the respring cover\n");
+            printf("[RESPRING] no SpringBoard restart seen after 20 s; removing the respring cover\n");
             [weakSelf removeFromSuperview];
         });
         UIActivityIndicatorView *spinner =
@@ -897,6 +910,14 @@ static NSString * const kSettingsSpringBoardRestartedNotification = @"CYSpringBo
         [self addSubview:spinner];
         return;
     }
+    [self loadWebKitFallback];
+}
+
+// The forced-respring payload. Also armed from direct mode when SpringBoard
+// does not come back in time.
+- (void)loadWebKitFallback {
+    if (self.didLoadWebKitFallback || self.webView) return;
+    self.didLoadWebKitFallback = YES;
     printf("[RESPRING] loading Lara-style in-app WebKit overlay\n");
 
     // Mirrors Lara's respringview verbatim: default-init WKWebView, the
@@ -3673,9 +3694,19 @@ static void settings_prepare_for_respring_sync(void)
             // relaunch fires: then the WebKit fallback below instead.
             if (!loopsStopped) {
                 log_user("[RESPRING] A live tweak loop didn't stop in time; using the fallback respring.\n");
-            } else if (respring_schedule_in_session(kRespringDelay) != ASRemovalNotScheduled) {
-                g_respring_scheduled = 1;
-                scheduledNs = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+            } else {
+                ASRemovalResult sched = respring_schedule_in_session(kRespringDelay);
+                if (sched != ASRemovalNotScheduled) {
+                    g_respring_scheduled = 1;
+                    scheduledNs = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+                    if (sched == ASRemovalUnknown) {
+                        // The timer may exist, so do not force a second respring
+                        // now; the overlay's WebKit fallback covers the case
+                        // where the request never actually reached SpringBoard.
+                        log_user("[RESPRING] The relaunch request's result was lost; "
+                                 "if SpringBoard does not restart, the fallback will.\n");
+                    }
+                }
             }
             settings_destroy_springboard_remote_call_locked("pre-respring cleanup");
         }
