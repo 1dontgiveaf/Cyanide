@@ -4775,6 +4775,13 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
         printf("[RemoteCall] INIT WATCHDOG: init returned (rc=%d) after the "
                "watchdog declared it wedged — the watchdog's abort stands; "
                "not publishing this session\n", rc);
+        // A successful init built a full session (responder, parked threads,
+        // our exception ports in the target). Every caller treats -1 as
+        // "nothing to destroy", and the wedge latch blocks every later init
+        // (so no landmine sweep), so tear it down here, exactly as a late init
+        // failure does. The watchdog already claimed the exc-guard ref; the
+        // destroy does not release it twice.
+        if (rc == 0) destroy_remote_call_internal();
         rc = -1;
     }
     // F-01: retire the generation under the watchdog's snapshot mutex — after
