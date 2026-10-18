@@ -440,10 +440,21 @@ static BOOL PackageShouldAutoQueueForApply(Package *package)
         settings_run_pending_actions();
         return;
     }
-    NSDictionary *userInfo = allApplied ? nil : @{
-        kSettingsActionsDidCompleteSuccessKey: @NO,
-        kSettingsActionsDidCompleteMessageKey: @"Some packages failed to apply — check the log above.",
-    };
+    // A NanoRegistry/heavy package can fail its ancillary step without
+    // starting a run. Consume the preflight note here so it cannot surface in
+    // an unrelated later run (review R-06).
+    NSString *preflight = settings_take_run_preflight_failure();
+    NSMutableDictionary *info = [NSMutableDictionary dictionary];
+    if (!allApplied) {
+        info[kSettingsActionsDidCompleteSuccessKey] = @NO;
+        info[kSettingsActionsDidCompleteMessageKey] =
+            @"Some packages failed to apply — check the log above.";
+    } else if (preflight.length > 0) {
+        info[kSettingsActionsDidCompleteSuccessKey] = @YES;
+        info[kSettingsActionsDidCompletePartialKey] = @YES;
+        info[kSettingsActionsDidCompleteMessageKey] = preflight;
+    }
+    NSDictionary *userInfo = info.count ? [info copy] : nil;
     dispatch_async(dispatch_get_main_queue(), ^{
         [[NSNotificationCenter defaultCenter]
             postNotificationName:kSettingsActionsDidCompleteNotification

@@ -239,6 +239,8 @@ void settings_run_pending_actions(void);
 // before the run started) to be folded into the next run's completion, so a
 // failed install can't end with the progress screen showing "Done".
 void settings_note_run_preflight_failure(NSString *message);
+// Consume the pending pre-run failure message exactly once (installer path).
+NSString * _Nullable settings_take_run_preflight_failure(void);
 void settings_destroy_springboard_remote_call(void);
 void settings_destroy_springboard_remote_call_sync(void);
 void settings_best_effort_termination_cleanup(const char *reason);
