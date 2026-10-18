@@ -767,6 +767,15 @@ typedef struct RemoteCallState {
     // Review F-25: identity of the target process INCARNATION this session
     // talks to (see remote_call_current_process_generation). 0 = no session.
     uint64_t processGeneration;
+    // Review F-02: this state's reference on the per-task task_exc_guard
+    // registry (rc_excguard_*). Set when init took a ref; claimed with
+    // atomic_exchange by whoever releases it (teardown OR the init watchdog),
+    // so the ref is released exactly once. excGuardTask/excGuardId identify
+    // the registry entry (the task we actually patched, not g_RC_taskAddr at
+    // release time).
+    _Atomic bool excGuardHeld;
+    uint64_t excGuardTask;
+    uint64_t excGuardId;
 } RemoteCallState;
 
 static RemoteCallState g_RC_defaultState = { .success = true, .stableExceptionTimeoutFloorMS = 10000 };
@@ -876,20 +885,134 @@ bool rc_session_pac_keys(uint64_t *outA, uint64_t *outB)
 // launchd-wedge shape). Call ONLY after every injected thread is un-armed
 // (restoring FATAL/CORPSE while a thread still carries our AST_GUARD arming
 // would kill the remote task on its next guarded-port touch — the very thing
-// disable protects against). One-shot: the saved flag is consumed.
-static bool g_RC_taskExcGuardSaved = false;
-static uint32_t g_RC_taskExcGuardOrig = 0;
+// disable protects against).
+//
+// Review F-02: the saved flags used to be ONE process-global slot while the
+// patched task is per session. A SpringBoard session and the launchd fastkill
+// session (or a default-state launchd init overlapping a warm launchd
+// session on the SAME task) overwrote each other's "original" — a second
+// session on an already-patched task even recorded DELIVER as the original —
+// and the first teardown consumed the slot, so launchd kept DELIVER. Now a
+// small per-task refcounted registry: the FIRST session on a task saves the
+// real original; later sessions on that task only take a ref (never
+// re-saving patched flags as "original"); the original is written back only
+// when the LAST ref drops, i.e. after every session on that task has
+// un-armed and drained. Fail-closed rule: a leaked ref leaves DELIVER until
+// app death (the pre-registry failure mode), never anything worse.
+#define RC_EXCGUARD_MAX 8
+typedef struct {
+    uint64_t taskAddr;     // 0 = free slot
+    uint32_t pid;          // incarnation check against task-address reuse
+    uint32_t origFlags;
+    uint32_t refs;
+    uint64_t id;           // never reused; a release names the entry it holds
+} RcExcGuardEntry;
+static RcExcGuardEntry g_rc_excguard[RC_EXCGUARD_MAX];
+static uint64_t g_rc_excguard_next_id = 0;
+static pthread_mutex_t g_rc_excguard_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static void rc_restore_task_exc_guard(const char *where)
+// Init side: patch (first session) or join (later sessions) the task's
+// task_exc_guard and record this state's ref. 0 = ref taken and DELIVER
+// verified; -1 = nothing taken (the caller fails init exactly as before).
+static int rc_excguard_acquire(RemoteCallState *st, uint64_t task, uint32_t pid,
+                               const char *process)
 {
-    if (!g_RC_taskExcGuardSaved) return;
-    g_RC_taskExcGuardSaved = false;   // consume: never restore twice
-    if (!g_RC_taskAddr || !is_kaddr_valid(g_RC_taskAddr)) {
-        printf("[RC] task_exc_guard restore skipped (%s): no valid target task\n",
-               where);
+    if (atomic_load_explicit(&st->excGuardHeld, memory_order_acquire)) {
+        // A previous init on this state never released its ref (no teardown
+        // ran). Its threads may still be armed, so restoring is NOT safe:
+        // leak it (that task keeps DELIVER until app death — the old
+        // failure mode) and track only the new ref from here on.
+        printf("[RC] task_exc_guard: stale ref from a previous init on this "
+               "state (task=%#llx id=%llu) — leaked, not restored\n",
+               st->excGuardTask, st->excGuardId);
+        atomic_store_explicit(&st->excGuardHeld, false, memory_order_release);
+    }
+    int ret = -1;
+    pthread_mutex_lock(&g_rc_excguard_mutex);
+    int slot = -1, freeSlot = -1;
+    for (int i = 0; i < RC_EXCGUARD_MAX; i++) {
+        if (g_rc_excguard[i].taskAddr == task && g_rc_excguard[i].refs > 0) {
+            slot = i;
+        } else if (!g_rc_excguard[i].taskAddr && freeSlot < 0) {
+            freeSlot = i;
+        }
+    }
+    if (slot >= 0 && g_rc_excguard[slot].pid != pid) {
+        // Same task address, different process: the recorded task died and
+        // its address was reused. Its "original" belongs to a dead task —
+        // never write it into this one. Replace the entry (fresh id); the
+        // old holders' releases then match nothing and restore nothing.
+        printf("[RC] task_exc_guard: registry entry task=%#llx pid=%u is stale "
+               "(now pid=%u) — replacing, old refs=%u orphaned\n",
+               task, g_rc_excguard[slot].pid, pid, g_rc_excguard[slot].refs);
+        freeSlot = slot;
+        slot = -1;
+    }
+    if (slot >= 0) {
+        // Already patched by a live session: re-assert DELIVER (idempotent,
+        // the same verified write every init did before) but keep the entry's
+        // REAL original — the value read now is our own patch.
+        uint32_t ignored = 0;
+        if (disable_excguard_kill_save(task, &ignored) == 0) {
+            g_rc_excguard[slot].refs++;
+            st->excGuardTask = task;
+            st->excGuardId = g_rc_excguard[slot].id;
+            atomic_store_explicit(&st->excGuardHeld, true, memory_order_release);
+            printf("[RC] task_exc_guard: %s task=%#llx already patched — "
+                   "joined (refs=%u, original %#x kept)\n", process ?: "?",
+                   task, g_rc_excguard[slot].refs, g_rc_excguard[slot].origFlags);
+            ret = 0;
+        }
+    } else if (freeSlot < 0) {
+        // Fail closed BEFORE patching: with no slot the original could not
+        // be restored later.
+        printf("[RC] task_exc_guard: registry full (%d tasks) — refusing to "
+               "patch %s task=%#llx\n", RC_EXCGUARD_MAX, process ?: "?", task);
+    } else {
+        uint32_t orig = 0;
+        if (disable_excguard_kill_save(task, &orig) == 0) {
+            g_rc_excguard[freeSlot].taskAddr = task;
+            g_rc_excguard[freeSlot].pid = pid;
+            g_rc_excguard[freeSlot].origFlags = orig;
+            g_rc_excguard[freeSlot].refs = 1;
+            g_rc_excguard[freeSlot].id = ++g_rc_excguard_next_id;
+            st->excGuardTask = task;
+            st->excGuardId = g_rc_excguard[freeSlot].id;
+            atomic_store_explicit(&st->excGuardHeld, true, memory_order_release);
+            ret = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_rc_excguard_mutex);
+    return ret;
+}
+
+// Drop one ref on registry entry `id` (task `task`). The CALLER has already
+// claimed the ref (atomic_exchange on excGuardHeld), so this runs once per
+// ref. Restores the original flags only when the last ref drops.
+static void rc_excguard_release(uint64_t task, uint64_t id, const char *where)
+{
+    // Validate BEFORE touching the registry: a release that cannot restore
+    // must not consume the entry another session still relies on.
+    if (!task || !is_kaddr_valid(task)) {
+        printf("[RC] task_exc_guard restore skipped (%s): no valid target task "
+               "(%#llx) — entry kept (task keeps DELIVER until app death)\n",
+               where, task);
         return;
     }
-    if (!kexploit_krw_ready()) {
+    bool krwLive = kexploit_krw_ready();
+    pthread_mutex_lock(&g_rc_excguard_mutex);
+    int slot = -1;
+    for (int i = 0; i < RC_EXCGUARD_MAX; i++) {
+        if (g_rc_excguard[i].taskAddr && g_rc_excguard[i].id == id) { slot = i; break; }
+    }
+    if (slot < 0 || g_rc_excguard[slot].taskAddr != task) {
+        pthread_mutex_unlock(&g_rc_excguard_mutex);
+        printf("[RC] task_exc_guard restore skipped (%s): registry entry "
+               "id=%llu for task=%#llx is gone (dropped or replaced) — nothing "
+               "to restore\n", where, id, task);
+        return;
+    }
+    if (!krwLive) {
         // KRW is gone (the abandon path): nothing left to write the flags back
         // WITH. Name the residual risk so the next panic log can attribute it.
         // Round 25 (B): this is the last link of the initproc-panic chain —
@@ -897,6 +1020,10 @@ static void rc_restore_task_exc_guard(const char *where)
         // a later guard violation there wedges on dead ports ~22 s after app
         // death. Surface it in the USER log (it survives in the UI / exported
         // log even when the live printf stream is lost with the process).
+        // F-02: drop the entry — its original can never be written with this
+        // KRW, and other holders' releases then match nothing.
+        memset(&g_rc_excguard[slot], 0, sizeof(g_rc_excguard[slot]));
+        pthread_mutex_unlock(&g_rc_excguard_mutex);
         printf("[RC] CRITICAL: task_exc_guard restore IMPOSSIBLE (%s): KRW dead — remote "
                "task keeps EXC_GUARD-DELIVER; a future guard violation there "
                "may wedge on our dead ports\n", where);
@@ -905,10 +1032,34 @@ static void rc_restore_task_exc_guard(const char *where)
                  "initproc-exit risk\n", where);
         return;
     }
-    if (restore_excguard_kill(g_RC_taskAddr, g_RC_taskExcGuardOrig) != 0) {
+    if (g_rc_excguard[slot].refs > 1) {
+        g_rc_excguard[slot].refs--;
+        printf("[RC] task_exc_guard (%s): task=%#llx still held by %u other "
+               "session(s) — DELIVER kept, original restored by the last one\n",
+               where, task, g_rc_excguard[slot].refs);
+        pthread_mutex_unlock(&g_rc_excguard_mutex);
+        return;
+    }
+    uint32_t orig = g_rc_excguard[slot].origFlags;
+    memset(&g_rc_excguard[slot], 0, sizeof(g_rc_excguard[slot]));
+    if (restore_excguard_kill(task, orig) != 0) {
         printf("[RC] task_exc_guard restore FAILED (%s) — residual launchd "
                "wedge risk on future guard violations\n", where);
     }
+    pthread_mutex_unlock(&g_rc_excguard_mutex);
+}
+
+// Claim `st`'s ref (exactly once across teardown / watchdog) and release it.
+static void rc_restore_task_exc_guard_state(RemoteCallState *st, const char *where)
+{
+    if (!st || !atomic_exchange_explicit(&st->excGuardHeld, false, memory_order_acq_rel))
+        return;
+    rc_excguard_release(st->excGuardTask, st->excGuardId, where);
+}
+
+static void rc_restore_task_exc_guard(const char *where)
+{
+    rc_restore_task_exc_guard_state(remote_call_current_state(), where);
 }
 
 static void remote_call_note_init_failure(RemoteCallInitFailure failure, uint32_t pid)
@@ -2771,16 +2922,49 @@ static bool rc_live_parked_contains(uint64_t thread)
     return known;
 }
 
-// Is the synthetic call thread gone? thread_get_task is ksafe-gated and
-// returns 0 for a dead/freed thread slot; a task mismatch means the slot died
-// (same round-8 test the tro-dance uses).
+// Is the synthetic call thread gone? Same walk as thread_get_task (ksafe map
+// gate = dead/freed thread slot; a task mismatch means the slot died — the
+// round-8 test the tro-dance uses), but TRI-STATE.
+// Review F-09: KRW reads fail safe by zero-filling, and a zero-filled owner
+// (0 != taskAddr) used to read as "gone" — destroy then logged "exit
+// CONFIRMED" and unregistered a thread that was still parked at a sentinel.
+// A read that did not really happen (KRW down/detached, or a per-call read
+// failure) is now UNKNOWN, which every caller treats as NOT gone.
+typedef enum {
+    RC_SYNTH_ALIVE = 0,
+    RC_SYNTH_GONE,
+    RC_SYNTH_UNKNOWN,
+} RcSyntheticThreadState;
+
+static RcSyntheticThreadState rc_synthetic_thread_state(void)
+{
+    uint64_t thread = g_RC_callThreadAddr;
+    if (!thread) return RC_SYNTH_GONE;
+    if (!kexploit_krw_peek_live()) return RC_SYNTH_UNKNOWN;
+    if (!is_kaddr_valid(thread)) return RC_SYNTH_GONE;
+    if (ksafe_available() && !kaddr_is_mapped(thread, off_thread_t_tro + 8))
+        return RC_SYNTH_GONE;
+    RcSyntheticThreadState result = RC_SYNTH_UNKNOWN;
+    krw_set_nonfatal(true);
+    uint64_t tro = 0, owner = 0;
+    if (early_kread_checked(thread + off_thread_t_tro, &tro, sizeof(tro))) {
+        if (!is_kaddr_valid(tro)) {
+            result = RC_SYNTH_GONE;
+        } else if (ksafe_available() &&
+                   !kaddr_is_mapped(tro, off_thread_ro_tro_task + 8)) {
+            result = RC_SYNTH_GONE;
+        } else if (early_kread_checked(tro + off_thread_ro_tro_task,
+                                       &owner, sizeof(owner))) {
+            result = owner == g_RC_taskAddr ? RC_SYNTH_ALIVE : RC_SYNTH_GONE;
+        }
+    }
+    krw_set_nonfatal(false);
+    return result;
+}
+
 static bool rc_synthetic_thread_gone(void)
 {
-    if (!g_RC_callThreadAddr) return true;
-    krw_set_nonfatal(true);
-    uint64_t owner = thread_get_task(g_RC_callThreadAddr);
-    krw_set_nonfatal(false);
-    return owner != g_RC_taskAddr;
+    return rc_synthetic_thread_state() == RC_SYNTH_GONE;
 }
 
 // One exit-dispatch attempt: consume the synthetic thread's park trap on the
@@ -2829,6 +3013,9 @@ static bool rc_exit_synthetic_confirmed(const char *where)
     uint64_t exitAddr  = (uint64_t)dlsym(RTLD_DEFAULT, "pthread_exit");
     uint64_t pauseAddr = (uint64_t)dlsym(RTLD_DEFAULT, "pause");
 
+    // F-09: rc_synthetic_thread_gone() is true only for a VERIFIED death; an
+    // unverifiable state (KRW down / read failed) counts as still parked, so
+    // it is never logged CONFIRMED nor unregistered here.
     for (int attempt = 0; attempt < 3; attempt++) {
         if (rc_synthetic_thread_gone())
             break;
@@ -3275,7 +3462,12 @@ int destroy_remote_call_internal(void) {
         printf("[RC] round24: synthetic call thread ORPHANED by a mid-init "
                "temp-fallback (suspended, never resumed) — terminating it via "
                "the temp channel before the trojan restore\n");
-        for (int attempt = 0; attempt < 3 && !rc_synthetic_thread_gone(); attempt++) {
+        // F-09: terminate only a thread positively verified ALIVE in the
+        // target — an UNKNOWN (unverifiable) state sends nothing new and is
+        // reported as unconfirmed below.
+        for (int attempt = 0;
+             attempt < 3 && rc_synthetic_thread_state() == RC_SYNTH_ALIVE;
+             attempt++) {
             do_remote_call_temp(200, "thread_terminate", g_RC_callThreadPort,
                                 0, 0, 0, 0, 0, 0, 0);
             usleep(50000);
@@ -3793,6 +3985,19 @@ static void rc_restore_trapped_thread_for_abort(mach_port_t port, int trapStage,
 
 static _Atomic uint64_t g_rc_init_watchdog_gen = 0;
 static _Atomic bool g_rc_init_wedged = false;
+// Review F-01: the watchdog is a fresh pthread with no pushed RemoteCallState,
+// so the g_RC_* macros there resolved to g_RC_defaultState — it drained
+// SpringBoard's ports / restored SpringBoard's flags while a wedged
+// RemoteCallSession (launchd fastkill) init went unrepaired. It now gets the
+// watched init's state pointer and snapshots what it needs BY VALUE under this
+// mutex, after re-checking the generation; init_remote_call retires the
+// generation under the same mutex, so once init has returned (and the session
+// object may be freed) the watchdog can never dereference the state.
+static pthread_mutex_t g_rc_init_watchdog_mutex = PTHREAD_MUTEX_INITIALIZER;
+typedef struct {
+    uint64_t gen;
+    RemoteCallState *st;
+} RcInitWatchdogArg;
 
 bool remote_call_init_wedged(void) {
     return atomic_load_explicit(&g_rc_init_wedged, memory_order_acquire);
@@ -3898,26 +4103,48 @@ static void rc_autopsy_task_threads(const char *label, uint64_t taskAddr)
     }
 }
 
-static void rc_wedge_autopsy(void)
+static void rc_wedge_autopsy(uint64_t targetTaskAddr)
 {
     printf("[AUTOPSY] wedge autopsy: dumping threads on both sides of the "
            "hijack (target = the 'Found <name> in kernel' line above)\n");
     rc_autopsy_task_threads("self", task_self());
-    rc_autopsy_task_threads("target", g_RC_taskAddr);
+    rc_autopsy_task_threads("target", targetTaskAddr);
     log_session_flush();
     printf("[AUTOPSY] wedge autopsy done\n");
 }
 
 static void *rc_init_watchdog_main(void *arg) {
-    uint64_t gen = (uint64_t)(uintptr_t)arg;
+    RcInitWatchdogArg wdArg = *(RcInitWatchdogArg *)arg;
+    free(arg);
+    uint64_t gen = wdArg.gen;
     for (int i = 0; i < RC_INIT_WATCHDOG_SECONDS; i++) {
         sleep(1);
         if (atomic_load_explicit(&g_rc_init_watchdog_gen, memory_order_acquire) != gen)
             return NULL;   // init returned (any result) — healthy, nothing to do
     }
-    // Latch FIRST: every later init refuses fast (the wedged thread may hold
-    // the init mutex forever) and the UI can offer a guided restart.
+    // F-01: snapshot the WATCHED init's state by value, under the mutex that
+    // init_remote_call retires the generation with — past this block the
+    // state pointer is never touched again (the session object owning it may
+    // be freed as soon as init returns). The task_exc_guard ref is claimed
+    // here too (atomic, exactly once vs a racing teardown).
+    pthread_mutex_lock(&g_rc_init_watchdog_mutex);
+    if (atomic_load_explicit(&g_rc_init_watchdog_gen, memory_order_acquire) != gen) {
+        pthread_mutex_unlock(&g_rc_init_watchdog_mutex);
+        return NULL;   // init returned while we were waking — healthy
+    }
+    RemoteCallState *st = wdArg.st;
+    mach_port_t wdFirstPort = st ? st->firstExceptionPort : MACH_PORT_NULL;
+    mach_port_t wdSecondPort = st ? st->secondExceptionPort : MACH_PORT_NULL;
+    uint64_t wdTaskAddr = st ? st->taskAddr : 0;
+    bool wdGuardHeld = st && atomic_exchange_explicit(&st->excGuardHeld, false,
+                                                      memory_order_acq_rel);
+    uint64_t wdGuardTask = wdGuardHeld ? st->excGuardTask : 0;
+    uint64_t wdGuardId = wdGuardHeld ? st->excGuardId : 0;
+    // Latch FIRST (before any repair): every later init refuses fast (the
+    // wedged thread may hold the init mutex forever) and the UI can offer a
+    // guided restart.
     atomic_store_explicit(&g_rc_init_wedged, true, memory_order_release);
+    pthread_mutex_unlock(&g_rc_init_watchdog_mutex);
     printf("[RemoteCall] INIT WATCHDOG: no init completion in %d s — init thread "
            "wedged (TH_UNINT); external abort: un-arm + drain + guard restore\n",
            RC_INIT_WATCHDOG_SECONDS);
@@ -3933,8 +4160,7 @@ static void *rc_init_watchdog_main(void *arg) {
     // 1+2: stop latch + un-arm snapshot (request_stop does both), then drain.
     remote_call_request_stop("init watchdog timeout");
     for (int portIdx = 0; portIdx < 2; portIdx++) {
-        mach_port_t port = portIdx == 0 ? g_RC_firstExceptionPort
-                                        : g_RC_secondExceptionPort;
+        mach_port_t port = portIdx == 0 ? wdFirstPort : wdSecondPort;
         if (!MACH_PORT_VALID(port)) continue;
         for (int i = 0; i < 16; i++) {
             ExceptionMessage msg;
@@ -3963,14 +4189,16 @@ static void *rc_init_watchdog_main(void *arg) {
         }
     }
 
-    // 3: task_exc_guard flags back (no-op if a racing teardown already did it).
-    rc_restore_task_exc_guard("init-watchdog");
+    // 3: task_exc_guard flags back (no-op if a racing teardown already did it:
+    // the ref was claimed above, so exactly one of us releases it).
+    if (wdGuardHeld)
+        rc_excguard_release(wdGuardTask, wdGuardId, "init-watchdog");
 
     // 3b: forensic autopsy — the wedged thread is frozen mid-deadlock and KRW
     // is live; dump both tasks' thread stacks (read-only) so the chain log
     // shows exactly which lock the wedge dies holding. Runs regardless of the
     // controlled-panic option; the flush makes it survive the reset.
-    rc_wedge_autopsy();
+    rc_wedge_autopsy(wdTaskAddr);
 
     // 4 (Launch Option, off by default): the wedge has already doomed this
     // boot — trade the logless ~93 s watchdog freeze for an instant reset
@@ -4080,17 +4308,28 @@ int init_remote_call(const char* process, bool useMigFilterBypass) {
     // spawn one). Retired by bumping the generation the moment init returns.
     uint64_t wdGen = atomic_fetch_add_explicit(&g_rc_init_watchdog_gen, 1,
                                                memory_order_acq_rel) + 1;
+    // F-01: hand the watchdog THIS init's state (the session object's _state
+    // is pushed only on this thread), not just the generation.
+    RcInitWatchdogArg *wdArg = malloc(sizeof(*wdArg));
     pthread_t wdThread;
-    if (pthread_create(&wdThread, NULL, rc_init_watchdog_main,
-                       (void *)(uintptr_t)wdGen) == 0) {
+    if (wdArg) {
+        wdArg->gen = wdGen;
+        wdArg->st = remote_call_current_state();
+    }
+    if (wdArg && pthread_create(&wdThread, NULL, rc_init_watchdog_main, wdArg) == 0) {
         pthread_detach(wdThread);
     } else {
+        free(wdArg);
         printf("[RemoteCall] INIT WATCHDOG: pthread_create failed — init runs "
                "WITHOUT the external abort net\n");
     }
     g_RC_processGeneration = 0;
     int rc = init_remote_call_internal(process, useMigFilterBypass);
+    // F-01: retire the generation under the watchdog's snapshot mutex — after
+    // this the watchdog cannot be (or start) reading this state.
+    pthread_mutex_lock(&g_rc_init_watchdog_mutex);
     atomic_fetch_add_explicit(&g_rc_init_watchdog_gen, 1, memory_order_acq_rel);
+    pthread_mutex_unlock(&g_rc_init_watchdog_mutex);
     if (rc == 0) {
         g_RC_processGeneration = rc_process_generation_for(g_RC_pid, g_RC_taskAddr);
         // Round 22: reap dead sessions' leaked sentinel-parked threads
@@ -4221,8 +4460,9 @@ static int init_remote_call_internal(const char* process, bool useMigFilterBypas
     // Round 21 (T3): save the original task_exc_guard flags; EVERY teardown
     // path (destroy / abandon / init-failure) restores them — see
     // rc_restore_task_exc_guard.
-    uint32_t origExcGuard = 0;
-    if (disable_excguard_kill_save(g_RC_taskAddr, &origExcGuard) != 0) {
+    // Review F-02: per-task refcounted save (rc_excguard_acquire).
+    if (rc_excguard_acquire(remote_call_current_state(), g_RC_taskAddr,
+                            targetPid, process) != 0) {
         printf("[%s:%d] failed to prepare task_exc_guard for %s task=%#llx\n",
                __FUNCTION__, __LINE__, process, g_RC_taskAddr);
         destroy_exception_port(firstExceptionPort);
@@ -4230,8 +4470,6 @@ static int init_remote_call_internal(const char* process, bool useMigFilterBypas
         remote_call_note_init_failure(RemoteCallInitFailureTaskGuard, targetPid);
         return -1;
     }
-    g_RC_taskExcGuardOrig = origExcGuard;
-    g_RC_taskExcGuardSaved = true;
 
     mach_exception_code_t guardCode = 0;
     EXC_GUARD_ENCODE_TYPE(guardCode, GUARD_TYPE_MACH_PORT);

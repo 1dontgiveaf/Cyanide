@@ -18,4 +18,6 @@ bool clear_guard_exception(uint64_t thread);
 bool thread_get_state_wrapper(mach_port_t machThread, arm_thread_state64_internal *outState);
 bool thread_set_state_wrapper(mach_port_t machThread, uint64_t threadAddr, arm_thread_state64_internal *state);
 bool thread_resume_wrapper(mach_port_t machThread);
-void thread_set_pac_keys(uint64_t threadAddr, uint64_t keyA, uint64_t keyB);
+// Installs the signing keys and reads both back (F-10). false = a write did
+// not land (or could not be verified): do not resume the thread to sign.
+bool thread_set_pac_keys(uint64_t threadAddr, uint64_t keyA, uint64_t keyB);

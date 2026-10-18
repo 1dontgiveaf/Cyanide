@@ -210,8 +210,27 @@ bool thread_resume_wrapper(mach_port_t machThread)
     return true;
 }
 
-void thread_set_pac_keys(uint64_t threadAddr, uint64_t keyA, uint64_t keyB)
+// F-10: kwrite64 is fail-safe (a skipped write is silent), and a skipped key
+// write means the gadget signs with the thread's PREVIOUS keys — a bad
+// signature that would be replied into launchd/SpringBoard. Read both words
+// back with the per-call checked read and require an exact match; false =
+// do not use this thread to sign.
+bool thread_set_pac_keys(uint64_t threadAddr, uint64_t keyA, uint64_t keyB)
 {
     kwrite64(threadAddr + off_thread_machine_rop_pid, keyA);
     kwrite64(threadAddr + off_thread_machine_jop_pid, keyB);
+    uint64_t gotA = 0, gotB = 0;
+    if (!early_kread_checked(threadAddr + off_thread_machine_rop_pid, &gotA, sizeof(gotA)) ||
+        !early_kread_checked(threadAddr + off_thread_machine_jop_pid, &gotB, sizeof(gotB))) {
+        printf("[%s:%d] key read-back failed (thread 0x%llx)\n",
+               __FUNCTION__, __LINE__, threadAddr);
+        return false;
+    }
+    if (gotA != keyA || gotB != keyB) {
+        printf("[%s:%d] key read-back mismatch (thread 0x%llx): A %s, B %s\n",
+               __FUNCTION__, __LINE__, threadAddr,
+               gotA == keyA ? "ok" : "MISMATCH", gotB == keyB ? "ok" : "MISMATCH");
+        return false;
+    }
+    return true;
 }

@@ -305,7 +305,14 @@ static uint64_t remote_pac_oneshot(uint64_t address, uint64_t modifier,
         krw_set_nonfatal(false);
         return -1;
     }
-    thread_set_pac_keys(pacThreadAddr, keyA, keyB);
+    if (!thread_set_pac_keys(pacThreadAddr, keyA, keyB)) {
+        // F-10: never sign with unverified keys — the result would be a bad
+        // signature sent into the target.
+        printf("[PAC] oneshot: thread_set_pac_keys not verified — not signing\n");
+        pac_cleanup(pacThread, exceptionPort, stack);
+        krw_set_nonfatal(false);
+        return -1;
+    }
     kr = thread_resume(pacThread);
     if (kr != KERN_SUCCESS) {
         printf("[PAC] oneshot: thread_resume failed: 0x%x (%s)\n", kr, mach_error_string(kr));
@@ -369,7 +376,12 @@ static uint64_t pac_sign_cached(uint64_t address, uint64_t modifier,
         pac_sign_context_destroy();
         return -1;
     }
-    thread_set_pac_keys(g_pacSignThreadAddr, keyA, keyB);
+    if (!thread_set_pac_keys(g_pacSignThreadAddr, keyA, keyB)) {
+        // F-10: unverified keys = possibly the previous target's keys.
+        printf("[PAC] cached sign: thread_set_pac_keys not verified — destroying\n");
+        pac_sign_context_destroy();
+        return -1;
+    }
     kern_return_t kr = thread_resume(g_pacSignThread);
     if (kr != KERN_SUCCESS) {
         printf("[PAC] cached sign: thread_resume failed: 0x%x (%s)\n",
