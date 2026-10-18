@@ -739,11 +739,13 @@ bool launchd_disabled_apply(NSDictionary<NSString *, NSNumber *> *changes)
         printf("[DAEMONS] refusing plist edit: KRW is not active/recovered\n");
         return false;
     }
+    BOOL enablesOTA = NO;
     for (NSString *label in changes) {
         if (!daemon_catalog_contains_label(label) || ![changes[label] isKindOfClass:NSNumber.class]) {
             printf("[DAEMONS] refusing plist edit: %s is not in the catalog\n", label.description.UTF8String);
             return false;
         }
+        if (!changes[label].boolValue && [ota_daemon_labels() containsObject:label]) enablesOTA = YES;
     }
     int (^mutate)(NSMutableDictionary *) = ^int(NSMutableDictionary *plist) {
         int changed = 0;
@@ -768,9 +770,13 @@ bool launchd_disabled_apply(NSDictionary<NSString *, NSNumber *> *changes)
         NSString *tempPath = [dirPath stringByAppendingPathComponent:@(kOTAPlistTempFileName)];
         NSMutableDictionary *plist = ota_read_disabled_plist_strict(plistPath);
         if (!plist) return false;
-        if (mutate(plist) == 0) return true;
+        if (mutate(plist) == 0) {
+            if (enablesOTA) (void)ota_enable_cleanup_best_effort();
+            return true;
+        }
         bool ok = ota_write_disabled_plist(plist, plistPath, tempPath, dirPath);
         printf("[DAEMONS] local disabled.plist write result=%d\n", ok);
+        if (ok && enablesOTA) (void)ota_enable_cleanup_best_effort();
         return ok;
     }
 
@@ -786,6 +792,7 @@ bool launchd_disabled_apply(NSDictionary<NSString *, NSNumber *> *changes)
                         ota_write_disabled_plist(plist, plistPath, tempPath, redir.localDir));
     if (!ota_end_launchd_dir_redirect(&redir)) ok = false;
     printf("[DAEMONS] redirected disabled.plist write result=%d\n", ok);
+    if (ok && enablesOTA) (void)ota_enable_cleanup_best_effort();
     return ok;
 }
 
