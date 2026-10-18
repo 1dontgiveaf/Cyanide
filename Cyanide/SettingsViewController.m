@@ -12437,12 +12437,15 @@ static BOOL settings_debug_launchd_spawn(NSString *exePath,
                                          NSString *outPath,
                                          NSString **messageOut)
 {
-    if (exePath.length == 0 ||
-        ![[NSFileManager defaultManager] isExecutableFileAtPath:exePath]) {
-        if (messageOut) *messageOut = [NSString stringWithFormat:
-            @"Executable not found: %@", exePath ?: @"(nil)"];
+    if (exePath.length == 0) {
+        if (messageOut) *messageOut = @"No executable path was built.";
         return NO;
     }
+    // Do NOT preflight with isExecutableFileAtPath: the app sandbox may deny
+    // access(X_OK) on the app's own bundle even though launchd can exec it
+    // (this check broke the previously working self proof). Let posix_spawn
+    // return the authoritative result; a missing helper will surface as
+    // ENOENT from launchd instead.
     if (arguments.count > 4) {
         if (messageOut) *messageOut = @"Too many proof arguments.";
         return NO;
