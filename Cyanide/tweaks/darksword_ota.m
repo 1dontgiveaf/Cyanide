@@ -262,6 +262,17 @@ static bool ota_restore_dir_mode(const char *path, mode_t mode, const char *labe
     return false;
 }
 
+static bool ota_retry_pending_dir_restore(void);
+
+// Public hook for the first moment kernel access is available again: a crash
+// between widening the launchd folder and restoring it must not leave it o+wx
+// until someone happens to perform another OTA write.
+void darksword_ota_retry_pending_dir_restore(void)
+{
+    if (!kexploit_krw_ready()) return;
+    (void)ota_retry_pending_dir_restore();
+}
+
 static bool ota_retry_pending_dir_restore(void)
 {
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;

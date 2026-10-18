@@ -16,6 +16,10 @@ bool darksword_ota_set_disabled(bool disabled);
 //    2 = partially disabled (some but not all)
 int darksword_ota_read_disabled(void);
 
+// Retries a launchd plist folder-mode restore left behind by an interrupted
+// write. No-op when nothing is pending or kernel access is not ready.
+void darksword_ota_retry_pending_dir_restore(void);
+
 #ifdef __OBJC__
 #import <Foundation/Foundation.h>
 // launchd's disabled.plist for any Daemons-catalog label (daemon_catalog.h).
