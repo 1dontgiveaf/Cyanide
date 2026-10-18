@@ -14,6 +14,27 @@
 #endif
 
 #if DEBUG
+// Debug-only launch marker: written at the very first line of main, before any
+// argv check, by every Debug launch. The self proof reads the child's marker
+// through launchd root read. This distinguishes "child never reached main"
+// (no marker) from "child ran but could not write the app-container output".
+static void cyanide_debug_root_child_marker(int argc, char **argv) {
+    char path[160];
+    snprintf(path, sizeof(path), "/private/var/tmp/cyanide-root-child-%d.txt", getpid());
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+    char buf[320];
+    int n = snprintf(buf, sizeof(buf),
+                     "pid=%d ppid=%d uid=%u euid=%u gid=%u argc=%d arg1=%s\n",
+                     getpid(), getppid(), (unsigned)getuid(), (unsigned)geteuid(),
+                     (unsigned)getgid(), argc,
+                     (argc > 1 && argv[1]) ? argv[1] : "-");
+    if (n > 0) (void)write(fd, buf, (size_t)n);
+    close(fd);
+}
+#endif
+
+#if DEBUG
 // Debug-only launchd root-exec child: the launchd proof spawns this same app
 // executable with this flag and an output path. We run BEFORE UIKit and exit
 // immediately, writing the real uid/euid/gid. It is never compiled into
@@ -35,6 +56,7 @@ static void cyanide_debug_root_exec_child(int argc, char *argv[]) {
 
 int main(int argc, char * argv[]) {
 #if DEBUG
+    cyanide_debug_root_child_marker(argc, argv);
     if (argc >= 3 && strcmp(argv[1], "--cyanide-root-exec-child") == 0)
         cyanide_debug_root_exec_child(argc, argv);
 #endif
