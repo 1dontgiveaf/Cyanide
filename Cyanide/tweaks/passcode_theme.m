@@ -362,15 +362,15 @@ static bool pt_write_data_to_target(NSData *data,
         return false;
     }
 
-    if (!lockedDirs[dir]) {
+    if (lockedDirs[dir] == nil) {
         NSMutableDictionary<NSString *, NSNumber *> *pending = pt_pending_dir_modes();
         NSNumber *recorded = pending[dir];
         // If a previous restore failed, `recorded` is the only copy of the
         // original mode. Never overwrite it with the already-widened mode.
-        mode_t originalMode = recorded ? (mode_t)recorded.unsignedIntValue
-                                       : (dirStat.st_mode & 07777);
+        mode_t originalMode = recorded != nil ? (mode_t)recorded.unsignedIntValue
+                                               : (dirStat.st_mode & 07777);
         lockedDirs[dir] = @(originalMode);
-        if (!recorded) {
+        if (recorded == nil) {
             pending[dir] = @(originalMode);
             pt_save_pending_dir_modes(pending);
         }
@@ -454,7 +454,7 @@ static bool pt_restore_directory_modes(NSMutableDictionary<NSString *, NSNumber 
 {
     NSMutableDictionary<NSString *, NSNumber *> *pending = pt_pending_dir_modes();
     for (NSString *dir in pending) {
-        if (!lockedDirs[dir]) lockedDirs[dir] = pending[dir];
+        if (lockedDirs[dir] == nil) lockedDirs[dir] = pending[dir];
     }
     NSMutableArray<NSString *> *restoredDirs = [NSMutableArray array];
     for (NSString *dir in lockedDirs) {
