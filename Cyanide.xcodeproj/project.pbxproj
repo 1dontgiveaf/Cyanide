@@ -465,6 +465,7 @@
 				AAA2989D2F7418CC000B5902 /* CopyFiles */,
 				FBC0A0012FD6000000C0A001 /* Copy Simulator XPF */,
 				CC0C0A01000000000000000D /* Embed Foundation Extensions */,
+				FBC0A0022FD6000000C0A002 /* Build Debug Helper */,
 			);
 			buildRules = (
 			);
@@ -721,6 +722,27 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
 			shellScript = "if [ \"$PLATFORM_NAME\" = \"iphonesimulator\" ]; then\n    cp \"$SRCROOT/Cyanide/XPF/output/iphonesimulator/libxpf.dylib\" \"$TARGET_BUILD_DIR/$WRAPPER_NAME/libxpf.dylib\"\nfi\n";
+		};
+		FBC0A0022FD6000000C0A002 /* Build Debug Helper */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/scripts/debug-helper/hello.c",
+			);
+			name = "Build Debug Helper";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(WRAPPER_NAME)/Helpers/hello",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "if [ \"$CONFIGURATION\" != \"Debug\" ]; then exit 0; fi\nset -e\nHELPER_DIR=\"$TARGET_BUILD_DIR/$WRAPPER_NAME/Helpers\"\nmkdir -p \"$HELPER_DIR\"\nxcrun --sdk iphoneos clang -arch arm64 -arch arm64e -miphoneos-version-min=17.0 -isysroot \"$(xcrun --sdk iphoneos --show-sdk-path)\" -O2 \"$SRCROOT/scripts/debug-helper/hello.c\" -o \"$HELPER_DIR/hello\"\nchmod 0755 \"$HELPER_DIR/hello\"\nif [ -n \"${EXPANDED_CODE_SIGN_IDENTITY:-}\" ]; then\n  /usr/bin/codesign --force --sign \"$EXPANDED_CODE_SIGN_IDENTITY\" \"$HELPER_DIR/hello\"\nfi\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
