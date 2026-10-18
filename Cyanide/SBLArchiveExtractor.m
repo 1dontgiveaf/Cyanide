@@ -8,6 +8,7 @@
 
 #import <dlfcn.h>
 #import <errno.h>
+#import <fcntl.h>
 #import <ImageIO/ImageIO.h>
 #import <sys/stat.h>
 #import <unistd.h>
@@ -48,14 +49,44 @@ static BOOL sbl_image_source_within_pixel_cap(CGImageSourceRef source)
 BOOL SBLImageFilePassesPreflight(NSString *path, uint64_t maxBytes, uint64_t *sizeOut)
 {
     if (sizeOut) *sizeOut = 0;
+    if (path.length == 0 || maxBytes == 0) return NO;
+    // Open once, no-follow, and take everything (size and dimensions) from
+    // that descriptor. lstat + CGImageSourceCreateWithURL reopens the path and
+    // follows a symlink swapped in between, so the checked object and the one
+    // later read could be different files.
+    int fd = open(path.fileSystemRepresentation, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return NO;
     struct stat st;
-    if (path.length == 0 || lstat(path.fileSystemRepresentation, &st) != 0) return NO;
-    if (!S_ISREG(st.st_mode) || st.st_size <= 0 || (uint64_t)st.st_size > maxBytes) return NO;
-    if (sizeOut) *sizeOut = (uint64_t)st.st_size;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+        (uint64_t)st.st_size > maxBytes) {
+        close(fd);
+        return NO;
+    }
 
-    CGImageSourceRef source = CGImageSourceCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:path], NULL);
+    NSMutableData *data = [NSMutableData dataWithCapacity:(NSUInteger)st.st_size];
+    uint8_t chunk[64 * 1024];
+    uint64_t total = 0;
+    BOOL tooLarge = NO, readFailed = NO;
+    for (;;) {
+        ssize_t got = read(fd, chunk, sizeof(chunk));
+        if (got < 0 && errno == EINTR) continue;
+        if (got < 0) { readFailed = YES; break; }
+        if (got == 0) break;
+        if (total + (uint64_t)got > maxBytes) { tooLarge = YES; break; }
+        [data appendBytes:chunk length:(NSUInteger)got];
+        total += (uint64_t)got;
+    }
+    struct stat after = {0};
+    BOOL unchanged = fstat(fd, &after) == 0 && after.st_ino == st.st_ino &&
+                     after.st_dev == st.st_dev && after.st_size == st.st_size &&
+                     total == (uint64_t)st.st_size;
+    close(fd);
+    if (readFailed || tooLarge || !unchanged || data.length == 0) return NO;
+
+    CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
     BOOL ok = sbl_image_source_within_pixel_cap(source);
     if (source) CFRelease(source);
+    if (ok && sizeOut) *sizeOut = (uint64_t)data.length;
     return ok;
 }
 
