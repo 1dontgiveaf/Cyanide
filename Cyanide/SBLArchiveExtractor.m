@@ -9,6 +9,8 @@
 #import <dlfcn.h>
 #import <ImageIO/ImageIO.h>
 #import <sys/stat.h>
+#import <fcntl.h>
+#import <unistd.h>
 #import <zlib.h>
 
 static NSString * const SBLArchiveErrorDomain = @"SnowBoardLiteArchive";
@@ -627,27 +629,47 @@ BOOL SBLExtractArchiveToDirectoryWithProgress(NSURL *url, NSString *destination,
             return NO;
         }
     }
-    // Size the input before materializing it: the decompressed and entry
-    // bounds below only apply once the whole archive is already in memory.
-    NSNumber *isRegular = nil;
-    NSNumber *fileSize = nil;
-    if (url.isFileURL) {
-        [url getResourceValue:&isRegular forKey:NSURLIsRegularFileKey error:nil];
-        [url getResourceValue:&fileSize forKey:NSURLFileSizeKey error:nil];
-        if (isRegular && !isRegular.boolValue) {
-            sbl_set_error(error, 51, @"The selected item is not a regular archive file.");
-            return NO;
-        }
-        if (fileSize.unsignedLongLongValue > SBLMaxArchiveInputBytes) {
-            sbl_set_error(error, 52, @"The archive is larger than 256 MB.");
-            return NO;
-        }
+    // Read the input through a descriptor with the cap enforced while
+    // reading: the decompressed and entry bounds below only apply once the
+    // archive is in memory, so its own size must never exceed the cap there.
+    if (!url.isFileURL) {
+        sbl_set_error(error, 54, @"Only local archive files can be imported.");
+        return NO;
     }
-    NSData *data = [NSData dataWithContentsOfURL:url options:0 error:error];
-    if (!data) return NO;
-    // The file may have grown since it was sized.
-    if (data.length > SBLMaxArchiveInputBytes) {
+    int fd = open(url.fileSystemRepresentation, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) {
+        sbl_set_error(error, 51, @"The selected item is not a readable archive file.");
+        return NO;
+    }
+    struct stat inStat;
+    if (fstat(fd, &inStat) != 0 || !S_ISREG(inStat.st_mode)) {
+        close(fd);
+        sbl_set_error(error, 51, @"The selected item is not a regular archive file.");
+        return NO;
+    }
+    if ((unsigned long long)inStat.st_size > SBLMaxArchiveInputBytes) {
+        close(fd);
         sbl_set_error(error, 52, @"The archive is larger than 256 MB.");
+        return NO;
+    }
+    NSMutableData *data = [NSMutableData dataWithCapacity:(NSUInteger)inStat.st_size];
+    uint8_t chunk[1 << 16];
+    BOOL tooLarge = NO, readFailed = NO;
+    for (;;) {
+        ssize_t got = read(fd, chunk, sizeof(chunk));
+        if (got < 0 && errno == EINTR) continue;
+        if (got < 0) { readFailed = YES; break; }
+        if (got == 0) break;
+        if (data.length + (NSUInteger)got > SBLMaxArchiveInputBytes) { tooLarge = YES; break; }   // it grew
+        [data appendBytes:chunk length:(NSUInteger)got];
+    }
+    close(fd);
+    if (tooLarge) {
+        sbl_set_error(error, 52, @"The archive is larger than 256 MB.");
+        return NO;
+    }
+    if (readFailed || data.length == 0) {
+        sbl_set_error(error, 51, @"The archive could not be read.");
         return NO;
     }
 

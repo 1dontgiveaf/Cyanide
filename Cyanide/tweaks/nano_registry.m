@@ -1023,5 +1023,8 @@ bool nano_registry_push_to_cfprefsd(const nano_registry_values *values, bool app
     log_user("[NANO-PUSH] live daemon reset skipped for stability; notify_post ret=%d. "
              "Respring or reboot before pairing so cfprefsd/NanoRegistry reload the plist.\n",
              notifyRet);
-    return true;
+    // Nothing reached cfprefsd's cache, so this is not a successful push:
+    // callers report a partial result (file written, respring still needed)
+    // instead of a clean success.
+    return false;
 }

@@ -292,8 +292,12 @@ UIViewController *settings_make_system_info_viewer(void);
 typedef void (^SettingsProgressBlock)(float fraction, NSString *step, NSTimeInterval animateOver, int target);
 // allowFullExploit: as for settings_unlock_filesystem_async -- NO never starts
 // a fresh exploit run and fails with kSettingsFullExploitRequiredMessage instead.
+// resolveOrigin: on a SpringBoard success, also record where the user was
+// before this request brought Cyanide to the front; read it in `completion`
+// with settings_location_services_take_origin().
 void settings_location_services_set_async(int desired, BOOL allowFullExploit,
                                           BOOL removeFromSwitcher,
+                                          BOOL resolveOrigin,
                                           NSTimeInterval homeDelay,
                                           SettingsProgressBlock progress,
                                           void (^completion)(BOOL ok, NSString *message,
@@ -303,6 +307,9 @@ void settings_location_services_set_async(int desired, BOOL allowFullExploit,
 // hijack is the activation ABBA deadlock), so new requests must fail fast
 // instead of starting work the removal will kill.
 BOOL settings_switcher_removal_pending(void);
+// The origin recorded by the last resolveOrigin run, then cleared: 0 unknown,
+// 1 Home Screen, 2 an app (its bundle ID in *bundleID). Main queue.
+NSInteger settings_location_services_take_origin(NSString **bundleID);
 
 @interface SettingsViewController : UITableViewController
 

@@ -241,35 +241,50 @@ static NSData *pt_read_file(NSString *path)
 {
     if (path.length == 0) return nil;
 
+    // Classified on the open descriptor (not the path), then read through
+    // EOF: a file the system rebuilds in place (it does, for the keypad
+    // cache) is caught whether it shrinks, grows or is replaced meanwhile. A
+    // partial file must never become an "original" backup or rollback target.
+    int fd = open(path.fileSystemRepresentation, O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) return nil;
     struct stat st = {0};
-    if (stat(path.UTF8String, &st) != 0) return nil;
-    if (!S_ISREG(st.st_mode) || st.st_size <= 0) return nil;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
+        close(fd);
+        return nil;
+    }
     if ((unsigned long long)st.st_size > (unsigned long long)kPTMaxDigitBytes) {
         printf("[PASSCODE] refusing oversized file (%lld bytes): %s\n",
                (long long)st.st_size, path.UTF8String);
+        close(fd);
         return nil;
     }
 
-    int fd = open(path.UTF8String, O_RDONLY);
-    if (fd < 0) return nil;
-
-    NSMutableData *out = [NSMutableData dataWithLength:(NSUInteger)st.st_size];
+    // One byte of room past the expected size, so growth shows up as an
+    // over-long read instead of a silently accepted prefix.
+    NSUInteger expected = (NSUInteger)st.st_size;
+    NSMutableData *out = [NSMutableData dataWithLength:expected + 1];
     uint8_t *bytes = out.mutableBytes;
     NSUInteger total = 0;
-    while (total < (NSUInteger)st.st_size) {
-        ssize_t got = read(fd, bytes + total, (NSUInteger)st.st_size - total);
+    while (total < expected + 1) {
+        ssize_t got = read(fd, bytes + total, expected + 1 - total);
         if (got < 0 && errno == EINTR) continue;
         if (got <= 0) break;
         total += (NSUInteger)got;
     }
+    struct stat after = {0};
+    bool unchanged = fstat(fd, &after) == 0 && after.st_ino == st.st_ino && after.st_dev == st.st_dev &&
+                     after.st_size == st.st_size;
     close(fd);
 
-    if (total == 0) return nil;
-    // A short read means the file changed underneath us — the system rebuilds
-    // the keypad cache in place. A truncated buffer must not count as readable:
-    // callers would otherwise save a partial file as an "original" backup or use
-    // it as a rollback target.
-    if (total != (NSUInteger)st.st_size) return nil;
+    // Still the same inode at the path (not replaced by a rename meanwhile).
+    struct stat atPath = {0};
+    bool samePath = lstat(path.fileSystemRepresentation, &atPath) == 0 &&
+                    atPath.st_ino == st.st_ino && atPath.st_dev == st.st_dev;
+
+    if (total != expected || !unchanged || !samePath) {
+        printf("[PASSCODE] %s changed while being read; not using it\n", path.UTF8String);
+        return nil;
+    }
     out.length = total;
     return out;
 }

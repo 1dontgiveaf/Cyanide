@@ -845,11 +845,17 @@ bool locationsim_stop(const char *hostProcess, bool launchHost)
 
     if (!primaryOk && !locationdOk) {
         printf("[LOCSIM] restore did not reach any simulation manager\n");
+    } else if (!primaryOk) {
+        printf("[LOCSIM] restore reached locationd but NOT the primary host %s; "
+               "its simulation may still be running\n", primary);
     } else if (locationdOk) {
-        printf("[LOCSIM] restore fallback reached locationd\n");
+        printf("[LOCSIM] restore also reached locationd\n");
     }
 
-    return primaryOk || locationdOk;
+    // The apply only ever targets the primary host, so only its confirmed
+    // stop ends the simulation; locationd is extra cleanup and must not turn
+    // a primary failure into "stopped" (the caller would forget it is active).
+    return primaryOk;
 }
 
 bool locationsim_stop_strict_hosts(const char *hostProcess, bool launchHost)

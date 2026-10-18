@@ -118,38 +118,41 @@ bool darksword_drag_coefficient_apply(double coefficient)
         return false;
     }
 
+    // Every access is checked and the value read back: success means the
+    // coefficient is verifiably in place, so a failed or partial write keeps
+    // the tweak pending instead of being marked applied.
+    bool ok = true;
     if (d.gated) {
         uint32_t rv = 0;
-        remote_read(d.revVar, &rv, 4);
-        if ((int)rv < 1) { uint32_t one = 1; remote_write(d.revVar, &one, 4); rv = 1; }
+        ok = remote_read(d.revVar, &rv, 4);
+        if (ok && (int)rv < 1) {
+            uint32_t one = 1;
+            ok = remote_write(d.revVar, &one, 4) && remote_read(d.revVar, &rv, 4) && rv == 1;
+        }
 
         union { double dv; uint64_t u; } b = { .dv = coefficient };
         uint32_t sentinel = 0x7fffffff;
 
-        remote_write(d.g + d.revOff, &sentinel, 4);
-        remote_write(d.g + d.valOff, &b.u, 8);
+        ok = ok && remote_write(d.g + d.revOff, &sentinel, 4);
+        ok = ok && remote_write(d.g + d.valOff, &b.u, 8);
 
         double chk = 0; uint32_t sr = 0;
-        remote_read(d.g + d.valOff, &chk, 8);
-        remote_read(d.g + d.revOff, &sr, 4);
-        printf("[DRAG] gated g=0x%llx revVar=%u value=%.4f slotRev=0x%x\n",
-               (unsigned long long)d.g, rv, chk, sr);
+        ok = ok && remote_read(d.g + d.valOff, &chk, 8) && remote_read(d.g + d.revOff, &sr, 4);
+        ok = ok && chk == coefficient && sr == sentinel;
+        printf("[DRAG] gated g=0x%llx revVar=%u value=%.4f slotRev=0x%x%s\n",
+               (unsigned long long)d.g, rv, chk, sr, ok ? "" : " (NOT verified)");
     } else if (d.isFloat) {
         float f = (float)coefficient;
-        remote_write(d.g + d.valOff, &f, 4);
-
         float chk = 0;
-        remote_read(d.g + d.valOff, &chk, 4);
-        printf("[DRAG] f32 g=0x%llx+0x%x value=%.4f\n",
-               (unsigned long long)d.g, d.valOff, (double)chk);
+        ok = remote_write(d.g + d.valOff, &f, 4) && remote_read(d.g + d.valOff, &chk, 4) && chk == f;
+        printf("[DRAG] f32 g=0x%llx+0x%x value=%.4f%s\n",
+               (unsigned long long)d.g, d.valOff, (double)chk, ok ? "" : " (NOT verified)");
     } else {
         union { double dv; uint64_t u; } b = { .dv = coefficient };
-        remote_write(d.g + d.valOff, &b.u, 8);
-
         double chk = 0;
-        remote_read(d.g + d.valOff, &chk, 8);
-        printf("[DRAG] f64 g=0x%llx+0x%x value=%.4f\n",
-               (unsigned long long)d.g, d.valOff, chk);
+        ok = remote_write(d.g + d.valOff, &b.u, 8) && remote_read(d.g + d.valOff, &chk, 8) && chk == coefficient;
+        printf("[DRAG] f64 g=0x%llx+0x%x value=%.4f%s\n",
+               (unsigned long long)d.g, d.valOff, chk, ok ? "" : " (NOT verified)");
     }
-    return true;
+    return ok;
 }

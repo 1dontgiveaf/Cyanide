@@ -163,22 +163,26 @@ bool killallapps_apply_in_session(int *outKilled)
         printf("[KILLALL] sharedInstance nil\n");
         return false;
     }
-    uint64_t apps = r_msg2_main(inst, "runningApplications", 0, 0, 0, 0);
-    if (!r_is_objc_ptr(apps)) {
-        printf("[KILLALL] runningApplications nil\n");
+    // A fresh array: fetched and retained in one checked step, so it stays
+    // alive while we walk it (and isn't released after an unknown retain).
+    uint64_t apps = r_msg2_main_retained(inst, "runningApplications");
+    if (!apps) {
+        printf("[KILLALL] runningApplications unavailable\n");
         return false;
     }
     uint64_t count = r_msg2_main(apps, "count", 0, 0, 0, 0);
     printf("[KILLALL] running apps=%llu\n", count);
-    if (count == 0) return true;
+    if (count == 0) { r_release(apps); return true; }
     // Sanity cap to bail on a garbled return value rather than spinning forever.
     if (count > 256) {
         printf("[KILLALL] absurd count=%llu, aborting\n", count);
+        r_release(apps);
         return false;
     }
 
     int killed = 0;
     int skipped = 0;
+    bool unknown = false;
     for (uint64_t i = 0; i < count; i++) {
         uint64_t app = r_msg2_main(apps, "objectAtIndex:", i, 0, 0, 0);
         if (!r_is_objc_ptr(app)) continue;
@@ -203,11 +207,20 @@ bool killallapps_apply_in_session(int *outKilled)
         // so we invoke by computed runtime address.
         do_remote_call_stable_addr(R_TIMEOUT, killFn, "SBWorkspaceKillApplication",
                                    app, 0, 0, 0, 0, 0, 0, 0);
+        if (!remote_call_last_call_ok()) {
+            // May or may not have run, and the session is now suspect: stop
+            // instead of sending more kills through it.
+            unknown = true;
+            printf("[KILLALL] kill of bid='%s' result unknown (reply lost); stopping\n", bidBuf);
+            break;
+        }
         killed++;
         printf("[KILLALL] killed bid='%s' app=0x%llx\n", bidBuf, app);
     }
+    r_release(apps);
 
+    // Only confirmed kills are counted.
     if (outKilled) *outKilled = killed;
-    printf("[KILLALL] done killed=%d skipped=%d\n", killed, skipped);
-    return true;
+    printf("[KILLALL] done killed=%d skipped=%d%s\n", killed, skipped, unknown ? " (incomplete)" : "");
+    return !unknown;
 }

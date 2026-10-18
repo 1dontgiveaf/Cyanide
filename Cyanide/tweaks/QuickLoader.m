@@ -229,6 +229,11 @@ bool quickloader_refresh_active_repo_tweak(void) {
         log_user("[QuickLoader] Selected repo package script is missing; refresh its source first.\n");
         return false;
     }
+    if (!repotweaks_cached_script_is_current(repoURL, tweakID)) {
+        log_user("[QuickLoader] Selected repo package script is out of date (its download failed); "
+                 "refresh its source first.\n");
+        return false;
+    }
 
     NSDictionary *values = [d dictionaryForKey:repotweaks_values_defaults_key(repoURL, tweakID)] ?: @{};
     NSString *displayName = [d stringForKey:@"QuickLoaderSourceScriptName"];

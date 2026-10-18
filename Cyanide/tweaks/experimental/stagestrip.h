@@ -28,7 +28,9 @@ bool stagestrip_apply_in_session(int maxSlots);
 void stagestrip_set_deferred_library_build_enabled(bool enabled);
 bool stagestrip_stop_in_session(void);
 void stagestrip_start_control_loop(void);
-void stagestrip_stop_control_loop(void);
+// Returns whether the loop has exited within its short wait.
+bool stagestrip_stop_control_loop(void);
+bool stagestrip_control_loop_running(void);
 void stagestrip_forget_remote_state(void);
 
 #endif

@@ -12,6 +12,7 @@
 #define location_services_h
 
 #include <stdbool.h>
+#include <stddef.h>
 
 // Current state as seen by this app (no entitlement needed to read it):
 // 1 = on, 0 = off.
@@ -40,5 +41,20 @@ LSCallResult locationservices_set_enabled_in_session(bool enabled);
 // Cyanide into the background mid-operation). Opens and closes its own
 // RemoteCall session; the caller must have closed any SpringBoard session.
 LSCallResult locationservices_set_enabled_via_running_preferences(bool enabled);
+
+// Where the user was when a request brought Cyanide to the front: SpringBoard's
+// main-display layout state from before the current one (iOS 18 SpringBoard:
+// SBWindowScene.layoutStateProvider.previousLayoutState). Home also covers the
+// App Library and Today view. Unknown when the state can't be read, or when
+// the current layout isn't Cyanide (the transition this is about didn't
+// happen as expected) -- callers then keep their old behaviour.
+typedef enum {
+    LSOriginUnknown = 0,
+    LSOriginHome,
+    LSOriginApp,   // bundle ID in appOut
+} LSOrigin;
+
+// Needs an open SpringBoard session. selfBundleID is Cyanide's own.
+LSOrigin locationservices_origin_in_session(const char *selfBundleID, char *appOut, size_t appLen);
 
 #endif /* location_services_h */

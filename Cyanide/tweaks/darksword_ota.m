@@ -229,8 +229,62 @@ static bool ota_vnode_chown(const char *path, uid_t uid, gid_t gid, const char *
     return true;
 }
 
+// The launchd plist folder is widened (o+wx) for the write and narrowed again
+// afterwards. vnode_apfs_chmod can apply a mode yet report failure, so the
+// folder's mode is always checked with stat, and a restore that can't be
+// proven leaves a record (folder + mode to put back) that every later write
+// retries first -- the folder must never stay world-writable silently.
+static NSString * const kOTADirRestorePathKey = @"OTADirModeRestorePath";
+static NSString * const kOTADirRestoreModeKey = @"OTADirModeRestoreMode";
+
+static bool ota_dir_mode_is(const char *path, mode_t mode)
+{
+    struct stat st = {0};
+    return stat(path, &st) == 0 && S_ISDIR(st.st_mode) && (st.st_mode & 07777) == (mode & 07777);
+}
+
+// Puts the folder back to `mode` and proves it. Keeps (or clears) the record.
+static bool ota_restore_dir_mode(const char *path, mode_t mode, const char *label)
+{
+    if (!ota_dir_mode_is(path, mode)) {
+        (void)ota_vnode_chmod(path, mode, label);   // the stat below decides, not the return
+    }
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    if (ota_dir_mode_is(path, mode)) {
+        [d removeObjectForKey:kOTADirRestorePathKey];
+        [d removeObjectForKey:kOTADirRestoreModeKey];
+        return true;
+    }
+    [d setObject:@(path) forKey:kOTADirRestorePathKey];
+    [d setInteger:(NSInteger)mode forKey:kOTADirRestoreModeKey];
+    [d synchronize];
+    printf("[OTA] !!! %s: folder mode NOT restored (want %o); will retry on the next write\n", path, mode);
+    return false;
+}
+
+static bool ota_retry_pending_dir_restore(void)
+{
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    NSString *path = [d stringForKey:kOTADirRestorePathKey];
+    if (path.length == 0) return true;
+    mode_t mode = (mode_t)[d integerForKey:kOTADirRestoreModeKey];
+    if (!S_ISDIR(mode)) {   // a record without the folder type would retype it
+        printf("[OTA] dropping malformed folder-restore record (mode %o)\n", mode);
+        [d removeObjectForKey:kOTADirRestorePathKey];
+        [d removeObjectForKey:kOTADirRestoreModeKey];
+        return true;
+    }
+    printf("[OTA] retrying the pending folder-mode restore for %s\n", path.UTF8String);
+    return ota_restore_dir_mode(path.fileSystemRepresentation, mode, "pending dir restore");
+}
+
 static bool ota_write_disabled_plist(NSDictionary *plist, NSString *plistPath, NSString *tempPath, NSString *dirPath)
 {
+    if (!ota_retry_pending_dir_restore()) {
+        printf("[OTA] refusing to write while an earlier folder restore is still pending\n");
+        return false;
+    }
+
     NSData *outData = [NSPropertyListSerialization dataWithPropertyList:plist
                                                                  format:NSPropertyListXMLFormat_v1_0
                                                                 options:0
@@ -254,9 +308,20 @@ static bool ota_write_disabled_plist(NSDictionary *plist, NSString *plistPath, N
 
     mode_t writableDirMode = dirStat.st_mode | S_IWOTH | S_IXOTH;
     bool dirModeChanged = (writableDirMode != dirStat.st_mode);
-    if (dirModeChanged &&
-        !ota_vnode_chmod(dirPath.UTF8String, writableDirMode, "disabled.plist dir writable")) {
-        return false;
+    if (dirModeChanged) {
+        // Recorded before widening: a crash from here on is still undone.
+        NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+        [d setObject:dirPath forKey:kOTADirRestorePathKey];
+        [d setInteger:(NSInteger)dirStat.st_mode forKey:kOTADirRestoreModeKey];
+        [d synchronize];
+        (void)ota_vnode_chmod(dirPath.UTF8String, writableDirMode, "disabled.plist dir writable");
+        if (!ota_dir_mode_is(dirPath.UTF8String, writableDirMode)) {
+            // Failed -- possibly after applying part or all of it: put the
+            // original back (and prove it) before giving up.
+            printf("[OTA] widening the disabled.plist folder failed; restoring its mode\n");
+            (void)ota_restore_dir_mode(dirPath.UTF8String, dirStat.st_mode, "disabled.plist dir restore");
+            return false;
+        }
     }
 
     bool ok = false;
@@ -304,9 +369,7 @@ static bool ota_write_disabled_plist(NSDictionary *plist, NSString *plistPath, N
     }
     // A launchd dir left world-writable is a failure even if the rename landed.
     if (dirModeChanged &&
-        !ota_vnode_chmod(dirPath.UTF8String, dirStat.st_mode, "disabled.plist dir restore")) {
-        printf("[OTA] !!! disabled.plist dir mode NOT restored (still %o, want %o)\n",
-               writableDirMode, dirStat.st_mode);
+        !ota_restore_dir_mode(dirPath.UTF8String, dirStat.st_mode, "disabled.plist dir restore")) {
         ok = false;
     }
     return ok;

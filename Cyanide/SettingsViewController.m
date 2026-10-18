@@ -43,6 +43,7 @@
 #import "tweaks/QuickLoader.h"
 #import "tweaks/RepoTweaks.h"
 #import <CoreMotion/CoreMotion.h>
+#import <os/lock.h>
 
 #import <objc/runtime.h>
 #import <objc/objc-sync.h>
@@ -1312,7 +1313,8 @@ static void settings_request_gravitylite_stop(void)
     __sync_lock_test_and_set(&g_gravitylite_background_armed, 0);
     settings_stop_gravity_motion();
 }
-static void settings_request_stagestrip_stop(void) { stagestrip_stop_control_loop(); }
+static void settings_request_stagestrip_stop(void) { (void)stagestrip_stop_control_loop(); }
+static BOOL settings_stagestrip_running(void) { return stagestrip_control_loop_running() ? YES : NO; }
 static void settings_request_livewp_stop(void) { g_livewp_live_stop_requested = 1; }
 
 static BOOL settings_statbar_running(void) { return g_statbar_live_running != 0; }
@@ -1487,7 +1489,7 @@ static void settings_each_springboard_cleanup_entry(void (^block)(const Settings
         { kSettingsThemerEnabled, "Themer", settings_request_themer_stop, settings_stop_themer_registered, themer_forget_remote_state, settings_themer_running, YES, YES },
         { kSettingsSnowBoardLiteEnabled, "SnowBoard Lite", NULL, settings_stop_themer_registered, themer_forget_remote_state, NULL, YES, YES },
         { kSettingsLiveWPEnabled, "LiveWP", settings_request_livewp_stop, settings_stop_livewp_registered, livewp_forget_remote_state, settings_livewp_running, YES, YES },
-        { kSettingsStageStripEnabled, "Stage Strip", settings_request_stagestrip_stop, settings_stop_stagestrip_registered, stagestrip_forget_remote_state, NULL, YES, YES },
+        { kSettingsStageStripEnabled, "Stage Strip", settings_request_stagestrip_stop, settings_stop_stagestrip_registered, stagestrip_forget_remote_state, settings_stagestrip_running, YES, YES },
         { kSettingsFastLockXLiteEnabled, "FastLockX Lite", NULL, settings_stop_fastlockx_lite_registered, fastlockx_lite_forget_remote_state, NULL, NO, YES },
         { kSettingsQuickLoaderEnabled, "QuickLoader", NULL, settings_stop_quickloader_registered, NULL, NULL, YES, YES },
         { kSettingsRepoTweaksEnabled, "RepoTweaks", NULL, settings_stop_repotweaks_registered, NULL, NULL, YES, YES },
@@ -5322,8 +5324,8 @@ static void settings_nano_load_from_plist_into_defaults(BOOL logResult)
 }
 
 static NSString * const kSettingsNanoCachePushFailedMessage =
-    @"Watch pairing override was written, but cfprefsd's cache could not be updated — "
-    @"it may revert. Apply it again if it does.";
+    @"Watch pairing override was written. Respring before pairing so the system "
+    @"reloads it — until then the old values are still cached and may overwrite it.";
 
 // Synchronous entry point used by both the Settings UI buttons and the
 // Installer's PackageQueue commit path. Logs progress to the in-app log so
@@ -5377,7 +5379,7 @@ static BOOL settings_apply_nano_registry_internal(BOOL apply, BOOL *cachePushedO
         if (ok) {
             bool pushed = nano_registry_push_to_cfprefsd(&values, apply ? true : false);
             if (!pushed) {
-                log_user("[NANO] cfprefsd push failed; on-disk override may be overwritten by cfprefsd's stale cache.\n");
+                log_user("[NANO] cfprefsd cache not updated live; respring before pairing, or the stale cache may overwrite the file.\n");
                 if (cachePushedOut) *cachePushedOut = NO;
             }
         }
@@ -6896,14 +6898,43 @@ void settings_application_will_enter_foreground(void)
 // `resultAge` is how long ago the result was posted. With removeFromSwitcher,
 // a successful SpringBoard run also has SpringBoard delete Cyanide's App
 // Switcher card a little later (after the caller has gone to the Home Screen).
+// Origin recorded by a resolveOrigin run: written by its worker (which holds
+// the RemoteCall lock, so never a dispatch_sync to main from there), taken
+// by the caller's completion on the main queue.
+static os_unfair_lock g_locsvc_origin_lock = OS_UNFAIR_LOCK_INIT;
+static NSInteger g_locsvc_origin = 0;
+static NSString *g_locsvc_origin_app = nil;
+
+static void settings_location_services_set_origin(NSInteger origin, NSString *bundleID)
+{
+    os_unfair_lock_lock(&g_locsvc_origin_lock);
+    g_locsvc_origin = origin;
+    g_locsvc_origin_app = bundleID;
+    os_unfair_lock_unlock(&g_locsvc_origin_lock);
+}
+
+NSInteger settings_location_services_take_origin(NSString **bundleID)
+{
+    os_unfair_lock_lock(&g_locsvc_origin_lock);
+    NSInteger origin = g_locsvc_origin;
+    NSString *app = g_locsvc_origin_app;
+    g_locsvc_origin = 0;
+    g_locsvc_origin_app = nil;
+    os_unfair_lock_unlock(&g_locsvc_origin_lock);
+    if (bundleID) *bundleID = app;
+    return origin;
+}
+
 void settings_location_services_set_async(int desired, BOOL allowFullExploit,
                                           BOOL removeFromSwitcher,
+                                          BOOL resolveOrigin,
                                           NSTimeInterval homeDelay,
                                           SettingsProgressBlock progress,
                                           void (^completion)(BOOL ok, NSString *message,
                                                              NSTimeInterval resultAge))
 {
     __block int target = desired;   // final once decided under the action lock
+    if (resolveOrigin) settings_location_services_set_origin(0, nil);   // nothing stale from an earlier run
     void (^step)(float, NSString *, NSTimeInterval) = ^(float f, NSString *text, NSTimeInterval over) {
         int t = target;
         if (progress) dispatch_async(dispatch_get_main_queue(), ^{ progress(f, text, over, t); });
@@ -6936,6 +6967,9 @@ void settings_location_services_set_async(int desired, BOOL allowFullExploit,
         __block BOOL doneSent = NO;   // the result phase is reported once
         __block NSString *message = nil;
         __block uint64_t resultPostedNs = 0;
+        // What became of the SpringBoard request. Uncertain means it may have
+        // run: only the readback may decide, never a second sender.
+        __block LSCallResult springboardSent = LSCallNotSent;
         void (^postResult)(void) = ^{
             if (resultPostedNs) return;
             resultPostedNs = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
@@ -6994,11 +7028,22 @@ void settings_location_services_set_async(int desired, BOOL allowFullExploit,
                 if (settings_ensure_springboard_remote_call_locked()) {
                     step(0.85f, verb, 0.3);
                     LSCallResult sent = locationservices_set_enabled_in_session(enable);
+                    springboardSent = sent;
                     // Not sent: nothing can change, don't wait for it.
                     // Sent/uncertain: the readback decides.
                     ok = sent != LSCallNotSent && locationservices_wait_for_state(enable, 3000);
                     uint64_t removalScheduledNs = 0;
                     double removalDelay = 0;
+                    if (ok && resolveOrigin) {
+                        // Where to send the user back to, read while the
+                        // channel is still open (a few main-thread reads).
+                        char app[256];
+                        LSOrigin origin = locationservices_origin_in_session(
+                            NSBundle.mainBundle.bundleIdentifier.UTF8String, app, sizeof(app));
+                        settings_location_services_set_origin(
+                            origin == LSOriginApp ? 2 : origin == LSOriginHome ? 1 : 0,
+                            origin == LSOriginApp ? @(app) : nil);
+                    }
                     if (ok) {
                         // Report now; the teardown below runs while the
                         // result is already on screen.
@@ -7067,6 +7112,13 @@ void settings_location_services_set_async(int desired, BOOL allowFullExploit,
                     ok = YES;
                     message = doneText();
                     if (!doneSent) { step(1.0f, @"Done", 0.2); doneSent = YES; }
+                    return;
+                }
+                if (springboardSent == LSCallUncertain) {
+                    // The SpringBoard request may still land; sending it again
+                    // from Preferences is exactly what LSCallUncertain forbids.
+                    message = @"Location Services may not have changed: the request's result was lost. "
+                              @"Check the switch, then try again if needed.";
                     return;
                 }
                 if (settings_any_registered_live_loop_running() || settings_has_persistent_springboard_remote_call_user()) {
@@ -14389,7 +14441,7 @@ UIViewController *settings_make_daemons_viewer(void)
                 (long)kSBCDefaultFirstPageIcons, (long)kSBCDefaultOtherPageIcons];
     }
     if (s == SectionDarkSwordTweaks) {
-        return @"Imported from DarkSword-Tweaks. These are SpringBoard memory patches; turning one off only skips future applies.";
+        return @"Imported from DarkSword-Tweaks. These are SpringBoard memory patches: one you turn off stays active until the next respring.";
     }
     if (s == SectionDragCoefficient) {
         return @"Overrides _UIAnimationDragCoefficient in SpringBoard. Type the raw coefficient: 1.00 = stock, 0.50 = 2× faster, 0.25 = 4× faster, minimum 0.01. Imported from kolbicz/DarkSword-Tweaks.";
@@ -17759,8 +17811,21 @@ void cyanide_present_contact(UIViewController *host)
         return;
     }
     NSString *key = row[@"key"];
+    // DarkSword patches rewrite SpringBoard methods with no in-session undo:
+    // switching one off after it was applied only skips the next apply. Say
+    // so (read before the applied marker is cleared below).
+    BOOL darkPatchStillLive = !sender.isOn && settings_key_is_dark_tweak(key) &&
+        ![key isEqualToString:kSettingsDSDragCoefficientEnabled] &&
+        ![key isEqualToString:kSettingsDSDragCoefficientValue] &&
+        settings_tweak_is_applied(key);
     [[NSUserDefaults standardUserDefaults] setBool:sender.isOn forKey:key];
     printf("[SETTINGS] toggle %s=%d\n", key.UTF8String, sender.isOn);
+    if (darkPatchStillLive) {
+        log_user("[DST] %s stays active until SpringBoard restarts.\n", key.UTF8String);
+        [self presentRespringPromptWithTitle:@"Respring to Turn It Off?"
+                                     message:[NSString stringWithFormat:@"%@ is still active in SpringBoard. "
+                                              @"It stays on until a respring.", row[@"title"] ?: @"This tweak"]];
+    }
     settings_note_package_configuration_changed(key);
     if ([key isEqualToString:kSettingsKeepAlive]) {
         ds_keepalive_apply_enabled(sender.isOn);
@@ -17962,7 +18027,7 @@ void cyanide_present_contact(UIViewController *host)
 - (void)runLocationServicesToggleAllowingFullExploit:(BOOL)allowFullExploit
 {
     __weak typeof(self) weakSelf = self;
-    settings_location_services_set_async(-1, allowFullExploit, NO, 0, nil,
+    settings_location_services_set_async(-1, allowFullExploit, NO, NO, 0, nil,
                                          ^(BOOL ok, NSString *message, NSTimeInterval resultAge) {
         typeof(self) me = weakSelf;
         [me reloadLocationSimUI];
