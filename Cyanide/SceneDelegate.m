@@ -153,6 +153,8 @@ static BOOL scene_request_launched_app(void)
 @property (nonatomic, assign) BOOL homeOnNextActivation;
 // With homeOnNextActivation: the app to go back to instead of Home (nil = Home).
 @property (nonatomic, copy) NSString *returnAppOnNextActivation;
+// Generation that owns the deferred return. A newer action supersedes it.
+@property (nonatomic, assign) NSUInteger deferredReturnGeneration;
 // Whether the waiting request (pendingActionURL) brought Cyanide to the
 // front, judged when it arrived (g_scene_visit_user_owned).
 @property (nonatomic, assign) BOOL pendingActionBroughtToFront;
@@ -725,7 +727,6 @@ static const double kQuietMinPhase = 0.35;   // a phase stays readable at least 
         else [self showAlertTitle:@"Location Services" message:busy];
         return;
     }
-    self.homeOnNextActivation = NO;
     int desired = -1;
     BOOL keepCard = NO, showLog = NO;
     NSString *parseError = nil;
@@ -735,6 +736,11 @@ static const double kQuietMinPhase = 0.35;   // a phase stays readable at least 
         if (requester) requester(NO, parseError);
         return;
     }
+    // A newly accepted action supersedes a deferred return owned by an older
+    // run. Invalid or rejected requests leave the completed run's intent alone.
+    self.homeOnNextActivation = NO;
+    self.returnAppOnNextActivation = nil;
+    self.deferredReturnGeneration = 0;
     // Only a run that cold-launched Cyanide removes the switcher card (and
     // keepInSwitcher=1 opts even that out). A run that found Cyanide open
     // keeps the card — the app was the user's before the request.
@@ -831,6 +837,7 @@ static const double kQuietMinPhase = 0.35;   // a phase stays readable at least 
                     // when it is back, instead of staying on the result.
                     me2.homeOnNextActivation = YES;
                     me2.returnAppOnNextActivation = returnApp;
+                    me2.deferredReturnGeneration = generation;
                     return;
                 }
                 [me2 leaveToApp:returnApp];
@@ -919,10 +926,15 @@ static const double kQuietMinPhase = 0.35;   // a phase stays readable at least 
         self.pendingActionBroughtToFront = NO;
         [self handleActionURL:url completion:completion coldLaunched:cold broughtToFront:broughtToFront];
     } else if (self.homeOnNextActivation && !self.actionInProgress) {
+        BOOL ownedByCurrentAction = self.deferredReturnGeneration == self.actionGeneration;
+        NSString *app = ownedByCurrentAction ? self.returnAppOnNextActivation : nil;
         self.homeOnNextActivation = NO;
-        NSString *app = self.returnAppOnNextActivation;
         self.returnAppOnNextActivation = nil;
-        [self leaveToApp:app];
+        self.deferredReturnGeneration = 0;
+        if (ownedByCurrentAction) {
+            [self leaveToApp:app];
+            return; // Do not present an update prompt over this action's return.
+        }
     }
     // Runs every foreground; UpdateChecker enforces a per-process + 24-hour
     // persisted throttle so the API isn't hammered.
@@ -968,8 +980,18 @@ static const double kQuietMinPhase = 0.35;   // a phase stays readable at least 
         pendingQuiet = scene_parse_location_url(pending, &desired, &keep, &showLog, &err) && !showLog;
     }
     if (!self.actionInProgress && !pendingQuiet) [self hideQuietCover];
-    self.homeOnNextActivation = NO;   // a real reopen: the user wants the app
-    self.returnAppOnNextActivation = nil;
+    // Foreground entry does not establish a new user-owned visit: an interrupted
+    // shortcut can pass through real background before its deferred return is
+    // consumed. Preserve that action's intent. Normal reopens after a completed
+    // return have no pending intent; a newer accepted action supersedes it.
+    BOOL preserveDeferredReturn = self.homeOnNextActivation &&
+        self.deferredReturnGeneration != 0 &&
+        self.deferredReturnGeneration == self.actionGeneration;
+    if (!preserveDeferredReturn) {
+        self.homeOnNextActivation = NO;
+        self.returnAppOnNextActivation = nil;
+        self.deferredReturnGeneration = 0;
+    }
     settings_application_will_enter_foreground();
 }
 
