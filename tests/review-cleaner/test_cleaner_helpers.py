@@ -87,8 +87,27 @@ check(exists(cache), "cache root preserved");
 // Normal nested files remain cleanable using the descriptor walk.
 put([cache stringByAppendingPathComponent:@"nested/file.bin"], 1024);
 check(cleaner_tree_bytes(cache, NULL, &complete) == 1024 && complete, "normal scan");
+removed = failed = 0;
 check(cleaner_clear_directory(cache, &removed, &failed) == 1024 && removed == 1 && failed == 0, "normal clear");
 check(exists(cache) && !exists([cache stringByAppendingPathComponent:@"nested"]), "only root contents removed");
+
+// tmp must not erase results from an earlier cache operation.
+a = app(); cache = [a stringByAppendingPathComponent:@"Library/Caches"];
+NSString *tmp = [a stringByAppendingPathComponent:@"tmp"]; mkdirp(tmp);
+put([cache stringByAppendingPathComponent:@"cache.bin"], 2048);
+removed = failed = 0;
+unsigned long long bytes = cleaner_clear_directory(cache, &removed, &failed);
+bytes += cleaner_clear_directory(tmp, &removed, &failed);
+check(bytes == 2048 && removed == 1 && failed == 0, "cache-only counters survive empty tmp");
+
+// Errors from either root must likewise survive the next call.
+check([NSFileManager.defaultManager removeItemAtPath:cache error:nil], "remove empty cache fixture");
+check(symlink("../tmp", cache.fileSystemRepresentation) == 0, "rejected cache root fixture");
+removed = failed = 0;
+cleaner_clear_directory(cache, &removed, &failed);
+NSUInteger cacheFailures = failed;
+cleaner_clear_directory(tmp, &removed, &failed);
+check(cacheFailures > 0 && failed == cacheFailures, "cache error survives empty tmp");
 '''
 
 class CleanerHelperTests(unittest.TestCase):

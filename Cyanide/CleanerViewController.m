@@ -197,14 +197,12 @@ static unsigned long long cleaner_remove_tree_at(int parentFD, const char *name,
 }
 
 // Removes the CONTENTS of `dir`, never the directory itself. Returns the number
-// of bytes whose removal succeeded.
+// of bytes whose removal succeeded. Counters accumulate across roots; callers
+// initialize them once per app, just as for cleaner_remove_tree_at.
 static unsigned long long cleaner_clear_directory(NSString *dir,
                                                   NSUInteger *removed,
                                                   NSUInteger *failed)
 {
-    if (removed) *removed = 0;
-    if (failed) *failed = 0;
-
     int rootFD = cleaner_open_root(dir);
     if (rootFD < 0) {
         if (errno != ENOENT && failed) (*failed)++;
