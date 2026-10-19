@@ -13,10 +13,15 @@
 #import <unistd.h>
 #import <fcntl.h>
 #import <dirent.h>
+#import <string.h>
+#import <time.h>
 
 static NSString * const kCleanerAppDataPrefix =
     @"/private/var/mobile/Containers/Data/Application/";
 static const NSUInteger kCleanerMaxScanEntries = 250000;
+static const NSUInteger kCleanerMaxTraversalDepth = 64;
+static const double kCleanerMaxScanSeconds = 15;
+static const double kCleanerMaxCleanSeconds = 60;
 
 static void cleaner_suppress_popup_bar(UIViewController *vc, BOOL suppressed)
 {
@@ -85,19 +90,67 @@ static BOOL cleaner_process_is_active(NSString *executable, NSSet<NSString *> *a
     return NO;
 }
 
-// Takes ownership of fd. A physical descriptor walk cannot be redirected by
-// replacing an ancestor pathname after the root was opened.
+// All entry kinds consume the budget, including empty directories and links.
+// A cancellation pointer belongs to the enclosing operation and uses atomic
+// accesses because background expiration is delivered on the main thread.
+typedef struct {
+    NSUInteger entries;
+    NSUInteger files;
+    double deadline;
+    int *cancelled;
+    BOOL stopped;
+} CYCleanerTraversal;
+
+static double cleaner_monotonic_seconds(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return -1;
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static CYCleanerTraversal cleaner_traversal(double seconds, int *cancelled)
+{
+    double now = cleaner_monotonic_seconds();
+    return (CYCleanerTraversal){ .deadline = now + seconds,
+                                 .cancelled = cancelled, .stopped = (now < 0) };
+}
+
+static BOOL cleaner_traversal_should_stop(CYCleanerTraversal *walk, NSUInteger depth)
+{
+    double now = cleaner_monotonic_seconds();
+    if (walk->stopped || depth > kCleanerMaxTraversalDepth || now < 0 ||
+        now >= walk->deadline ||
+        (walk->cancelled && __atomic_load_n(walk->cancelled, __ATOMIC_RELAXED))) {
+        walk->stopped = YES;
+        return YES;
+    }
+    return NO;
+}
+
+static BOOL cleaner_visit_entry(CYCleanerTraversal *walk, NSUInteger depth)
+{
+    if (cleaner_traversal_should_stop(walk, depth)) return NO;
+    if (walk->entries >= kCleanerMaxScanEntries) { walk->stopped = YES; return NO; }
+    walk->entries++;
+    return YES;
+}
+
+// Takes ownership of fd. Open descriptors, never ancestor pathnames, anchor
+// the walk. Bounded depth also bounds the number of descriptors on the stack.
 static unsigned long long cleaner_scan_directory_fd(int fd, dev_t device,
-                                                     NSUInteger *count, BOOL *complete)
+                                                     NSUInteger depth,
+                                                     CYCleanerTraversal *walk,
+                                                     BOOL *complete)
 {
     DIR *dir = fdopendir(fd);
     if (!dir) { close(fd); *complete = NO; return 0; }
     unsigned long long total = 0;
-    while (*count < kCleanerMaxScanEntries) {
+    while (!cleaner_traversal_should_stop(walk, depth)) {
         errno = 0;
         struct dirent *entry = readdir(dir);
         if (!entry) { if (errno) *complete = NO; break; }
         if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        if (!cleaner_visit_entry(walk, depth + 1)) break;
         struct stat st = {0};
         if (fstatat(fd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
             if (errno != ENOENT) *complete = NO;
@@ -106,7 +159,7 @@ static unsigned long long cleaner_scan_directory_fd(int fd, dev_t device,
         if (st.st_dev != device) { *complete = NO; continue; }
         if (S_ISREG(st.st_mode)) {
             total += (unsigned long long)st.st_size;
-            (*count)++;
+            walk->files++;
         } else if (S_ISDIR(st.st_mode)) {
             int child = openat(fd, entry->d_name,
                                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -116,11 +169,35 @@ static unsigned long long cleaner_scan_directory_fd(int fd, dev_t device,
                 opened.st_ino != st.st_ino) {
                 close(child); *complete = NO; continue;
             }
-            total += cleaner_scan_directory_fd(child, device, count, complete);
+            total += cleaner_scan_directory_fd(child, device, depth + 1, walk, complete);
         }
     }
-    if (*count >= kCleanerMaxScanEntries) *complete = NO;
+    if (walk->stopped) *complete = NO;
     closedir(dir);
+    return total;
+}
+
+static unsigned long long cleaner_tree_bytes_cancellable(NSString *root,
+                                                          NSUInteger *fileCount,
+                                                          BOOL *complete,
+                                                          int *cancelled)
+{
+    if (fileCount) *fileCount = 0;
+    BOOL finished = YES;
+    CYCleanerTraversal walk = cleaner_traversal(kCleanerMaxScanSeconds, cancelled);
+    if (cleaner_traversal_should_stop(&walk, 0)) {
+        if (complete) *complete = NO;
+        return 0;
+    }
+    int fd = cleaner_open_root(root);
+    if (fd < 0) { if (complete) *complete = (errno == ENOENT); return 0; }
+    struct stat st = {0};
+    if (fstat(fd, &st) != 0) {
+        close(fd); if (complete) *complete = NO; return 0;
+    }
+    unsigned long long total = cleaner_scan_directory_fd(fd, st.st_dev, 0, &walk, &finished);
+    if (fileCount) *fileCount = walk.files;
+    if (complete) *complete = finished;
     return total;
 }
 
@@ -128,36 +205,27 @@ static unsigned long long cleaner_tree_bytes(NSString *root,
                                              NSUInteger *fileCount,
                                              BOOL *complete)
 {
-    if (fileCount) *fileCount = 0;
-    BOOL finished = YES;
-    int fd = cleaner_open_root(root);
-    if (fd < 0) { if (complete) *complete = (errno == ENOENT); return 0; }
-    struct stat st = {0};
-    if (fstat(fd, &st) != 0) {
-        close(fd); if (complete) *complete = NO; return 0;
-    }
-    NSUInteger count = 0;
-    unsigned long long total = cleaner_scan_directory_fd(fd, st.st_dev, &count, &finished);
-    if (fileCount) *fileCount = count;
-    if (complete) *complete = finished;
-    return total;
+    return cleaner_tree_bytes_cancellable(root, fileCount, complete, NULL);
 }
 
-// Recursive removal relative to an open directory, with O_NOFOLLOW at every
-// step. Using fstatat/openat/unlinkat instead of path-based NSFileManager closes
-// the symlink-swap race: an app being cleaned cannot turn one of its cache
-// entries into a link to another container between our check and our delete.
+// Removal is always relative to an open, no-follow descriptor. Mounts and
+// swapped directory identities are rejected. Successfully removed child bytes
+// remain reportable even if an enclosing directory is left behind.
 static unsigned long long cleaner_remove_tree_at(int parentFD, const char *name,
+                                                 NSUInteger depth, dev_t device,
+                                                 CYCleanerTraversal *walk,
                                                  NSUInteger *removed,
                                                  NSUInteger *failed)
 {
+    if (!cleaner_visit_entry(walk, depth)) return 0;
     struct stat st = {0};
     if (fstatat(parentFD, name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
         if (errno != ENOENT && failed) (*failed)++;
         return 0;
     }
-
+    if (st.st_dev != device) { if (failed) (*failed)++; return 0; }
     if (!S_ISDIR(st.st_mode)) {
+        if (cleaner_traversal_should_stop(walk, depth)) return 0;
         if (unlinkat(parentFD, name, 0) == 0) {
             if (removed) (*removed)++;
             return S_ISREG(st.st_mode) ? (unsigned long long)st.st_size : 0;
@@ -166,67 +234,64 @@ static unsigned long long cleaner_remove_tree_at(int parentFD, const char *name,
         return 0;
     }
 
-    int dirFD = openat(parentFD, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    if (dirFD < 0) {
-        if (failed) (*failed)++;
-        return 0;
+    int fd = openat(parentFD, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) { if (failed) (*failed)++; return 0; }
+    struct stat opened = {0};
+    if (fstat(fd, &opened) != 0 || opened.st_dev != device || opened.st_ino != st.st_ino) {
+        close(fd); if (failed) (*failed)++; return 0;
     }
-    DIR *dir = fdopendir(dirFD);
-    if (!dir) {
-        close(dirFD);
-        if (failed) (*failed)++;
-        return 0;
-    }
-
-    unsigned long long freed = 0;
-    struct dirent *entry;
-    while ((entry = readdir(dir))) {
-        if (!entry->d_name[0] ||
-            (entry->d_name[0] == '.' && entry->d_name[1] == '\0') ||
-            (entry->d_name[0] == '.' && entry->d_name[1] == '.' &&
-             entry->d_name[2] == '\0')) continue;
-        freed += cleaner_remove_tree_at(dirFD, entry->d_name, removed, failed);
+    DIR *dir = fdopendir(fd);
+    if (!dir) { close(fd); if (failed) (*failed)++; return 0; }
+    unsigned long long bytes = 0;
+    while (!cleaner_traversal_should_stop(walk, depth)) {
+        errno = 0;
+        struct dirent *entry = readdir(dir);
+        if (!entry) { if (errno && failed) (*failed)++; break; }
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        bytes += cleaner_remove_tree_at(fd, entry->d_name, depth + 1, device, walk, removed, failed);
     }
     closedir(dir);
-
-    if (unlinkat(parentFD, name, AT_REMOVEDIR) != 0) {
-        if (failed) (*failed)++;
-        // Deleted children stay deleted even when another child keeps this
-        // directory alive. Preserve their successful byte total.
+    if (!cleaner_traversal_should_stop(walk, depth)) {
+        struct stat current = {0};
+        if (fstatat(parentFD, name, &current, AT_SYMLINK_NOFOLLOW) != 0 ||
+            current.st_dev != st.st_dev || current.st_ino != st.st_ino ||
+            unlinkat(parentFD, name, AT_REMOVEDIR) != 0) {
+            if (failed) (*failed)++;
+        }
     }
-    return freed;
+    return bytes;
 }
 
-// Removes the CONTENTS of `dir`, never the directory itself. Returns the number
-// of bytes whose removal succeeded. Counters accumulate across roots; callers
-// initialize them once per app, just as for cleaner_remove_tree_at.
+// Counters accumulate across roots; initialize them once per app. A supplied
+// traversal shares the whole clean pass's budget/cancellation. NULL creates a
+// standalone bounded root operation (also useful to deterministic tests).
 static unsigned long long cleaner_clear_directory(NSString *dir,
                                                   NSUInteger *removed,
-                                                  NSUInteger *failed)
+                                                  NSUInteger *failed,
+                                                  CYCleanerTraversal *operation)
 {
-    int rootFD = cleaner_open_root(dir);
-    if (rootFD < 0) {
+    CYCleanerTraversal local = cleaner_traversal(kCleanerMaxCleanSeconds, NULL);
+    CYCleanerTraversal *walk = operation ?: &local;
+    if (cleaner_traversal_should_stop(walk, 0)) return 0;
+    int fd = cleaner_open_root(dir);
+    if (fd < 0) {
         if (errno != ENOENT && failed) (*failed)++;
         return 0;
     }
-    DIR *root = fdopendir(rootFD);
-    if (!root) {
-        close(rootFD);
-        if (failed) (*failed)++;
-        return 0;
-    }
-
-    unsigned long long freed = 0;
-    struct dirent *entry;
-    while ((entry = readdir(root))) {
-        if (!entry->d_name[0] ||
-            (entry->d_name[0] == '.' && entry->d_name[1] == '\0') ||
-            (entry->d_name[0] == '.' && entry->d_name[1] == '.' &&
-             entry->d_name[2] == '\0')) continue;
-        freed += cleaner_remove_tree_at(rootFD, entry->d_name, removed, failed);
+    struct stat st = {0};
+    if (fstat(fd, &st) != 0) { close(fd); if (failed) (*failed)++; return 0; }
+    DIR *root = fdopendir(fd);
+    if (!root) { close(fd); if (failed) (*failed)++; return 0; }
+    unsigned long long bytes = 0;
+    while (!cleaner_traversal_should_stop(walk, 0)) {
+        errno = 0;
+        struct dirent *entry = readdir(root);
+        if (!entry) { if (errno && failed) (*failed)++; break; }
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        bytes += cleaner_remove_tree_at(fd, entry->d_name, 1, st.st_dev, walk, removed, failed);
     }
     closedir(root);
-    return freed;
+    return bytes;
 }
 
 @interface CYCleanerItem : NSObject <NSCopying>
@@ -786,8 +851,8 @@ static BOOL cleaner_intro_accepted(void)
                     [self reloadSummary];
                 });
                 // Apps with nothing reclaimable are noise in this screen.
-                if (item.totalBytes == 0) continue;
-                item.selected = processListAvailable && !item.active && !item.systemApp;
+                if (item.totalBytes == 0 && !item.incomplete) continue;
+                item.selected = item.totalBytes > 0 && processListAvailable && !item.active && !item.systemApp;
                 [items addObject:item];
             }
 
@@ -887,18 +952,31 @@ static BOOL cleaner_intro_accepted(void)
     NSMutableArray<CYCleanerItem *> *work = [NSMutableArray array];
     for (CYCleanerItem *item in self.items) if (item.selected) [work addObject:[item copy]];
 
-    __block UIBackgroundTaskIdentifier bgTask =
-        [UIApplication.sharedApplication beginBackgroundTaskWithName:@"cyanide.cleaner" expirationHandler:^{}];
+    __block int cancelled = 0;
+    __block UIBackgroundTaskIdentifier bgTask = UIBackgroundTaskInvalid;
+    bgTask = [UIApplication.sharedApplication beginBackgroundTaskWithName:@"cyanide.cleaner" expirationHandler:^{
+        __atomic_store_n(&cancelled, 1, __ATOMIC_RELAXED);
+        // UIKit invokes expiration on the main thread. End the lease now,
+        // not after an unbounded worker or rescan eventually finishes.
+        if (bgTask != UIBackgroundTaskInvalid) {
+            [UIApplication.sharedApplication endBackgroundTask:bgTask];
+            bgTask = UIBackgroundTaskInvalid;
+        }
+    }];
+    if (bgTask == UIBackgroundTaskInvalid) __atomic_store_n(&cancelled, 1, __ATOMIC_RELAXED);
 
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
-            NSSet<NSString *> *active = settings_active_process_names();
+            CYCleanerTraversal traversal = cleaner_traversal(kCleanerMaxCleanSeconds, &cancelled);
+            NSSet<NSString *> *active = cleaner_traversal_should_stop(&traversal, 0)
+                ? nil : settings_active_process_names();
             NSUInteger cleanedApps = 0, skippedActive = 0, failedApps = 0, done = 0;
             unsigned long long freed = 0;
 
             if (active) {
                 for (CYCleanerItem *item in work) {
+                    if (cleaner_traversal_should_stop(&traversal, 0)) break;
                     done++;
                     float fraction = (float)done / (float)MAX(work.count, (NSUInteger)1);
                     dispatch_async(dispatch_get_main_queue(), ^{
@@ -916,26 +994,33 @@ static BOOL cleaner_intro_accepted(void)
                     unsigned long long appFreed = 0;
                     appFreed += cleaner_clear_directory(
                         [item.container.path stringByAppendingPathComponent:@"Library/Caches"],
-                        &removed, &failed);
+                        &removed, &failed, &traversal);
                     appFreed += cleaner_clear_directory(
                         [item.container.path stringByAppendingPathComponent:@"tmp"],
-                        &removed, &failed);
+                        &removed, &failed, &traversal);
                     freed += appFreed;
 
-                    BOOL complete = NO;
-                    item.cacheBytes = cleaner_tree_bytes(
-                        [item.container.path stringByAppendingPathComponent:@"Library/Caches"], NULL, &complete);
-                    item.incomplete = !complete;
-                    complete = NO;
-                    item.tempBytes = cleaner_tree_bytes(
-                        [item.container.path stringByAppendingPathComponent:@"tmp"], NULL, &complete);
-                    item.incomplete = item.incomplete || !complete;
+                    if (cleaner_traversal_should_stop(&traversal, 0)) {
+                        // Retain the last known sizes rather than pretending an
+                        // interrupted/unreadable rescan proved the roots empty.
+                        item.incomplete = YES;
+                    } else {
+                        BOOL complete = NO;
+                        item.cacheBytes = cleaner_tree_bytes_cancellable(
+                            [item.container.path stringByAppendingPathComponent:@"Library/Caches"], NULL, &complete, &cancelled);
+                        item.incomplete = !complete;
+                        complete = NO;
+                        item.tempBytes = cleaner_tree_bytes_cancellable(
+                            [item.container.path stringByAppendingPathComponent:@"tmp"], NULL, &complete, &cancelled);
+                        item.incomplete = item.incomplete || !complete;
+                    }
                     item.selected = NO;
                     if (failed > 0) failedApps++;
                     if (removed > 0) cleanedApps++;
                 }
             }
 
+            BOOL interrupted = cleaner_traversal_should_stop(&traversal, 0);
             dispatch_async(dispatch_get_main_queue(), ^{
                 typeof(self) self = weakSelf;
                 if (bgTask != UIBackgroundTaskInvalid) {
@@ -945,7 +1030,9 @@ static BOOL cleaner_intro_accepted(void)
                 if (!self) return;
                 self.cleaning = NO;
                 if (!active) {
-                    self.resultText = @"Stopped: the active-app list was unavailable, so nothing was removed.";
+                    self.resultText = interrupted
+                        ? @"Stopped before cleaning: background time or the safety budget was unavailable."
+                        : @"Stopped: the active-app list was unavailable, so nothing was removed.";
                 } else {
                     NSMutableString *result = [NSMutableString stringWithFormat:
                         @"Removed %@ (logical size) from %lu app%@.", cleaner_bytes(freed),
@@ -956,6 +1043,8 @@ static BOOL cleaner_intro_accepted(void)
                     if (failedApps > 0)
                         [result appendFormat:@" Some files in %lu app%@ could not be removed.",
                          (unsigned long)failedApps, failedApps == 1 ? @"" : @"s"];
+                    if (interrupted)
+                        [result appendString:@" Cleaning stopped at a safety limit or background expiration; results are partial."];
                     self.resultText = result;
                 }
                 NSMutableDictionary<NSString *, CYCleanerItem *> *results = [NSMutableDictionary dictionary];
@@ -963,7 +1052,7 @@ static BOOL cleaner_intro_accepted(void)
                 NSMutableArray<CYCleanerItem *> *published = [NSMutableArray array];
                 for (CYCleanerItem *oldItem in self.items) {
                     CYCleanerItem *item = results[oldItem.container.path] ?: oldItem;
-                    if (item.totalBytes > 0) [published addObject:item];
+                    if (item.totalBytes > 0 || item.incomplete) [published addObject:item];
                 }
                 // Replace the model and reload together. Offscreen folder-review
                 // controllers keep their original stable item snapshots.
@@ -1096,7 +1185,7 @@ static BOOL cleaner_intro_accepted(void)
     if (item.cacheBytes > 0) [parts addObject:[NSString stringWithFormat:@"%@ cache", cleaner_bytes(item.cacheBytes)]];
     if (item.tempBytes > 0) [parts addObject:[NSString stringWithFormat:@"%@ temp", cleaner_bytes(item.tempBytes)]];
     if (item.active) [parts addObject:@"in use"];
-    else if (item.incomplete) [parts addObject:@"partly unreadable"];
+    else if (item.incomplete) [parts addObject:@"incomplete scan"];
     cell.detailLabel.text = [parts componentsJoinedByString:@" · "];
     cell.sizeLabel.text = item.incomplete ? [@"≥ " stringByAppendingString:cleaner_bytes(item.totalBytes)]
                                           : cleaner_bytes(item.totalBytes);

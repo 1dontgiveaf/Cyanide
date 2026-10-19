@@ -20,6 +20,7 @@ PREAMBLE = r'''
 #import <fcntl.h>
 #import <dirent.h>
 #import <string.h>
+#import <time.h>
 NSString *fb_canonical_path(NSString *path) {
     NSString *p = path.stringByStandardizingPath;
     if ([p isEqualToString:@"/var"] || [p hasPrefix:@"/var/"])
@@ -56,7 +57,7 @@ NSString *cache = [a stringByAppendingPathComponent:@"Library/Caches"];
 BOOL complete = YES;
 NSUInteger removed = 0, failed = 0;
 check(cleaner_tree_bytes(cache, NULL, &complete) == 0 && !complete, "ancestor scan refused");
-check(cleaner_clear_directory(cache, &removed, &failed) == 0 && failed > 0, "ancestor clear refused");
+check(cleaner_clear_directory(cache, &removed, &failed, NULL) == 0 && failed > 0, "ancestor clear refused");
 check(exists(document), "document survives Library symlink");
 
 // An otherwise valid UUID container may itself be a symlink.
@@ -64,14 +65,14 @@ NSString *outside = [kCleanerAppDataPrefix.stringByDeletingLastPathComponent str
 put([outside stringByAppendingPathComponent:@"tmp/keep.txt"], 512);
 NSString *linkedContainer = [kCleanerAppDataPrefix stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
 check(symlink(outside.fileSystemRepresentation, linkedContainer.fileSystemRepresentation) == 0, "container link");
-check(cleaner_clear_directory([linkedContainer stringByAppendingPathComponent:@"tmp"], &removed, &failed) == 0 && failed > 0, "container link refused");
+check(cleaner_clear_directory([linkedContainer stringByAppendingPathComponent:@"tmp"], &removed, &failed, NULL) == 0 && failed > 0, "container link refused");
 check(exists([outside stringByAppendingPathComponent:@"tmp/keep.txt"]), "external target survives");
 
 // Even within a valid container, arbitrary nested tmp/Caches roots are forbidden.
 NSString *nested = [a stringByAppendingPathComponent:@"Documents/tmp"];
 put([nested stringByAppendingPathComponent:@"keep.txt"], 256);
 check(!cleaner_is_disposable_root(nested), "nested root guard");
-cleaner_clear_directory(nested, &removed, &failed);
+cleaner_clear_directory(nested, &removed, &failed, NULL);
 check(exists([nested stringByAppendingPathComponent:@"keep.txt"]), "nested document survives");
 
 // A link INSIDE the disposable root is unlinked; its target is never followed.
@@ -79,7 +80,7 @@ a = app(); cache = [a stringByAppendingPathComponent:@"Library/Caches"];
 mkdirp(cache); document = [a stringByAppendingPathComponent:@"Documents/keep.txt"]; put(document, 128);
 NSString *link = [cache stringByAppendingPathComponent:@"link"];
 check(symlink(document.fileSystemRepresentation, link.fileSystemRepresentation) == 0, "child link");
-cleaner_clear_directory(cache, &removed, &failed);
+cleaner_clear_directory(cache, &removed, &failed, NULL);
 struct stat st;
 check(lstat(link.fileSystemRepresentation, &st) != 0 && exists(document), "child link removed without target deletion");
 check(exists(cache), "cache root preserved");
@@ -88,7 +89,7 @@ check(exists(cache), "cache root preserved");
 put([cache stringByAppendingPathComponent:@"nested/file.bin"], 1024);
 check(cleaner_tree_bytes(cache, NULL, &complete) == 1024 && complete, "normal scan");
 removed = failed = 0;
-check(cleaner_clear_directory(cache, &removed, &failed) == 1024 && removed == 1 && failed == 0, "normal clear");
+check(cleaner_clear_directory(cache, &removed, &failed, NULL) == 1024 && removed == 1 && failed == 0, "normal clear");
 check(exists(cache) && !exists([cache stringByAppendingPathComponent:@"nested"]), "only root contents removed");
 
 // tmp must not erase results from an earlier cache operation.
@@ -96,17 +97,17 @@ a = app(); cache = [a stringByAppendingPathComponent:@"Library/Caches"];
 NSString *tmp = [a stringByAppendingPathComponent:@"tmp"]; mkdirp(tmp);
 put([cache stringByAppendingPathComponent:@"cache.bin"], 2048);
 removed = failed = 0;
-unsigned long long bytes = cleaner_clear_directory(cache, &removed, &failed);
-bytes += cleaner_clear_directory(tmp, &removed, &failed);
+unsigned long long bytes = cleaner_clear_directory(cache, &removed, &failed, NULL);
+bytes += cleaner_clear_directory(tmp, &removed, &failed, NULL);
 check(bytes == 2048 && removed == 1 && failed == 0, "cache-only counters survive empty tmp");
 
 // Errors from either root must likewise survive the next call.
 check([NSFileManager.defaultManager removeItemAtPath:cache error:nil], "remove empty cache fixture");
 check(symlink("../tmp", cache.fileSystemRepresentation) == 0, "rejected cache root fixture");
 removed = failed = 0;
-cleaner_clear_directory(cache, &removed, &failed);
+cleaner_clear_directory(cache, &removed, &failed, NULL);
 NSUInteger cacheFailures = failed;
-cleaner_clear_directory(tmp, &removed, &failed);
+cleaner_clear_directory(tmp, &removed, &failed, NULL);
 check(cacheFailures > 0 && failed == cacheFailures, "cache error survives empty tmp");
 
 // One failed child must not discard bytes already deleted from its parent.
@@ -117,7 +118,7 @@ if (geteuid() != 0) {
     mkdirp(blocked); put(deletable, 1024);
     check(chmod(blocked.fileSystemRepresentation, 0000) == 0, "make blocked fixture");
     removed = failed = 0;
-    bytes = cleaner_clear_directory(cache, &removed, &failed);
+    bytes = cleaner_clear_directory(cache, &removed, &failed, NULL);
     // Restore permissions BEFORE asserting so temporary-directory cleanup is safe.
     chmod(blocked.fileSystemRepresentation, 0700);
     check(bytes == 1024 && removed == 1 && failed > 0 && !exists(deletable), "partial child bytes preserved");
@@ -131,9 +132,50 @@ check(linkat(AT_FDCWD, document.fileSystemRepresentation, AT_FDCWD,
 struct stat before, after;
 check(lstat(document.fileSystemRepresentation, &before) == 0, "stat original");
 removed = failed = 0;
-bytes = cleaner_clear_directory(cache, &removed, &failed);
+bytes = cleaner_clear_directory(cache, &removed, &failed, NULL);
 check(lstat(document.fileSystemRepresentation, &after) == 0, "original survives cache unlink");
 check(bytes == 8192 && before.st_blocks == after.st_blocks && after.st_nlink == 1, "logical bytes differ from recovered space");
+
+// Empty directories count toward the entry cap, not just regular files.
+a = app(); cache = [a stringByAppendingPathComponent:@"Library/Caches"];
+mkdirp([cache stringByAppendingPathComponent:@"one"]);
+mkdirp([cache stringByAppendingPathComponent:@"two"]);
+CYCleanerTraversal walk = cleaner_traversal(10, NULL);
+walk.entries = kCleanerMaxScanEntries - 1;
+int scanFD = cleaner_open_root(cache); struct stat rootStat;
+check(scanFD >= 0 && fstat(scanFD, &rootStat) == 0, "open bounded scan");
+complete = YES;
+cleaner_scan_directory_fd(scanFD, rootStat.st_dev, 0, &walk, &complete);
+check(walk.stopped && !complete && walk.entries == kCleanerMaxScanEntries, "directory-only scan cap");
+walk = cleaner_traversal(10, NULL); walk.entries = kCleanerMaxScanEntries - 1;
+cleaner_clear_directory(cache, &removed, &failed, &walk);
+check(walk.stopped && (exists([cache stringByAppendingPathComponent:@"one"]) ||
+    exists([cache stringByAppendingPathComponent:@"two"])), "directory-only removal cap");
+
+// A bounded stack refuses a very deep cache rather than exhausting descriptors.
+a = app(); cache = [a stringByAppendingPathComponent:@"Library/Caches"];
+NSString *deep = cache;
+for (NSUInteger i = 0; i < kCleanerMaxTraversalDepth + 2; i++) deep = [deep stringByAppendingPathComponent:@"d"];
+NSString *deepFile = [deep stringByAppendingPathComponent:@"keep.bin"]; put(deepFile, 32);
+complete = YES; cleaner_tree_bytes(cache, NULL, &complete);
+check(!complete, "depth-limited scan");
+walk = cleaner_traversal(10, NULL);
+cleaner_clear_directory(cache, &removed, &failed, &walk);
+check(walk.stopped && exists(deepFile), "depth-limited removal");
+
+// Expiration/cancellation gates both deletes and post-clean scans.
+a = app(); cache = [a stringByAppendingPathComponent:@"Library/Caches"];
+NSString *cancelFile = [cache stringByAppendingPathComponent:@"keep.bin"]; put(cancelFile, 64);
+int cancelled = 1;
+walk = cleaner_traversal(10, &cancelled); removed = failed = 0;
+cleaner_clear_directory(cache, &removed, &failed, &walk);
+check(walk.stopped && removed == 0 && exists(cancelFile), "cancelled clean leaves data intact");
+complete = YES;
+cleaner_tree_bytes_cancellable(cache, NULL, &complete, &cancelled);
+check(!complete && exists(cancelFile), "cancelled rescan is incomplete");
+walk = cleaner_traversal(10, NULL); walk.deadline = 0;
+cleaner_clear_directory(cache, &removed, &failed, &walk);
+check(walk.stopped && exists(cancelFile), "expired deadline leaves data intact");
 '''
 
 class CleanerHelperTests(unittest.TestCase):
@@ -144,6 +186,16 @@ class CleanerHelperTests(unittest.TestCase):
         self.assertIn("not guaranteed recovered storage", source)
         self.assertNotIn('@"Freed %@', source)
         self.assertNotIn('@"Reclaimable"', source)
+
+    def test_background_expiration_contract(self):
+        source = SOURCE.read_text()
+        body = source[source.index("- (void)performClean"):source.index("#pragma mark Table")]
+        expiration = body[body.index("expirationHandler:^{"):body.index("if (bgTask == UIBackgroundTaskInvalid)")]
+        self.assertIn("__atomic_store_n(&cancelled, 1", expiration)
+        self.assertIn("endBackgroundTask:bgTask", expiration)
+        self.assertNotIn("expirationHandler:^{}", body)
+        self.assertIn("results are partial", body)
+        self.assertIn("cleaner_tree_bytes_cancellable", body)
 
     def test_native_helpers(self):
         source = SOURCE.read_text()
