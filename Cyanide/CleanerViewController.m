@@ -355,6 +355,14 @@ typedef NS_ENUM(NSInteger, CYCleanerSection) {
 
 typedef NS_ENUM(NSInteger, CYCleanerSort) { CYCleanerSortSize, CYCleanerSortName };
 static NSString * const kCleanerSortKey = @"CleanerSort";
+// The explanation version the user acknowledged; bump to show it again.
+static NSString * const kCleanerIntroAcceptedKey = @"CleanerIntroAcceptedVersion";
+static const NSInteger kCleanerIntroVersion = 1;
+
+static BOOL cleaner_intro_accepted(void)
+{
+    return [NSUserDefaults.standardUserDefaults integerForKey:kCleanerIntroAcceptedKey] >= kCleanerIntroVersion;
+}
 
 @interface CleanerViewController () <UISearchResultsUpdating>
 @property (nonatomic, copy) NSArray<CYCleanerItem *> *items;
@@ -420,6 +428,34 @@ static NSString * const kCleanerSortKey = @"CleanerSort";
     [super viewDidAppear:animated];
     cleaner_suppress_popup_bar(self, YES);
     if (!self.accessReady && !self.loading) [self ensureAccessAllowingFullExploit:NO];
+    [self showIntroIfNeeded];
+}
+
+// Once, on first open: what cleaning removes and what it can cause.
+- (void)showIntroIfNeeded
+{
+    if (cleaner_intro_accepted() || self.presentedViewController) return;
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"Before You Clean"
+                         message:@"Cleaner removes the contents of each app's Library/Caches and tmp folders. "
+                                 @"Documents, settings, logins and other app data are not touched, and apps in use are skipped.\n\n"
+                                 @"What can happen:\n"
+                                 @"• Apps load slower at first and use data to rebuild their caches.\n"
+                                 @"• Some apps keep offline content (music, podcasts, maps, game data) in their cache. "
+                                 @"It has to be downloaded again — check large caches before cleaning.\n"
+                                 @"• Rarely, an app asks you to sign in again or loses an unsent draft.\n"
+                                 @"• An app waiting in the background may crash once when you return to it.\n\n"
+                                 @"The space is freed for a while; apps refill their caches as you use them."
+                  preferredStyle:UIAlertControllerStyleAlert];
+    __weak typeof(self) weakSelf = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
+        [weakSelf.navigationController popViewControllerAnimated:YES];
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Got It" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        [NSUserDefaults.standardUserDefaults setInteger:kCleanerIntroVersion forKey:kCleanerIntroAcceptedKey];
+        [weakSelf updateControls];
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
 }
 
 - (void)viewWillDisappear:(BOOL)animated
@@ -772,6 +808,7 @@ static NSString * const kCleanerSortKey = @"CleanerSort";
 {
     (void)sender;
     if (self.loading || self.cleaning || !self.accessReady) return;
+    if (!cleaner_intro_accepted()) { [self showIntroIfNeeded]; return; }
     if (!self.processListAvailable) {
         UIAlertController *alert = [UIAlertController
             alertControllerWithTitle:@"Kernel Access Needed"
