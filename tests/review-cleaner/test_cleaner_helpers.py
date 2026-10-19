@@ -196,6 +196,15 @@ check(cleaner_should_skip_now(@"ExampleApp", ^{ return (NSSet<NSString *> *)nil;
     "unavailable detection fails closed");
 check(cleaner_should_skip_now(@"", ^{ return [NSSet set]; }, &available) && !available,
     "unknown executable fails closed");
+
+check(cleaner_process_is_active(@"Foo", [NSSet setWithObject:@"Foo"]), "exact process name");
+check(!cleaner_process_is_active(@"FooBar", [NSSet setWithObject:@"Foo"]), "short prefix is not truncation");
+NSString *prefix31 = [@"x" stringByPaddingToLength:31 withString:@"x" startingAtIndex:0];
+check(cleaner_process_is_active([prefix31 stringByAppendingString:@"Tail"], [NSSet setWithObject:prefix31]), "31-byte ASCII truncation");
+NSString *unicode31 = [[@"é" stringByPaddingToLength:15 withString:@"é" startingAtIndex:0] stringByAppendingString:@"A"];
+check(cleaner_process_is_active([unicode31 stringByAppendingString:@"Tail"], [NSSet setWithObject:unicode31]), "31-byte Unicode truncation");
+NSString *characters31 = [@"é" stringByPaddingToLength:31 withString:@"é" startingAtIndex:0];
+check(!cleaner_process_is_active([characters31 stringByAppendingString:@"Tail"], [NSSet setWithObject:characters31]), "31 characters is not 31 bytes");
 '''
 
 class CleanerHelperTests(unittest.TestCase):

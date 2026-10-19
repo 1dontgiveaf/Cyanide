@@ -84,7 +84,10 @@ static BOOL cleaner_process_is_active(NSString *executable, NSSet<NSString *> *a
     if (executable.length == 0 || activeNames.count == 0) return NO;
     if ([activeNames containsObject:executable]) return YES;
     for (NSString *name in activeNames) {
-        if (name.length > 0 && executable.length > name.length &&
+        // p_name truncates bytes, not NSString characters. A short unrelated
+        // process (Foo) must not cause FooBar to be falsely marked active.
+        if ([name lengthOfBytesUsingEncoding:NSUTF8StringEncoding] == 31 &&
+            [executable lengthOfBytesUsingEncoding:NSUTF8StringEncoding] > 31 &&
             [executable hasPrefix:name]) return YES;
     }
     return NO;
