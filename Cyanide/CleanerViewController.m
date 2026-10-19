@@ -1153,11 +1153,6 @@ static BOOL cleaner_intro_accepted(void)
 
             for (CYCleanerItem *item in work) {
                 if (processUnavailable || cleaner_traversal_should_stop(&traversal, 0)) break;
-                done++;
-                float fraction = (float)done / (float)MAX(work.count, (NSUInteger)1);
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [weakSelf.cleanProgress setProgress:fraction animated:YES];
-                });
                 if (!cleaner_path_is_app_data(item.container.path)) { failedApps++; continue; }
 
                 NSUInteger removed = 0, failed = 0;
@@ -1196,6 +1191,13 @@ static BOOL cleaner_intro_accepted(void)
                 item.selected = NO;
                 if (failed > 0) failedApps++;
                 if (removed > 0) cleanedApps++;
+                // Progress reflects finished apps, not started ones: the bar
+                // only reaches 100% when the pass has actually ended.
+                done++;
+                float fraction = (float)done / (float)MAX(work.count, (NSUInteger)1);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [weakSelf.cleanProgress setProgress:fraction animated:YES];
+                });
             }
 
             BOOL interrupted = cleaner_traversal_should_stop(&traversal, 0);
