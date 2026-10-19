@@ -93,18 +93,6 @@ static BOOL cleaner_process_is_active(NSString *executable, NSSet<NSString *> *a
     return NO;
 }
 
-// Never reuse a pass-wide name snapshot. The provider is invoked anew for each
-// root; an unavailable list or unknown executable protects rather than guesses.
-// A process can still launch/resume after this check, so protection is best-effort.
-static BOOL cleaner_should_skip_now(NSString *executable,
-                                     NSSet<NSString *> *(^readActiveNames)(void),
-                                     BOOL *available)
-{
-    NSSet<NSString *> *names = readActiveNames ? readActiveNames() : nil;
-    if (available) *available = (names != nil && executable.length > 0);
-    return !names || executable.length == 0 || cleaner_process_is_active(executable, names);
-}
-
 // All entry kinds consume the budget, including empty directories and links.
 // A cancellation pointer belongs to the enclosing operation and uses atomic
 // accesses because background expiration is delivered on the main thread.
@@ -1155,20 +1143,30 @@ static BOOL cleaner_intro_accepted(void)
                 if (processUnavailable || cleaner_traversal_should_stop(&traversal, 0)) break;
                 if (!cleaner_path_is_app_data(item.container.path)) { failedApps++; continue; }
 
+                // Refresh the active check once per app, before touching any
+                // of its roots: each process-list read is a kernel round
+                // trip, and checking between roots could leave an app
+                // half-cleaned before noticing it had become active. Fail
+                // closed: no list or no executable name means no deletion.
+                BOOL skipApp = NO;
+                NSSet<NSString *> *activeNames = settings_active_process_names();
+                if (!activeNames || item.container.executableName.length == 0) {
+                    processUnavailable = YES;
+                } else if (cleaner_process_is_active(item.container.executableName, activeNames)) {
+                    item.active = YES;
+                    skippedActive++;
+                    skipApp = YES;
+                }
+
                 NSUInteger removed = 0, failed = 0;
                 unsigned long long appFreed = 0;
-                for (NSString *relativeRoot in @[ @"Library/Caches", @"tmp" ]) {
-                    if (cleaner_traversal_should_stop(&traversal, 0)) break;
-                    BOOL available = NO;
-                    if (cleaner_should_skip_now(item.container.executableName,
-                            ^{ return settings_active_process_names(); }, &available)) {
-                        processUnavailable = !available;
-                        if (available) { item.active = YES; skippedActive++; }
-                        break;
+                if (!processUnavailable && !skipApp) {
+                    for (NSString *relativeRoot in @[ @"Library/Caches", @"tmp" ]) {
+                        if (cleaner_traversal_should_stop(&traversal, 0)) break;
+                        appFreed += cleaner_clear_directory(
+                            [item.container.path stringByAppendingPathComponent:relativeRoot],
+                            &removed, &failed, &traversal);
                     }
-                    appFreed += cleaner_clear_directory(
-                        [item.container.path stringByAppendingPathComponent:relativeRoot],
-                        &removed, &failed, &traversal);
                 }
                 freed += appFreed;
 
