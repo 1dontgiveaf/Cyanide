@@ -64,3 +64,24 @@ ASRemovalResult respring_schedule_in_session(double delaySeconds)
     printf("[RESPRING] no relaunch method found in SpringBoard\n");
     return ASRemovalNotScheduled;
 }
+
+ASRemovalResult reboot_schedule_in_session(double delaySeconds)
+{
+    uint64_t fbs = r_class("FBSystemService");
+    if (!r_is_objc_ptr(fbs) || !r_responds(fbs, "sharedInstance")) {
+        printf("[REBOOT] FBSystemService not found\n");
+        return ASRemovalNotScheduled;
+    }
+    uint64_t service = r_msg2_main(fbs, "sharedInstance", 0, 0, 0, 0);
+    if (!r_is_objc_ptr(service) || !r_responds(service, "shutdownAndReboot:")) {
+        printf("[REBOOT] FBSystemService has no usable shutdownAndReboot:\n");
+        return ASRemovalNotScheduled;
+    }
+    BOOL reboot = YES;
+    int r = r_invoke_after_delay(service, "shutdownAndReboot:", &reboot, sizeof(reboot), delaySeconds);
+    printf("[REBOOT] -[FBSystemService shutdownAndReboot:YES] %s (in %.2fs)\n",
+           r == R_DELAY_SCHEDULED ? "scheduled" :
+           r == R_DELAY_UNKNOWN ? "result UNKNOWN (treated as scheduled)" : "could not be scheduled",
+           delaySeconds);
+    return respring_result(r);
+}

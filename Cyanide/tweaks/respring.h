@@ -13,4 +13,10 @@
 #include "app_switcher.h"
 ASRemovalResult respring_schedule_in_session(double delaySeconds);
 
+// Asks FrontBoard to reboot the device after `delaySeconds`
+// (-[FBSystemService shutdownAndReboot:YES], the system's own restart),
+// scheduled on SpringBoard's main run loop so it fires after this session is
+// gone. Needs an open SpringBoard session.
+ASRemovalResult reboot_schedule_in_session(double delaySeconds);
+
 #endif /* respring_h */

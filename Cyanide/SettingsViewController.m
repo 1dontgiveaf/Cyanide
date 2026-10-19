@@ -1193,6 +1193,7 @@ enum {
     kSettingsLockRun = 2,
 };
 static volatile int g_settings_respring_cleanup_running = 0;
+static volatile int g_settings_reboot_running = 0;
 static volatile int g_settings_actions_rerun_requested = 0;
 // Remembers how the last chain run was invoked so the post-failure "Run Again"
 // alert can re-enter with the same mode (full Apply vs pending-only).
@@ -2922,7 +2923,8 @@ static void settings_notify_remote_call_state_changed_preserving_applied(BOOL pr
 static BOOL settings_cleanup_in_progress(void)
 {
     return g_settings_cleanup_running != 0 ||
-           g_settings_respring_cleanup_running != 0;
+           g_settings_respring_cleanup_running != 0 ||
+           g_settings_reboot_running != 0;
 }
 
 static void settings_request_all_live_loops_stop(const char *reason)
@@ -3687,22 +3689,29 @@ static void settings_destroy_springboard_remote_call_locked(const char *reason)
 // usually ends Cyanide, so it must not start before that's done.
 static const double kRespringDelay = 2.5;
 
-static void settings_prepare_for_respring_sync(void)
+// Reboot: same cleanup as a respring, then FrontBoard's own reboot instead of
+// a relaunch. Returns whether the reboot was scheduled (there is no fallback:
+// without a SpringBoard session nothing can ask the system to reboot).
+static const double kRebootDelay = 2.5;
+
+static BOOL settings_prepare_for_restart_sync(BOOL reboot)
 {
-    log_user("[RESPRING] Stopping live sessions before respring.\n");
-    printf("[SETTINGS] preparing for respring cleanup rcReady=%d\n", g_springboard_rc_ready);
+    const char *tag = reboot ? "[REBOOT]" : "[RESPRING]";
+    log_user("%s Stopping live sessions before %s.\n", tag, reboot ? "reboot" : "respring");
+    printf("[SETTINGS] preparing for %s cleanup rcReady=%d\n", reboot ? "reboot" : "respring", g_springboard_rc_ready);
     settings_request_all_live_loops_stop("pre-respring cleanup");
     settings_end_statbar_background_task_async("pre-respring cleanup");
     BOOL loopsStopped = settings_wait_live_loops_stopped_for_switch("pre-respring cleanup");
 
     g_respring_scheduled = 0;
+    BOOL rebootScheduled = NO;
     uint64_t scheduledNs = 0;
     // A direct relaunch needs a SpringBoard session; open one if kernel
     // access is live or parked (never a full exploit run for this).
     BOOL kernelReady = g_springboard_rc_ready || settings_ensure_kexploit_for_read();
     @synchronized (settings_rc_lock()) {
         if (!g_springboard_rc_ready && kernelReady) {
-            log_user("[RESPRING] Opening SpringBoard to ask it to restart…\n");
+            log_user("%s Opening SpringBoard to ask it to %s…\n", tag, reboot ? "reboot" : "restart");
             settings_ensure_springboard_remote_call_locked();
         }
         if (g_springboard_rc_ready) {
@@ -3711,7 +3720,19 @@ static void settings_prepare_for_respring_sync(void)
             settings_stop_springboard_tweaks_locked("pre-respring cleanup", YES);
             // A live loop that didn't stop could still be working when the
             // relaunch fires: then the WebKit fallback below instead.
-            if (!loopsStopped) {
+            if (reboot) {
+                // Everything stops at a reboot, so a loop that didn't stop in
+                // time is no reason to refuse; it is logged.
+                if (!loopsStopped)
+                    log_user("[REBOOT] A live tweak loop didn't stop in time; rebooting anyway.\n");
+                ASRemovalResult sched = reboot_schedule_in_session(kRebootDelay);
+                if (sched != ASRemovalNotScheduled) {
+                    rebootScheduled = YES;
+                    scheduledNs = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+                    if (sched == ASRemovalUnknown)
+                        log_user("[REBOOT] The reboot request's result was lost; it may still happen.\n");
+                }
+            } else if (!loopsStopped) {
                 log_user("[RESPRING] A live tweak loop didn't stop in time; using the fallback respring.\n");
             } else {
                 ASRemovalResult sched = respring_schedule_in_session(kRespringDelay);
@@ -3741,16 +3762,34 @@ static void settings_prepare_for_respring_sync(void)
         settings_notify_remote_call_state_changed();
     }
 
+    if (reboot) {
+        if (rebootScheduled) {
+            double elapsed = (double)(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - scheduledNs) / 1e9;
+            log_user("[REBOOT] Cleanup complete after %.2fs; the device reboots %.1fs after the request.\n",
+                     elapsed, kRebootDelay);
+        } else {
+            log_user("[REBOOT] Could not ask the system to reboot: %s\n",
+                     kernelReady ? "SpringBoard did not accept the request."
+                                 : "no kernel access from an earlier run (open Run first).");
+        }
+        return rebootScheduled;
+    }
     if (g_respring_scheduled) {
         double elapsed = (double)(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) - scheduledNs) / 1e9;
         log_user("[RESPRING] Cleanup complete after %.2fs; SpringBoard restarts %.1fs after the request.\n",
                  elapsed, kRespringDelay);
         if (elapsed > kRespringDelay - 0.5)
             log_user("[RESPRING] WARNING: cleanup took %.2fs, close to the %.1fs restart.\n", elapsed, kRespringDelay);
-        return;
+        return YES;
     }
     log_user("[RESPRING] Cleanup complete. Opening respring flow.\n");
     usleep(300000);
+    return YES;
+}
+
+static void settings_prepare_for_respring_sync(void)
+{
+    (void)settings_prepare_for_restart_sync(NO);
 }
 
 // Round 6: warm fastkill session lifetime policy.
@@ -13181,6 +13220,53 @@ NSData *settings_root_read_file(NSString *path, NSUInteger maxBytes, BOOL *trunc
     // and two respring controls on one page is redundant.
 }
 
+// Covers the app while the scheduled reboot runs. If the device is still up
+// after a while, the request didn't land: say so instead of leaving the cover.
+- (void)showRebootingCover
+{
+    UIWindow *window = self.view.window ?: UIApplication.sharedApplication.keyWindow;
+    if (!window) return;
+    UIView *cover = [[UIView alloc] initWithFrame:window.bounds];
+    cover.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    cover.backgroundColor = UIColor.blackColor;
+    UIActivityIndicatorView *spin = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
+    spin.color = UIColor.whiteColor;
+    spin.translatesAutoresizingMaskIntoConstraints = NO;
+    [spin startAnimating];
+    UILabel *label = [UILabel new];
+    label.text = @"Rebooting…";
+    label.textColor = UIColor.whiteColor;
+    label.font = [UIFont systemFontOfSize:17.0 weight:UIFontWeightSemibold];
+    label.translatesAutoresizingMaskIntoConstraints = NO;
+    [cover addSubview:spin];
+    [cover addSubview:label];
+    [NSLayoutConstraint activateConstraints:@[
+        [spin.centerXAnchor constraintEqualToAnchor:cover.centerXAnchor],
+        [spin.centerYAnchor constraintEqualToAnchor:cover.centerYAnchor constant:-16.0],
+        [label.centerXAnchor constraintEqualToAnchor:cover.centerXAnchor],
+        [label.topAnchor constraintEqualToAnchor:spin.bottomAnchor constant:14.0],
+    ]];
+    [window addSubview:cover];
+    __weak typeof(self) weakSelf = self;
+    __weak UIView *weakCover = cover;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (!weakCover.superview) return;
+        [weakCover removeFromSuperview];
+        log_user("[REBOOT] The device did not reboot within 25 s.\n");
+        [weakSelf showRebootFailedAlert];
+    });
+}
+
+- (void)showRebootFailedAlert
+{
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"Reboot Didn't Happen"
+                         message:@"Cyanide couldn't ask the system to reboot. It needs kernel access from an earlier Run; run Cyanide, then try again, or restart the device yourself. Details are in the log."
+                  preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    settings_present_controller(ac, self);
+}
+
 - (void)presentRespringPromptWithTitle:(NSString *)title message:(NSString *)message
 {
     UIAlertController *ac = [UIAlertController
@@ -14444,7 +14530,7 @@ UIViewController *settings_make_daemons_viewer(void)
             if (n == 0) return 0;
             return self.changelogExpanded ? n + 2 : 1;
         }
-        case RootSectionActions:        return 4;
+        case RootSectionActions:        return 5;
         case RootSectionTweakBundles:   return (NSInteger)self.tweakBundleRows.count;
         case RootSectionInDev:         return (NSInteger)self.inDevBundleRows.count;
         case RootSectionSystemBundles:  return (NSInteger)self.systemBundleRows.count;
@@ -17055,14 +17141,16 @@ void cyanide_present_contact(UIViewController *host)
                 if (!self.changelogExpanded) {
                     return [self buildChangelogCollapsedCellInTableView:tableView];
                 }
+                // Show Less first, so the list can be closed without
+                // scrolling through every entry; the releases link stays last.
                 NSInteger entryCount = (NSInteger)settings_changelog_entries().count;
-                if (indexPath.row == entryCount) {
-                    return [self buildChangelogFooterCellInTableView:tableView];
-                }
-                if (indexPath.row > entryCount) {
+                if (indexPath.row == 0) {
                     return [self buildChangelogCollapseCellInTableView:tableView];
                 }
-                return [self buildChangelogCellAtRow:indexPath.row tableView:tableView];
+                if (indexPath.row > entryCount) {
+                    return [self buildChangelogFooterCellInTableView:tableView];
+                }
+                return [self buildChangelogCellAtRow:indexPath.row - 1 tableView:tableView];
             }
             case RootSectionActions:
                 indexPath = [NSIndexPath indexPathForRow:indexPath.row inSection:SectionActions];
@@ -17137,6 +17225,17 @@ void cyanide_present_contact(UIViewController *host)
                 cell.accessoryView = spin;
             }
         } else if (indexPath.row == 2) {
+            BOOL running = g_settings_reboot_running;
+            symbol = @"power.circle.fill";
+            color  = UIColor.systemPurpleColor;
+            cell.textLabel.text = running ? @"Preparing…" : @"Reboot";
+            if (running) {
+                UIActivityIndicatorView *spin = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+                spin.color = color;
+                [spin startAnimating];
+                cell.accessoryView = spin;
+            }
+        } else if (indexPath.row == 3) {
             rowEnabled = anyInstalledOrQueued;
             symbol = @"trash.fill";
             color  = UIColor.systemRedColor;
@@ -18587,9 +18686,9 @@ void cyanide_present_contact(UIViewController *host)
                     return;
                 }
                 NSInteger entryCount = (NSInteger)settings_changelog_entries().count;
-                if (indexPath.row == entryCount) {
+                if (indexPath.row > entryCount) {
                     [self openReleasesPage];
-                } else if (indexPath.row > entryCount) {
+                } else if (indexPath.row == 0) {
                     self.changelogExpanded = NO;
                     [tableView reloadSections:[NSIndexSet indexSetWithIndex:RootSectionChangelog]
                              withRowAnimation:UITableViewRowAnimationAutomatic];
@@ -18725,6 +18824,43 @@ void cyanide_present_contact(UIViewController *host)
             settings_present_controller(ac, self);
         } else if (indexPath.row == 2) {
             UIAlertController *ac = [UIAlertController
+                alertControllerWithTitle:@"Reboot?"
+                                 message:@"The device restarts. Live tweaks stop first; Run Cyanide again after the restart."
+                          preferredStyle:UIAlertControllerStyleAlert];
+            [ac addAction:[UIAlertAction actionWithTitle:@"Cancel"
+                                                   style:UIAlertActionStyleCancel
+                                                 handler:nil]];
+            __weak typeof(self) weakSelf = self;
+            [ac addAction:[UIAlertAction actionWithTitle:@"Reboot"
+                                                   style:UIAlertActionStyleDestructive
+                                                 handler:^(UIAlertAction *_) {
+                dispatch_async(dispatch_get_global_queue(0, 0), ^{
+                    if (__sync_val_compare_and_swap(&g_settings_actions_running, kSettingsLockFree, kSettingsLockAction)) {
+                        printf("[SETTINGS] reboot blocked: actions already running\n");
+                        log_user("[REBOOT] Another action is still running. Try Reboot again in a moment.\n");
+                        return;
+                    }
+                    __sync_lock_test_and_set(&g_settings_reboot_running, 1);
+                    settings_notify_cleanup_state_changed();
+                    BOOL scheduled = NO;
+                    @try {
+                        scheduled = settings_prepare_for_restart_sync(YES);
+                    } @finally {
+                        __sync_lock_release(&g_settings_actions_running);
+                        __sync_lock_release(&g_settings_reboot_running);
+                        settings_notify_cleanup_state_changed();
+                    }
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        __strong typeof(weakSelf) strongSelf = weakSelf;
+                        if (!strongSelf) return;
+                        if (scheduled) [strongSelf showRebootingCover];
+                        else [strongSelf showRebootFailedAlert];
+                    });
+                });
+            }]];
+            settings_present_controller(ac, self);
+        } else if (indexPath.row == 3) {
+            UIAlertController *ac = [UIAlertController
                 alertControllerWithTitle:@"Reset All Packages?"
                                  message:@"Deactivates every package and clears pending changes. Already-applied patches stay until respring or reboot. Per-tweak settings are not affected."
                           preferredStyle:UIAlertControllerStyleAlert];
@@ -18748,7 +18884,7 @@ void cyanide_present_contact(UIViewController *host)
                 [self.tableView reloadData];
             }]];
             settings_present_controller(ac, self);
-        } else if (indexPath.row == 3) {
+        } else if (indexPath.row == 4) {
             [[UpdateChecker shared] checkForUpdatesManuallyFrom:self];
         }
     }
