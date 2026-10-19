@@ -530,6 +530,9 @@ static BOOL cleaner_intro_accepted(void)
 @property (nonatomic, copy) NSArray<CYCleanerItem *> *cachedSystem;
 @property (nonatomic, copy) NSArray<CYCleanerItem *> *cachedSkipped;
 @property (nonatomic) BOOL sectionCacheValid;
+// Round 53: toolbar width follows the actual view, not a frozen
+// UIScreen.mainScreen snapshot taken before any rotation/split-view.
+@property (nonatomic, strong) NSLayoutConstraint *cleanButtonWidth;
 @end
 
 @implementation CleanerViewController
@@ -653,6 +656,14 @@ static BOOL cleaner_intro_accepted(void)
     }
 }
 
+- (void)viewDidLayoutSubviews
+{
+    [super viewDidLayoutSubviews];
+    CGFloat width = MIN(self.view.bounds.size.width - 40, 520);
+    if (self.cleanButtonWidth && self.cleanButtonWidth.constant != width)
+        self.cleanButtonWidth.constant = width;
+}
+
 // The clean button lives in the toolbar so it stays put while the list scrolls.
 - (void)buildBottomBar
 {
@@ -678,13 +689,17 @@ static BOOL cleaner_intro_accepted(void)
     UIView *holder = [UIView new];
     [holder addSubview:self.cleanButton];
     holder.translatesAutoresizingMaskIntoConstraints = NO;
+    self.cleanButtonWidth = [holder.widthAnchor constraintEqualToConstant:320];
     [NSLayoutConstraint activateConstraints:@[
         [self.cleanButton.leadingAnchor constraintEqualToAnchor:holder.leadingAnchor],
         [self.cleanButton.trailingAnchor constraintEqualToAnchor:holder.trailingAnchor],
         [self.cleanButton.topAnchor constraintEqualToAnchor:holder.topAnchor],
         [self.cleanButton.bottomAnchor constraintEqualToAnchor:holder.bottomAnchor],
-        [holder.widthAnchor constraintEqualToConstant:MIN(UIScreen.mainScreen.bounds.size.width - 40, 520)],
+        self.cleanButtonWidth,
     ]];
+    // The real width is applied in viewDidLayoutSubviews from the view's
+    // bounds, so rotation and split-view resize the bar instead of leaving
+    // it at whatever UIScreen.mainScreen reported at load time.
     UIBarButtonItem *flex = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemFlexibleSpace
                                                                           target:nil action:nil];
     self.toolbarItems = @[ flex, [[UIBarButtonItem alloc] initWithCustomView:holder], flex ];
