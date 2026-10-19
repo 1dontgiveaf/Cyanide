@@ -191,7 +191,8 @@ static unsigned long long cleaner_remove_tree_at(int parentFD, const char *name,
 
     if (unlinkat(parentFD, name, AT_REMOVEDIR) != 0) {
         if (failed) (*failed)++;
-        return 0;   // partial deletion: do not claim its bytes as freed
+        // Deleted children stay deleted even when another child keeps this
+        // directory alive. Preserve their successful byte total.
     }
     return freed;
 }

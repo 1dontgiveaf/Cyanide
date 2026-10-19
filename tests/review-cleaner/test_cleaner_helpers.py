@@ -108,6 +108,20 @@ cleaner_clear_directory(cache, &removed, &failed);
 NSUInteger cacheFailures = failed;
 cleaner_clear_directory(tmp, &removed, &failed);
 check(cacheFailures > 0 && failed == cacheFailures, "cache error survives empty tmp");
+
+// One failed child must not discard bytes already deleted from its parent.
+if (geteuid() != 0) {
+    a = app(); cache = [a stringByAppendingPathComponent:@"Library/Caches"];
+    NSString *blocked = [cache stringByAppendingPathComponent:@"sub/blocked"];
+    NSString *deletable = [cache stringByAppendingPathComponent:@"sub/delete.bin"];
+    mkdirp(blocked); put(deletable, 1024);
+    check(chmod(blocked.fileSystemRepresentation, 0000) == 0, "make blocked fixture");
+    removed = failed = 0;
+    bytes = cleaner_clear_directory(cache, &removed, &failed);
+    // Restore permissions BEFORE asserting so temporary-directory cleanup is safe.
+    chmod(blocked.fileSystemRepresentation, 0700);
+    check(bytes == 1024 && removed == 1 && failed > 0 && !exists(deletable), "partial child bytes preserved");
+}
 '''
 
 class CleanerHelperTests(unittest.TestCase):
