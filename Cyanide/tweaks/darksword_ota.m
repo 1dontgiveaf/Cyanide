@@ -232,10 +232,17 @@ static bool ota_vnode_chown(const char *path, uid_t uid, gid_t gid, const char *
 // The launchd plist folder is widened (o+wx) for the write and narrowed again
 // afterwards. vnode_apfs_chmod can apply a mode yet report failure, so the
 // folder's mode is always checked with stat, and a restore that can't be
-// proven leaves a record (folder + mode to put back) that every later write
-// retries first -- the folder must never stay world-writable silently.
-static NSString * const kOTADirRestorePathKey = @"OTADirModeRestorePath";
+// proven leaves a record (the mode to put back) that is retried before the
+// next write and whenever kernel access comes back -- the folder must never
+// stay world-writable silently.
+//
+// The record always means the launchd folder itself, never the path it was
+// reached through: on the redirect route that path is an app folder that
+// aliases launchd's only while the redirect is active, so a later chmod
+// through it would change the app folder and leave launchd's widened.
+static NSString * const kOTADirRestorePendingKey = @"OTADirModeRestorePending";
 static NSString * const kOTADirRestoreModeKey = @"OTADirModeRestoreMode";
+static NSString * const kOTADirRestoreLegacyPathKey = @"OTADirModeRestorePath";   // 1.9.0 builds before this fix
 
 static bool ota_dir_mode_is(const char *path, mode_t mode)
 {
@@ -243,55 +250,93 @@ static bool ota_dir_mode_is(const char *path, mode_t mode)
     return stat(path, &st) == 0 && S_ISDIR(st.st_mode) && (st.st_mode & 07777) == (mode & 07777);
 }
 
-// Puts the folder back to `mode` and proves it. Keeps (or clears) the record.
-static bool ota_restore_dir_mode(const char *path, mode_t mode, const char *label)
+static void ota_set_dir_restore_record(bool pending, mode_t mode)
 {
-    if (!ota_dir_mode_is(path, mode)) {
-        (void)ota_vnode_chmod(path, mode, label);   // the stat below decides, not the return
-    }
     NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
-    if (ota_dir_mode_is(path, mode)) {
-        [d removeObjectForKey:kOTADirRestorePathKey];
+    [d removeObjectForKey:kOTADirRestoreLegacyPathKey];
+    if (pending) {
+        [d setBool:YES forKey:kOTADirRestorePendingKey];
+        [d setInteger:(NSInteger)mode forKey:kOTADirRestoreModeKey];
+    } else {
+        [d removeObjectForKey:kOTADirRestorePendingKey];
         [d removeObjectForKey:kOTADirRestoreModeKey];
+    }
+    [d synchronize];
+}
+
+// Puts the launchd folder back to `mode` and proves it. accessPath is how the
+// folder is reached right now: kOTAPlistDirPath itself, or an active
+// redirect's local folder. Keeps (or clears) the record.
+static bool ota_restore_dir_mode(const char *accessPath, mode_t mode, const char *label)
+{
+    if (!ota_dir_mode_is(accessPath, mode)) {
+        (void)ota_vnode_chmod(accessPath, mode, label);   // the stat below decides, not the return
+    }
+    if (ota_dir_mode_is(accessPath, mode)) {
+        ota_set_dir_restore_record(false, 0);
         return true;
     }
-    [d setObject:@(path) forKey:kOTADirRestorePathKey];
-    [d setInteger:(NSInteger)mode forKey:kOTADirRestoreModeKey];
-    [d synchronize];
-    printf("[OTA] !!! %s: folder mode NOT restored (want %o); will retry on the next write\n", path, mode);
+    ota_set_dir_restore_record(true, mode);
+    printf("[OTA] !!! launchd plist folder mode NOT restored (want %o); will retry\n", mode);
     return false;
 }
 
-static bool ota_retry_pending_dir_restore(void);
+// The pending mode, or 0 when nothing is pending (or the record is malformed:
+// a mode without the folder type would retype it, so it is dropped).
+static mode_t ota_pending_dir_restore_mode(void)
+{
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    BOOL pending = [d boolForKey:kOTADirRestorePendingKey] ||
+                   [d stringForKey:kOTADirRestoreLegacyPathKey].length > 0;
+    if (!pending) return 0;
+    mode_t mode = (mode_t)[d integerForKey:kOTADirRestoreModeKey];
+    if (!S_ISDIR(mode)) {
+        printf("[OTA] dropping malformed folder-restore record (mode %o)\n", mode);
+        ota_set_dir_restore_record(false, 0);
+        return 0;
+    }
+    return mode;
+}
+
+// Retry through a path the caller already has access through (a write in
+// progress: direct, or inside its own redirect).
+static bool ota_retry_pending_dir_restore_via(NSString *accessPath)
+{
+    mode_t mode = ota_pending_dir_restore_mode();
+    if (!mode) return true;
+    printf("[OTA] retrying the pending launchd folder-mode restore\n");
+    return ota_restore_dir_mode(accessPath.fileSystemRepresentation, mode, "pending dir restore");
+}
+
+static bool ota_begin_launchd_dir_redirect(OTADirRedirect *redir);
+static bool ota_end_launchd_dir_redirect(OTADirRedirect *redir);
 
 // Public hook for the first moment kernel access is available again: a crash
 // between widening the launchd folder and restoring it must not leave it o+wx
-// until someone happens to perform another OTA write.
+// until someone happens to perform another OTA write. Uses the folder's own
+// path when it is reachable, else a short-lived redirect, as a write would.
 void darksword_ota_retry_pending_dir_restore(void)
 {
-    if (!kexploit_krw_ready()) return;
-    (void)ota_retry_pending_dir_restore();
-}
-
-static bool ota_retry_pending_dir_restore(void)
-{
-    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
-    NSString *path = [d stringForKey:kOTADirRestorePathKey];
-    if (path.length == 0) return true;
-    mode_t mode = (mode_t)[d integerForKey:kOTADirRestoreModeKey];
-    if (!S_ISDIR(mode)) {   // a record without the folder type would retype it
-        printf("[OTA] dropping malformed folder-restore record (mode %o)\n", mode);
-        [d removeObjectForKey:kOTADirRestorePathKey];
-        [d removeObjectForKey:kOTADirRestoreModeKey];
-        return true;
+    if (!ota_pending_dir_restore_mode() || !kexploit_krw_ready()) return;
+    struct stat st = {0};
+    if (stat(kOTAPlistDirPath, &st) == 0) {
+        (void)ota_retry_pending_dir_restore_via(@(kOTAPlistDirPath));
+        return;
     }
-    printf("[OTA] retrying the pending folder-mode restore for %s\n", path.UTF8String);
-    return ota_restore_dir_mode(path.fileSystemRepresentation, mode, "pending dir restore");
+    OTADirRedirect redir = {0};
+    if (!ota_begin_launchd_dir_redirect(&redir)) {
+        printf("[OTA] pending folder restore: no access to the launchd folder yet\n");
+        return;
+    }
+    (void)ota_retry_pending_dir_restore_via(redir.localDir);
+    if (!ota_end_launchd_dir_redirect(&redir))
+        printf("[OTA] !!! pending folder restore: redirect not undone\n");
 }
 
 static bool ota_write_disabled_plist(NSDictionary *plist, NSString *plistPath, NSString *tempPath, NSString *dirPath)
 {
-    if (!ota_retry_pending_dir_restore()) {
+    // dirPath is the launchd folder or this write's active redirect of it.
+    if (!ota_retry_pending_dir_restore_via(dirPath)) {
         printf("[OTA] refusing to write while an earlier folder restore is still pending\n");
         return false;
     }
@@ -321,10 +366,7 @@ static bool ota_write_disabled_plist(NSDictionary *plist, NSString *plistPath, N
     bool dirModeChanged = (writableDirMode != dirStat.st_mode);
     if (dirModeChanged) {
         // Recorded before widening: a crash from here on is still undone.
-        NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
-        [d setObject:dirPath forKey:kOTADirRestorePathKey];
-        [d setInteger:(NSInteger)dirStat.st_mode forKey:kOTADirRestoreModeKey];
-        [d synchronize];
+        ota_set_dir_restore_record(true, dirStat.st_mode);
         (void)ota_vnode_chmod(dirPath.UTF8String, writableDirMode, "disabled.plist dir writable");
         if (!ota_dir_mode_is(dirPath.UTF8String, writableDirMode)) {
             // Failed -- possibly after applying part or all of it: put the
