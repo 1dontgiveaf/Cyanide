@@ -90,6 +90,18 @@ static BOOL cleaner_process_is_active(NSString *executable, NSSet<NSString *> *a
     return NO;
 }
 
+// Never reuse a pass-wide name snapshot. The provider is invoked anew for each
+// root; an unavailable list or unknown executable protects rather than guesses.
+// A process can still launch/resume after this check, so protection is best-effort.
+static BOOL cleaner_should_skip_now(NSString *executable,
+                                     NSSet<NSString *> *(^readActiveNames)(void),
+                                     BOOL *available)
+{
+    NSSet<NSString *> *names = readActiveNames ? readActiveNames() : nil;
+    if (available) *available = (names != nil && executable.length > 0);
+    return !names || executable.length == 0 || cleaner_process_is_active(executable, names);
+}
+
 // All entry kinds consume the budget, including empty directories and links.
 // A cancellation pointer belongs to the enclosing operation and uses atomic
 // accesses because background expiration is delivered on the main thread.
@@ -458,7 +470,7 @@ typedef NS_ENUM(NSInteger, CYCleanerSort) { CYCleanerSortSize, CYCleanerSortName
 static NSString * const kCleanerSortKey = @"CleanerSort";
 // The explanation version the user acknowledged; bump to show it again.
 static NSString * const kCleanerIntroAcceptedKey = @"CleanerIntroAcceptedVersion";
-static const NSInteger kCleanerIntroVersion = 1;
+static const NSInteger kCleanerIntroVersion = 2;
 
 static BOOL cleaner_intro_accepted(void)
 {
@@ -539,7 +551,8 @@ static BOOL cleaner_intro_accepted(void)
     UIAlertController *ac = [UIAlertController
         alertControllerWithTitle:@"Before You Clean"
                          message:@"Cleaner removes the contents of each app's Library/Caches and tmp folders. "
-                                 @"Documents, settings, logins and other app data are not touched, and apps in use are skipped.\n\n"
+                                 @"Documents, settings, logins and other app data are not touched. Active apps are checked again before each folder. "
+                                 @"Detection is best-effort; close apps before cleaning.\n\n"
                                  @"What can happen:\n"
                                  @"• Apps load slower at first and use data to rebuild their caches.\n"
                                  @"• Some apps keep offline content (music, podcasts, maps, game data) in their cache. "
@@ -969,55 +982,53 @@ static BOOL cleaner_intro_accepted(void)
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
             CYCleanerTraversal traversal = cleaner_traversal(kCleanerMaxCleanSeconds, &cancelled);
-            NSSet<NSString *> *active = cleaner_traversal_should_stop(&traversal, 0)
-                ? nil : settings_active_process_names();
+            BOOL processUnavailable = NO;
             NSUInteger cleanedApps = 0, skippedActive = 0, failedApps = 0, done = 0;
             unsigned long long freed = 0;
 
-            if (active) {
-                for (CYCleanerItem *item in work) {
+            for (CYCleanerItem *item in work) {
+                if (processUnavailable || cleaner_traversal_should_stop(&traversal, 0)) break;
+                done++;
+                float fraction = (float)done / (float)MAX(work.count, (NSUInteger)1);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [weakSelf.cleanProgress setProgress:fraction animated:YES];
+                });
+                if (!cleaner_path_is_app_data(item.container.path)) { failedApps++; continue; }
+
+                NSUInteger removed = 0, failed = 0;
+                unsigned long long appFreed = 0;
+                for (NSString *relativeRoot in @[ @"Library/Caches", @"tmp" ]) {
                     if (cleaner_traversal_should_stop(&traversal, 0)) break;
-                    done++;
-                    float fraction = (float)done / (float)MAX(work.count, (NSUInteger)1);
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        [weakSelf.cleanProgress setProgress:fraction animated:YES];
-                    });
-                    if (!cleaner_path_is_app_data(item.container.path)) { failedApps++; continue; }
-                    if (cleaner_process_is_active(item.container.executableName, active)) {
-                        item.active = YES;
-                        item.selected = NO;
-                        skippedActive++;
-                        continue;
+                    BOOL available = NO;
+                    if (cleaner_should_skip_now(item.container.executableName,
+                            ^{ return settings_active_process_names(); }, &available)) {
+                        processUnavailable = !available;
+                        if (available) { item.active = YES; skippedActive++; }
+                        break;
                     }
-
-                    NSUInteger removed = 0, failed = 0;
-                    unsigned long long appFreed = 0;
                     appFreed += cleaner_clear_directory(
-                        [item.container.path stringByAppendingPathComponent:@"Library/Caches"],
+                        [item.container.path stringByAppendingPathComponent:relativeRoot],
                         &removed, &failed, &traversal);
-                    appFreed += cleaner_clear_directory(
-                        [item.container.path stringByAppendingPathComponent:@"tmp"],
-                        &removed, &failed, &traversal);
-                    freed += appFreed;
-
-                    if (cleaner_traversal_should_stop(&traversal, 0)) {
-                        // Retain the last known sizes rather than pretending an
-                        // interrupted/unreadable rescan proved the roots empty.
-                        item.incomplete = YES;
-                    } else {
-                        BOOL complete = NO;
-                        item.cacheBytes = cleaner_tree_bytes_cancellable(
-                            [item.container.path stringByAppendingPathComponent:@"Library/Caches"], NULL, &complete, &cancelled);
-                        item.incomplete = !complete;
-                        complete = NO;
-                        item.tempBytes = cleaner_tree_bytes_cancellable(
-                            [item.container.path stringByAppendingPathComponent:@"tmp"], NULL, &complete, &cancelled);
-                        item.incomplete = item.incomplete || !complete;
-                    }
-                    item.selected = NO;
-                    if (failed > 0) failedApps++;
-                    if (removed > 0) cleanedApps++;
                 }
+                freed += appFreed;
+
+                if (processUnavailable || cleaner_traversal_should_stop(&traversal, 0)) {
+                    // Retain the last known sizes rather than pretending an
+                    // interrupted/unreadable rescan proved the roots empty.
+                    item.incomplete = YES;
+                } else {
+                    BOOL complete = NO;
+                    item.cacheBytes = cleaner_tree_bytes_cancellable(
+                        [item.container.path stringByAppendingPathComponent:@"Library/Caches"], NULL, &complete, &cancelled);
+                    item.incomplete = !complete;
+                    complete = NO;
+                    item.tempBytes = cleaner_tree_bytes_cancellable(
+                        [item.container.path stringByAppendingPathComponent:@"tmp"], NULL, &complete, &cancelled);
+                    item.incomplete = item.incomplete || !complete;
+                }
+                item.selected = NO;
+                if (failed > 0) failedApps++;
+                if (removed > 0) cleanedApps++;
             }
 
             BOOL interrupted = cleaner_traversal_should_stop(&traversal, 0);
@@ -1029,24 +1040,21 @@ static BOOL cleaner_intro_accepted(void)
                 }
                 if (!self) return;
                 self.cleaning = NO;
-                if (!active) {
-                    self.resultText = interrupted
-                        ? @"Stopped before cleaning: background time or the safety budget was unavailable."
-                        : @"Stopped: the active-app list was unavailable, so nothing was removed.";
-                } else {
-                    NSMutableString *result = [NSMutableString stringWithFormat:
-                        @"Removed %@ (logical size) from %lu app%@.", cleaner_bytes(freed),
-                        (unsigned long)cleanedApps, cleanedApps == 1 ? @"" : @"s"];
-                    if (skippedActive > 0)
-                        [result appendFormat:@" Skipped %lu active app%@.", (unsigned long)skippedActive,
-                         skippedActive == 1 ? @"" : @"s"];
-                    if (failedApps > 0)
-                        [result appendFormat:@" Some files in %lu app%@ could not be removed.",
-                         (unsigned long)failedApps, failedApps == 1 ? @"" : @"s"];
-                    if (interrupted)
-                        [result appendString:@" Cleaning stopped at a safety limit or background expiration; results are partial."];
-                    self.resultText = result;
-                }
+                if (processUnavailable) self.processListAvailable = NO;
+                NSMutableString *result = [NSMutableString stringWithFormat:
+                    @"Removed %@ (logical size) from %lu app%@.", cleaner_bytes(freed),
+                    (unsigned long)cleanedApps, cleanedApps == 1 ? @"" : @"s"];
+                if (skippedActive > 0)
+                    [result appendFormat:@" Skipped %lu active app%@.", (unsigned long)skippedActive,
+                     skippedActive == 1 ? @"" : @"s"];
+                if (failedApps > 0)
+                    [result appendFormat:@" Some files in %lu app%@ could not be removed.",
+                     (unsigned long)failedApps, failedApps == 1 ? @"" : @"s"];
+                if (interrupted)
+                    [result appendString:@" Cleaning stopped at a safety limit or background expiration; results are partial."];
+                if (processUnavailable)
+                    [result appendString:@" Stopped: active-app detection was unavailable; remaining roots were not cleaned."];
+                self.resultText = result;
                 NSMutableDictionary<NSString *, CYCleanerItem *> *results = [NSMutableDictionary dictionary];
                 for (CYCleanerItem *item in work) results[item.container.path] = item;
                 NSMutableArray<CYCleanerItem *> *published = [NSMutableArray array];
@@ -1126,7 +1134,7 @@ static BOOL cleaner_intro_accepted(void)
 {
     if (section != CYCleanerSectionSkipped) return nil;
     return @"Only Library/Caches and tmp contents are removed. Documents, settings and app data are not touched. "
-           @"Apps in use are skipped; built-in apps are not selected by default. Long-press an app to open its caches "
+           @"Active-app checks are best-effort; built-in apps are not selected by default. Long-press an app to open its caches "
            @"in the File Browser.";
 }
 

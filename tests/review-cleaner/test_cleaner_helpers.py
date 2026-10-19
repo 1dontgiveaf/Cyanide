@@ -176,6 +176,26 @@ check(!complete && exists(cancelFile), "cancelled rescan is incomplete");
 walk = cleaner_traversal(10, NULL); walk.deadline = 0;
 cleaner_clear_directory(cache, &removed, &failed, &walk);
 check(walk.stopped && exists(cancelFile), "expired deadline leaves data intact");
+
+// The second root must observe activation after the first root was cleared.
+a = app(); cache = [a stringByAppendingPathComponent:@"Library/Caches"];
+tmp = [a stringByAppendingPathComponent:@"tmp"];
+put([cache stringByAppendingPathComponent:@"first.bin"], 32);
+NSString *tempFile = [tmp stringByAppendingPathComponent:@"keep.bin"]; put(tempFile, 64);
+__block NSUInteger reads = 0;
+NSSet<NSString *> *(^provider)(void) = ^{
+    return ++reads == 1 ? [NSSet set] : [NSSet setWithObject:@"ExampleApp"];
+};
+BOOL available = NO;
+check(!cleaner_should_skip_now(@"ExampleApp", provider, &available) && available, "first root inactive");
+cleaner_clear_directory(cache, &removed, &failed, NULL);
+check(cleaner_should_skip_now(@"ExampleApp", provider, &available) && available && reads == 2,
+    "second root refresh observes activation");
+check(exists(tempFile), "activated app tmp survives");
+check(cleaner_should_skip_now(@"ExampleApp", ^{ return (NSSet<NSString *> *)nil; }, &available) && !available,
+    "unavailable detection fails closed");
+check(cleaner_should_skip_now(@"", ^{ return [NSSet set]; }, &available) && !available,
+    "unknown executable fails closed");
 '''
 
 class CleanerHelperTests(unittest.TestCase):
@@ -196,6 +216,17 @@ class CleanerHelperTests(unittest.TestCase):
         self.assertNotIn("expirationHandler:^{}", body)
         self.assertIn("results are partial", body)
         self.assertIn("cleaner_tree_bytes_cancellable", body)
+
+    def test_fresh_process_check_contract(self):
+        source = SOURCE.read_text()
+        body = source[source.index("- (void)performClean"):source.index("#pragma mark Table")]
+        roots = body[body.index("for (NSString *relativeRoot"):body.index("freed += appFreed")]
+        self.assertIn("cleaner_should_skip_now", roots)
+        self.assertIn("settings_active_process_names()", roots)
+        self.assertLess(roots.index("cleaner_should_skip_now"), roots.index("cleaner_clear_directory"))
+        self.assertNotIn("NSSet<NSString *> *active", body)
+        self.assertIn("processUnavailable = !available", roots)
+        self.assertIn("Detection is best-effort", source)
 
     def test_native_helpers(self):
         source = SOURCE.read_text()
