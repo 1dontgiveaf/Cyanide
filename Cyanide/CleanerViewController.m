@@ -319,7 +319,7 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
         _totalLabel.font = [[UIFontMetrics metricsForTextStyle:UIFontTextStyleLargeTitle] scaledFontForFont:big];
         _totalLabel.adjustsFontForContentSizeCategory = YES;
         _bar = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
-        _bar.progressTintColor = UIColor.systemOrangeColor;
+        _bar.progressTintColor = UIColor.systemBlueColor;
         _statusLabel = [UILabel new];
         _statusLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
         _statusLabel.textColor = UIColor.secondaryLabelColor;
@@ -433,7 +433,7 @@ static NSString * const kCleanerSortKey = @"CleanerSort";
 - (void)buildBottomBar
 {
     UIButtonConfiguration *cfg = [UIButtonConfiguration filledButtonConfiguration];
-    cfg.baseBackgroundColor = UIColor.systemOrangeColor;
+    cfg.baseBackgroundColor = UIColor.systemBlueColor;
     cfg.cornerStyle = UIButtonConfigurationCornerStyleLarge;
     cfg.contentInsets = NSDirectionalEdgeInsetsMake(10, 16, 10, 16);
     self.cleanButton = [UIButton buttonWithConfiguration:cfg primaryAction:nil];
@@ -974,7 +974,7 @@ static NSString * const kCleanerSortKey = @"CleanerSort";
                               : (self.accessReady ? @"Finding app containers…" : @"Getting filesystem access…");
         return;
     }
-    cell.bar.progressTintColor = UIColor.systemOrangeColor;
+    cell.bar.progressTintColor = UIColor.systemBlueColor;
     if (!self.accessReady) {
         cell.captionLabel.text = @"Cleaner";
         cell.totalLabel.text = @"—";
@@ -1021,7 +1021,7 @@ static NSString * const kCleanerSortKey = @"CleanerSort";
                                           : cleaner_bytes(item.totalBytes);
     cell.checkView.image = [UIImage systemImageNamed:item.active ? @"minus.circle"
                                                     : item.selected ? @"checkmark.circle.fill" : @"circle"];
-    cell.checkView.tintColor = item.selected ? UIColor.systemOrangeColor : UIColor.tertiaryLabelColor;
+    cell.checkView.tintColor = item.selected ? UIColor.systemBlueColor : UIColor.tertiaryLabelColor;
     cell.selectionStyle = selectable ? UITableViewCellSelectionStyleDefault : UITableViewCellSelectionStyleNone;
     cell.accessibilityTraits = item.selected ? UIAccessibilityTraitSelected : UIAccessibilityTraitNone;
     return cell;

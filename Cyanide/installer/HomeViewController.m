@@ -414,7 +414,7 @@ static const CGFloat kMargin = 20.0;
     [s addArrangedSubview:[self bigActionButton:@"Cleaner"
                                           sub:@"Free space from app caches"
                                          icon:@"trash.fill"
-                                        color:UIColor.systemOrangeColor
+                                        color:UIColor.systemCyanColor
                                           sel:@selector(openCleaner)]];
     [s addArrangedSubview:[self bigActionButton:@"System Info"
                                           sub:@"Battery, uptime, kernel access, storage"
