@@ -144,10 +144,15 @@ static NSString *fb_app_in_container(NSString *container)
 }
 
 // Installed apps (bundle containers) and system apps (/Applications), by
-// bundle identifier. Built once; caller holds the lock.
-static NSDictionary<NSString *, FBAppRecord *> *fb_apps_locked(void)
+// bundle identifier. Round 53: built OUTSIDE the lock (pure file I/O — every
+// /Applications and bundle-container Info.plist) with a double-checked
+// publish, so the one-time index build no longer stalls the File Browser
+// behind fb_containers_lock. Self-locking; callers hold nothing.
+static NSDictionary<NSString *, FBAppRecord *> *fb_apps_index(void)
 {
-    if (g_apps) return g_apps;
+    @synchronized (fb_containers_lock()) {
+        if (g_apps) return g_apps;
+    }
     NSMutableDictionary *apps = [NSMutableDictionary dictionary];
     NSFileManager *fm = NSFileManager.defaultManager;
     for (NSString *item in [fm contentsOfDirectoryAtPath:@"/Applications" error:nil]) {
@@ -163,30 +168,41 @@ static NSDictionary<NSString *, FBAppRecord *> *fb_apps_locked(void)
         FBAppRecord *app = appPath ? fb_app_record_for_app(appPath, container, &bid) : nil;
         if (app) apps[bid] = app;   // an installed copy wins over /Applications
     }
-    g_apps = apps;
-    return g_apps;
+    @synchronized (fb_containers_lock()) {
+        if (!g_apps) g_apps = apps;   // a concurrent build lost; both are valid
+        return g_apps;
+    }
 }
 
-static UIImage *fb_icon_for_app_locked(FBAppRecord *app, NSString *bundleID)
+// Round 53: the decode/render runs OUTSIDE the lock; only the cache
+// check/store is synchronized (double-checked — a concurrent load wastes
+// one decode at most). Self-locking; callers hold nothing.
+static UIImage *fb_icon_for_app(FBAppRecord *app, NSString *bundleID)
 {
-    if (!app.iconLoaded) {
-        app.icon = fb_app_icon(app.appPath, bundleID);
-        app.iconLoaded = YES;
+    @synchronized (fb_containers_lock()) {
+        if (app.iconLoaded) return app.icon;
     }
-    return app.icon;
+    UIImage *img = fb_app_icon(app.appPath, bundleID);
+    @synchronized (fb_containers_lock()) {
+        if (!app.iconLoaded) { app.icon = img; app.iconLoaded = YES; }
+        return app.icon;
+    }
 }
 
 // An extension's app: the installed app whose identifier is the longest
 // prefix of the extension's ("com.foo.app.widget" -> "com.foo.app").
-static NSString *fb_owner_app_id_locked(NSString *identifier)
+static NSString *fb_owner_app_id(NSString *identifier)
 {
     NSString *best = nil;
-    for (NSString *bid in fb_apps_locked())
+    for (NSString *bid in fb_apps_index())
         if ([identifier hasPrefix:[bid stringByAppendingString:@"."]] && bid.length > best.length) best = bid;
     return best;
 }
 
-static FBAppContainer *fb_make_container_locked(NSString *dir, FBContainerKind kind, BOOL viaRoot)
+// Round 53: called WITHOUT the lock (fb_container_for_path builds outside
+// it). All shared-state access goes through the self-locking helpers above;
+// the returned container is caller-private until published into g_containers.
+static FBAppContainer *fb_make_container(NSString *dir, FBContainerKind kind, BOOL viaRoot)
 {
     NSDictionary *meta = fb_read_plist([dir stringByAppendingPathComponent:kMetadataName], viaRoot);
     NSString *identifier = meta[@"MCMMetadataIdentifier"];
@@ -206,21 +222,21 @@ static FBAppContainer *fb_make_container_locked(NSString *dir, FBContainerKind k
     c.path = dir;
     c.identifier = identifier;
     c.viaRoot = viaRoot;
-    NSDictionary<NSString *, FBAppRecord *> *apps = fb_apps_locked();
+    NSDictionary<NSString *, FBAppRecord *> *apps = fb_apps_index();
     FBAppRecord *app = apps[identifier];
     if (kind == FBContainerKindPlugin && !app) {
-        NSString *owner = fb_owner_app_id_locked(identifier);
+        NSString *owner = fb_owner_app_id(identifier);
         FBAppRecord *ownerApp = owner ? apps[owner] : nil;
         if (ownerApp) {
             c.displayName = [NSString stringWithFormat:@"%@ (%@)", ownerApp.name,
                              [identifier substringFromIndex:owner.length + 1]];
-            c.icon = fb_icon_for_app_locked(ownerApp, owner);
+            c.icon = fb_icon_for_app(ownerApp, owner);
             return c;
         }
     }
     if (app && (kind == FBContainerKindBundle || kind == FBContainerKindData || kind == FBContainerKindPlugin)) {
         c.displayName = app.name;
-        c.icon = fb_icon_for_app_locked(app, identifier);
+        c.icon = fb_icon_for_app(app, identifier);
         if (kind != FBContainerKindPlugin) {
             c.executableName = app.executable;
             c.systemApp = app.bundleContainer == nil;
@@ -242,18 +258,29 @@ FBAppContainer *fb_container_for_path(NSString *path, BOOL viaRoot)
         if (!uuid.length) return nil;
         NSString *dir = [parents[i] stringByAppendingPathComponent:uuid];
         @synchronized (fb_containers_lock()) {
-            if (!g_containers) g_containers = [NSMutableDictionary dictionary];
             FBAppContainer *c = g_containers[dir];
-            if (!c) {
-                c = fb_make_container_locked(dir, (FBContainerKind)i, viaRoot);
-                if (c) g_containers[dir] = c;
-            } else if (viaRoot) {
+            if (c) {
                 // Cached from a mobile-readable earlier lookup; related lookups
                 // may still need the root path.
-                c.viaRoot = YES;
+                if (viaRoot) c.viaRoot = YES;
+                return c;
             }
-            return c;
         }
+        // Round 53: build OUTSIDE the lock — plist reads, directory listings
+        // and icon decode no longer stall the File Browser behind
+        // fb_containers_lock — then publish with a double-checked insert.
+        FBAppContainer *c = fb_make_container(dir, (FBContainerKind)i, viaRoot);
+        if (!c) return nil;
+        @synchronized (fb_containers_lock()) {
+            if (!g_containers) g_containers = [NSMutableDictionary dictionary];
+            FBAppContainer *existing = g_containers[dir];
+            if (existing) {
+                if (viaRoot) existing.viaRoot = YES;
+                return existing;   // concurrent build won; both are valid
+            }
+            g_containers[dir] = c;
+        }
+        return c;
     }
     return nil;
 }
@@ -295,10 +322,10 @@ FBAppContainer *fb_related_container(FBAppContainer *container)
                 target = fb_data_container_for_id_locked(container.identifier, container.viaRoot);
                 break;
             case FBContainerKindData:
-                target = fb_apps_locked()[container.identifier].bundleContainer;
+                target = fb_apps_index()[container.identifier].bundleContainer;
                 break;
             case FBContainerKindPlugin: {
-                NSString *owner = fb_owner_app_id_locked(container.identifier);
+                NSString *owner = fb_owner_app_id(container.identifier);
                 target = owner ? fb_data_container_for_id_locked(owner, container.viaRoot) : nil;
                 break;
             }

@@ -904,8 +904,17 @@ static BOOL cleaner_intro_accepted(void)
     };
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
-            // Keep the scan independent of the File Browser's cached metadata.
-            fb_containers_reset();
+            // Round 53: no fb_containers_reset() here anymore. Container
+            // builds now happen outside fb_containers_lock, so the reset's
+            // locking concern is gone; and wiping the shared cache forced
+            // the File Browser to re-read every app's metadata and re-decode
+            // every icon after each Cleaner scan. The residual staleness is
+            // cosmetic and bounded: the UUID list itself is re-enumerated
+            // every scan (new/uninstalled apps are exact), and a cached
+            // display name/icon/executable only goes stale when an app is
+            // updated mid-session — the same staleness the File Browser
+            // already lives with. Sizes and active-state are always fresh
+            // (re-walked/re-read per scan).
             // Same set as fb_app_data_containers(), looked up one by one so the
             // card can count up (reading metadata and icons takes a while).
             NSString *dataParent = [kCleanerAppDataPrefix substringToIndex:kCleanerAppDataPrefix.length - 1];
