@@ -185,7 +185,6 @@ static NSData *sbl_inflate_data(NSData *input, NSUInteger outputSize, int window
                                 NSProgress *progress, NSError **error)
 {
     if (sbl_cancelled(progress, error)) return nil;
-    if (outputSize == 0) return [NSData data];
 
     void *libz = dlopen("/usr/lib/libz.1.dylib", RTLD_LAZY);
     if (!libz) {
@@ -202,7 +201,10 @@ static NSData *sbl_inflate_data(NSData *input, NSUInteger outputSize, int window
         return nil;
     }
 
-    NSMutableData *out = [NSMutableData dataWithLength:outputSize];
+    if (outputSize == NSUIntegerMax) { dlclose(libz); return nil; }
+    // One scratch byte lets inflate consume end markers when declared output
+    // is zero or exactly fills the buffer; any use of it rejects the stream.
+    NSMutableData *out = [NSMutableData dataWithLength:outputSize + 1];
     const Bytef *inBase = input.bytes;
     Bytef *outBase = out.mutableBytes;
     z_stream stream;
@@ -228,18 +230,22 @@ static NSData *sbl_inflate_data(NSData *input, NSUInteger outputSize, int window
         }
         NSUInteger consumed = (NSUInteger)(stream.next_in - inBase);
         NSUInteger produced = (NSUInteger)(stream.next_out - outBase);
+        if (consumed > input.length || produced > outputSize) { rc = Z_DATA_ERROR; break; }
         stream.avail_in = (uInt)MIN(input.length - consumed, kSBLInflateChunk);
-        stream.avail_out = (uInt)MIN(outputSize - produced, kSBLInflateChunk);
+        stream.avail_out = (uInt)MIN(outputSize + 1 - produced, kSBLInflateChunk);
         rc = pInflate(&stream, Z_NO_FLUSH);
+        if (stream.total_out > outputSize) { rc = Z_DATA_ERROR; break; }
         if (rc != Z_OK) break;
     }
     pEnd(&stream);
     dlclose(libz);
 
-    if (rc != Z_STREAM_END || stream.total_out != outputSize) {
+    if (rc != Z_STREAM_END || stream.total_out != outputSize ||
+        stream.total_in != input.length) {
         sbl_set_error(error, 13, @"Compressed archive data could not be inflated.");
         return nil;
     }
+    [out setLength:outputSize];
     return out;
 }
 
@@ -336,6 +342,59 @@ static BOOL sbl_write_file(NSData *data, NSString *path, NSError **error)
     return [data writeToFile:path options:NSDataWritingAtomic error:error];
 }
 
+static const uint16_t kSBLZipDataDescriptorFlag = 1u << 3;
+static const uint16_t kSBLZipUTF8Flag = 1u << 11;
+static const uint16_t kSBLZipSupportedFlags = kSBLZipDataDescriptorFlag | kSBLZipUTF8Flag;
+
+static BOOL sbl_zip_flags_are_supported(uint16_t flags, uint16_t method, NSError **error)
+{
+    if (flags & 1u) {
+        sbl_set_error(error, 27, @"Encrypted ZIP entries are not supported.");
+        return NO;
+    }
+    // Bits 1/2 describe ordinary deflate compression levels, not encryption.
+    uint16_t supported = kSBLZipSupportedFlags | (method == 8 ? 6u : 0u);
+    if (flags & (uint16_t)~supported) {
+        sbl_set_error(error, 27, @"ZIP entry uses unsupported flags.");
+        return NO;
+    }
+    return YES;
+}
+
+static BOOL sbl_zip_crc_matches(NSData *data, uint32_t expected)
+{
+    // Keep the extractor's existing dynamic-zlib contract: the app target does
+    // not link libz directly. Test fixture generation may link it independently.
+    void *libz = dlopen("/usr/lib/libz.1.dylib", RTLD_LAZY);
+    if (!libz) return NO;
+    uLong (*pCRC)(uLong, const Bytef *, uInt) = (void *)dlsym(libz, "crc32");
+    uLong actual = pCRC ? pCRC(pCRC(0L, Z_NULL, 0), data.bytes, (uInt)data.length) : 0;
+    BOOL matches = pCRC && (uint32_t)actual == expected;
+    dlclose(libz);
+    return matches;
+}
+
+static BOOL sbl_zip_descriptor_matches(const uint8_t *b, NSUInteger offset,
+                                       NSUInteger limit, uint32_t crc,
+                                       uint32_t compSize, uint32_t uncompSize)
+{
+    if (offset > limit) return NO;
+    NSUInteger available = limit - offset;
+    if (available >= 16 && sbl_le32(b + offset) == 0x08074b50 &&
+        sbl_le32(b + offset + 4) == crc &&
+        sbl_le32(b + offset + 8) == compSize &&
+        sbl_le32(b + offset + 12) == uncompSize) {
+        return YES;
+    }
+    // The optional data-descriptor signature is omitted by many ordinary ZIP
+    // writers. Try the unsigned form even when the first CRC happens to equal
+    // the signature value.
+    return available >= 12 &&
+           sbl_le32(b + offset) == crc &&
+           sbl_le32(b + offset + 4) == compSize &&
+           sbl_le32(b + offset + 8) == uncompSize;
+}
+
 static BOOL sbl_extract_zip(NSData *zip, NSString *destination, NSProgress *progress, NSError **error)
 {
     const uint8_t *b = zip.bytes;
@@ -383,53 +442,53 @@ static BOOL sbl_extract_zip(NSData *zip, NSString *destination, NSProgress *prog
             sbl_set_error(error, 23, @"ZIP central directory is malformed.");
             return NO;
         }
+        uint16_t flags = sbl_le16(b + p + 8);
         uint16_t method = sbl_le16(b + p + 10);
+        uint32_t expectedCRC = sbl_le32(b + p + 16);
         uint32_t compSize = sbl_le32(b + p + 20);
         uint32_t uncompSize = sbl_le32(b + p + 24);
         uint16_t nameLen = sbl_le16(b + p + 28);
         uint16_t extraLen = sbl_le16(b + p + 30);
         uint16_t commentLen = sbl_le16(b + p + 32);
         uint32_t localOff = sbl_le32(b + p + 42);
+        if (!sbl_zip_flags_are_supported(flags, method, error)) return NO;
         if (nameLen > len - (p + 46) || extraLen > len - (p + 46 + nameLen) ||
             commentLen > len - (p + 46 + nameLen + extraLen)) {
             sbl_set_error(error, 23, @"ZIP central directory is malformed.");
             return NO;
         }
 
-        NSString *name = [[NSString alloc] initWithBytes:b + p + 46
-                                                  length:nameLen
-                                                encoding:NSUTF8StringEncoding];
-        if (name.length == 0) {
-            name = [[NSString alloc] initWithBytes:b + p + 46
-                                            length:nameLen
-                                          encoding:NSISOLatin1StringEncoding];
-        }
+        const uint8_t *centralName = b + p + 46;
+        NSString *name = [[NSString alloc] initWithBytes:centralName length:nameLen
+                                               encoding:NSUTF8StringEncoding];
+        if (!name && !(flags & kSBLZipUTF8Flag))
+            name = [[NSString alloc] initWithBytes:centralName length:nameLen
+                                         encoding:NSISOLatin1StringEncoding];
         p += 46 + nameLen + extraLen + commentLen;
         if (!name) {
             sbl_set_error(error, 23, @"ZIP entry name is not valid text.");
             return NO;
         }
-        if ([name hasSuffix:@"/"]) {
-            if (!sbl_safe_output_path(destination, [name substringToIndex:name.length - 1])) {
-                sbl_set_error(error, 25, @"ZIP contains an unsafe directory name.");
-                return NO;
-            }
-            continue;
-        }
+        BOOL isDirectory = [name hasSuffix:@"/"];
 
         // Bounds in NSUInteger, subtraction form: localOff is a uint32_t read
         // from the archive, and `localOff + 30` in 32-bit arithmetic wraps
         // (0xfffffff0 + 30 == 14), passing the check before an out-of-bounds
         // read. len >= 22 here, so len - 30 needs its own guard.
         NSUInteger lo = localOff;
-        if (lo > len - 30 || sbl_le32(b + lo) != 0x04034b50) {
+        if (lo >= (NSUInteger)cdOffset || lo > len - 30 || sbl_le32(b + lo) != 0x04034b50) {
             sbl_set_error(error, 23, @"ZIP local file header is malformed.");
             return NO;
         }
+        uint16_t localFlags = sbl_le16(b + lo + 6);
         uint16_t localNameLen = sbl_le16(b + lo + 26);
         uint16_t localExtraLen = sbl_le16(b + lo + 28);
         uint16_t localMethod = sbl_le16(b + lo + 8);
-        if (localMethod != method) {
+        uint32_t localCRC = sbl_le32(b + lo + 14);
+        uint32_t localCompSize = sbl_le32(b + lo + 18);
+        uint32_t localUncompSize = sbl_le32(b + lo + 22);
+        if (!sbl_zip_flags_are_supported(localFlags, localMethod, error)) return NO;
+        if (localFlags != flags || localMethod != method) {
             sbl_set_error(error, 23, @"ZIP local and central headers disagree.");
             return NO;
         }
@@ -437,33 +496,68 @@ static BOOL sbl_extract_zip(NSData *zip, NSString *destination, NSProgress *prog
             sbl_set_error(error, 23, @"ZIP local file header is malformed.");
             return NO;
         }
+        if (localNameLen != nameLen ||
+            memcmp(b + lo + 30, centralName, nameLen) != 0) {
+            sbl_set_error(error, 23, @"ZIP local and central filenames disagree.");
+            return NO;
+        }
+        BOOL hasDescriptor = (flags & kSBLZipDataDescriptorFlag) != 0;
+        if (!hasDescriptor &&
+            (localCRC != expectedCRC || localCompSize != compSize || localUncompSize != uncompSize)) {
+            sbl_set_error(error, 23, @"ZIP local and central metadata disagree.");
+            return NO;
+        }
+        if (hasDescriptor &&
+            ((localCRC != 0 && localCRC != expectedCRC) ||
+             (localCompSize != 0 && localCompSize != compSize) ||
+             (localUncompSize != 0 && localUncompSize != uncompSize))) {
+            sbl_set_error(error, 23, @"ZIP local data-descriptor metadata disagrees.");
+            return NO;
+        }
         NSUInteger dataOff = lo + 30 + localNameLen + localExtraLen;
-        if (compSize > len - dataOff) {
+        if (dataOff > (NSUInteger)cdOffset || compSize > (NSUInteger)cdOffset - dataOff) {
             sbl_set_error(error, 23, @"ZIP entry data is outside the archive.");
+            return NO;
+        }
+        NSUInteger descriptorOff = dataOff + compSize;
+        if (hasDescriptor &&
+            !sbl_zip_descriptor_matches(b, descriptorOff, (NSUInteger)cdOffset,
+                                        expectedCRC, compSize, uncompSize)) {
+            sbl_set_error(error, 23, @"ZIP data descriptor is malformed or disagrees with the central directory.");
             return NO;
         }
 
         NSString *outPath = sbl_safe_output_path(destination, name);
         if (!outPath) {
-            sbl_set_error(error, 25, @"ZIP contains an unsafe entry path.");
+            sbl_set_error(error, 25,
+                          isDirectory ? @"ZIP contains an unsafe directory name."
+                                      : @"ZIP contains an unsafe entry path.");
             return NO;
         }
-        if ([outputPaths containsObject:outPath]) {
-            sbl_set_error(error, 26, @"ZIP contains duplicate output paths.");
-            return NO;
+        if (!isDirectory) {
+            if ([outputPaths containsObject:outPath]) {
+                sbl_set_error(error, 26, @"ZIP contains duplicate output paths.");
+                return NO;
+            }
+            [outputPaths addObject:outPath];
         }
-        [outputPaths addObject:outPath];
 
-        uint64_t entryBytes = (method == 0) ? compSize : uncompSize;
         if (method != 0 && method != 8) {
             sbl_set_error(error, 27, @"ZIP uses an unsupported compression method.");
             return NO;
         }
-        if (entryBytes > kSBLMaxEntryBytes || totalBytes > kSBLMaxTotalBytes - MIN(entryBytes, kSBLMaxTotalBytes)) {
-            sbl_set_error(error, 24, @"ZIP contains a file larger than 64 MB or more than 256 MB in total.");
+        uint64_t entryBytes = (method == 0) ? compSize : uncompSize;
+        if ((isDirectory && uncompSize != 0) || entryBytes > kSBLMaxEntryBytes) {
+            sbl_set_error(error, 24, @"ZIP directory payload or entry size is invalid.");
             return NO;
         }
-        totalBytes += entryBytes;
+        if (!isDirectory) {
+            if (entryBytes > kSBLMaxEntryBytes || totalBytes > kSBLMaxTotalBytes - MIN(entryBytes, kSBLMaxTotalBytes)) {
+                sbl_set_error(error, 24, @"ZIP contains a file larger than 64 MB or more than 256 MB in total.");
+                return NO;
+            }
+            totalBytes += entryBytes;
+        }
 
         NSData *payload = [NSData dataWithBytes:b + dataOff length:compSize];
         NSData *fileData = nil;
@@ -477,10 +571,21 @@ static BOOL sbl_extract_zip(NSData *zip, NSString *destination, NSProgress *prog
             fileData = sbl_inflate_data(payload, uncompSize, -MAX_WBITS, progress, error);
             if (!fileData) return NO;
         }
+        if (!sbl_zip_crc_matches(fileData, expectedCRC)) {
+            sbl_set_error(error, 28, @"ZIP entry CRC32 does not match its central directory.");
+            return NO;
+        }
         // A cancel that arrived during inflate must not still write this entry.
         if (sbl_cancelled(progress, error)) return NO;
-        if (!sbl_write_file(fileData, outPath, error)) return NO;
-        extracted++;
+        if (!isDirectory) {
+            if (!sbl_write_file(fileData, outPath, error)) return NO;
+            extracted++;
+        }
+    }
+
+    if (p != (NSUInteger)eocd) {
+        sbl_set_error(error, 23, @"ZIP central directory has trailing or missing entries.");
+        return NO;
     }
 
     if (extracted == 0) {
@@ -640,12 +745,29 @@ static BOOL sbl_extract_deb(NSData *deb, NSString *destination, NSProgress *prog
     return NO;
 }
 
+static NSString *sbl_create_staging_directory(NSString *parent, NSString *destination,
+                                              NSError **error)
+{
+    NSString *leaf = destination.lastPathComponent.length > 0
+        ? destination.lastPathComponent : @"archive";
+    for (NSUInteger attempt = 0; attempt < 32; attempt++) {
+        NSString *name = [NSString stringWithFormat:@".%@.extract-%@",
+                          leaf, NSUUID.UUID.UUIDString];
+        NSString *path = parent.length > 0
+            ? [parent stringByAppendingPathComponent:name] : name;
+        if (mkdir(path.fileSystemRepresentation, 0700) == 0) return path;
+        if (errno != EEXIST) break;
+    }
+    sbl_set_error(error, 53, @"The archive staging directory could not be created exclusively.");
+    return nil;
+}
+
 BOOL SBLExtractArchiveToDirectoryWithProgress(NSURL *url, NSString *destination,
                                               NSProgress *progress, NSError **error)
 {
     if (sbl_cancelled(progress, error)) return NO;
     NSFileManager *fm = NSFileManager.defaultManager;
-    // The destination is replaced (and removed on failure), so it must be new
+    // The destination is committed only on success, so it must be new
     // or an empty directory: never clear a real folder (review F-35).
     if (destination.length == 0) {
         sbl_set_error(error, 53, @"No extraction destination was given.");
@@ -704,42 +826,50 @@ BOOL SBLExtractArchiveToDirectoryWithProgress(NSURL *url, NSString *destination,
         return NO;
     }
 
-    // Clear and recreate the destination without any recursive delete. The
-    // emptiness check above is only a fast path: another writer can populate
-    // the folder before this point, and removeItemAtPath: would then delete
-    // their files. rmdir only succeeds on an empty directory, and mkdir is
-    // exclusive, so a recreated/populated path makes the import fail closed.
+    NSString *ext = url.pathExtension.lowercaseString;
+    const uint8_t *bytes = data.bytes;
+    BOOL looksZip = data.length >= 4 && sbl_le32(bytes) == 0x04034b50;
+    BOOL looksDeb = data.length >= 8 && memcmp(bytes, "!<arch>\n", 8) == 0;
+    BOOL isZip = [ext isEqualToString:@"zip"] || looksZip;
+    BOOL isDeb = [ext isEqualToString:@"deb"] || looksDeb;
+    if (!isZip && !isDeb) {
+        sbl_set_error(error, 50, @"Unsupported archive type. Choose a folder, .zip, or .deb.");
+        return NO;
+    }
+
+    // Extract into a private same-parent directory. The destination is not
+    // touched until every entry (including CRC and metadata checks) succeeds;
+    // this keeps failed imports from exposing a partial tree. A final rmdir is
+    // deliberately non-recursive, so a concurrent writer is never cleared.
     NSString *parent = destination.stringByDeletingLastPathComponent;
     if (parent.length > 0 &&
         ![fm createDirectoryAtPath:parent withIntermediateDirectories:YES attributes:nil error:error]) {
         return NO;
     }
+    NSString *staging = sbl_create_staging_directory(parent, destination, error);
+    if (!staging) return NO;
+
+    BOOL ok = NO;
+    if (isZip) {
+        ok = sbl_extract_zip(data, staging, progress, error);
+    } else if (isDeb) {
+        ok = sbl_extract_deb(data, staging, progress, error);
+    }
+    if (!ok) {
+        [fm removeItemAtPath:staging error:nil];
+        return NO;
+    }
     if (rmdir(destination.fileSystemRepresentation) != 0 && errno != ENOENT) {
+        [fm removeItemAtPath:staging error:nil];
         sbl_set_error(error, 53, @"The extraction destination is no longer empty; refusing to clear it.");
         return NO;
     }
-    if (mkdir(destination.fileSystemRepresentation, 0700) != 0) {
-        sbl_set_error(error, 53, @"The extraction destination could not be created exclusively.");
+    if (renamex_np(staging.fileSystemRepresentation, destination.fileSystemRepresentation, RENAME_EXCL) != 0) {
+        [fm removeItemAtPath:staging error:nil];
+        sbl_set_error(error, 53, @"The extracted archive could not be committed.");
         return NO;
     }
-
-    NSString *ext = url.pathExtension.lowercaseString;
-    const uint8_t *bytes = data.bytes;
-    BOOL looksZip = data.length >= 4 && sbl_le32(bytes) == 0x04034b50;
-    BOOL looksDeb = data.length >= 8 && memcmp(bytes, "!<arch>\n", 8) == 0;
-
-    BOOL ok = NO;
-    if ([ext isEqualToString:@"zip"] || looksZip) {
-        ok = sbl_extract_zip(data, destination, progress, error);
-    } else if ([ext isEqualToString:@"deb"] || looksDeb) {
-        ok = sbl_extract_deb(data, destination, progress, error);
-    } else {
-        sbl_set_error(error, 50, @"Unsupported archive type. Choose a folder, .zip, or .deb.");
-    }
-    if (!ok) {
-        [fm removeItemAtPath:destination error:nil];
-    }
-    return ok;
+    return YES;
 }
 
 BOOL SBLExtractArchiveToDirectory(NSURL *url, NSString *destination, NSError **error)
