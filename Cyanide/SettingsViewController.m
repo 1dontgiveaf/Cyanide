@@ -7,6 +7,7 @@
 #import "FileBrowserViewController.h"
 #import "DaemonsViewController.h"
 #import "SystemInfoViewController.h"
+#import "CleanerViewController.h"
 #import "tweaks/daemon_catalog.h"
 #import <dirent.h>
 #import <dlfcn.h>
@@ -7573,6 +7574,28 @@ void settings_battery_info_async(BOOL allowFullExploit,
     });
 }
 
+NSSet<NSString *> *settings_running_process_names(void)
+{
+    if (!kexploit_krw_ready()) return nil;
+    int cap = 4096;
+    procmgr_entry_t *buf = calloc((size_t)cap, sizeof(procmgr_entry_t));
+    int n = buf ? procmgr_list(buf, cap) : -1;
+    if (n < 0) { free(buf); return nil; }   // incomplete walk: don't guess
+    NSMutableSet<NSString *> *names = [NSMutableSet setWithCapacity:(NSUInteger)n];
+    for (int i = 0; i < n; i++) {
+        buf[i].name[sizeof(buf[i].name) - 1] = 0;
+        NSString *name = [NSString stringWithUTF8String:buf[i].name];
+        if (name.length) [names addObject:name];
+    }
+    free(buf);
+    return names;
+}
+
+UIViewController *settings_make_cleaner_viewer(void)
+{
+    return [[CleanerViewController alloc] init];
+}
+
 UIViewController *settings_make_system_info_viewer(void)
 {
     return [[SystemInfoViewController alloc] init];
@@ -14467,6 +14490,7 @@ UIViewController *settings_make_daemons_viewer(void)
         @{ @"title": @"File Browser",      @"icon": @"folder.fill", @"color": [UIColor systemBlueColor], @"section": @(-1), @"custom": @"filebrowser" },
         @{ @"title": @"Daemons",           @"icon": @"gearshape.2.fill", @"color": [UIColor systemTealColor], @"section": @(-1), @"custom": @"daemons" },
         @{ @"title": @"System Info",       @"icon": @"info.circle.fill", @"color": [UIColor systemGreenColor], @"section": @(-1), @"custom": @"sysinfo" },
+        @{ @"title": @"Cache Cleaner",     @"icon": @"trash.fill", @"color": [UIColor systemOrangeColor], @"section": @(-1), @"custom": @"cleaner" },
     ];
 }
 
@@ -18719,6 +18743,10 @@ void cyanide_present_contact(UIViewController *host)
                 }
                 if ([bundle[@"custom"] isEqualToString:@"sysinfo"]) {
                     [self.navigationController pushViewController:settings_make_system_info_viewer() animated:YES];
+                    return;
+                }
+                if ([bundle[@"custom"] isEqualToString:@"cleaner"]) {
+                    [self.navigationController pushViewController:settings_make_cleaner_viewer() animated:YES];
                     return;
                 }
                 if ([bundle[@"custom"] isEqualToString:@"daemons"]) {

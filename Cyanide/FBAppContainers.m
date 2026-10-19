@@ -20,6 +20,8 @@ static NSString * const kMetadataName      = @".com.apple.mobile_container_manag
 @property (nonatomic, copy) NSString *displayName;
 @property (nonatomic, strong) UIImage *icon;
 @property (nonatomic) BOOL viaRoot;   // metadata was read through launchd root
+@property (nonatomic, copy) NSString *executableName;
+@property (nonatomic) BOOL systemApp;
 @end
 
 @implementation FBAppContainer
@@ -30,6 +32,7 @@ static NSString * const kMetadataName      = @".com.apple.mobile_container_manag
 @property (nonatomic, copy) NSString *name;
 @property (nonatomic, copy) NSString *appPath;        // the .app bundle
 @property (nonatomic, copy) NSString *bundleContainer;  // nil for system apps in /Applications
+@property (nonatomic, copy) NSString *executable;       // CFBundleExecutable
 @property (nonatomic, strong) UIImage *icon;           // loaded on first use
 @property (nonatomic) BOOL iconLoaded;
 @end
@@ -127,6 +130,8 @@ static FBAppRecord *fb_app_record_for_app(NSString *appPath, NSString *container
                                                                   : appPath.lastPathComponent.stringByDeletingPathExtension;
     app.appPath = appPath;
     app.bundleContainer = container;
+    NSString *exe = info[@"CFBundleExecutable"];
+    app.executable = [exe isKindOfClass:NSString.class] && exe.length ? exe : nil;
     *bundleIDOut = bid;
     return app;
 }
@@ -216,6 +221,10 @@ static FBAppContainer *fb_make_container_locked(NSString *dir, FBContainerKind k
     if (app && (kind == FBContainerKindBundle || kind == FBContainerKindData || kind == FBContainerKindPlugin)) {
         c.displayName = app.name;
         c.icon = fb_icon_for_app_locked(app, identifier);
+        if (kind != FBContainerKindPlugin) {
+            c.executableName = app.executable;
+            c.systemApp = app.bundleContainer == nil;
+        }
     } else {
         c.displayName = identifier;   // app groups, system groups, unknown apps
     }
@@ -298,6 +307,17 @@ FBAppContainer *fb_related_container(FBAppContainer *container)
         }
     }
     return target ? fb_container_for_path(target, container.viaRoot) : nil;
+}
+
+NSArray<FBAppContainer *> *fb_app_data_containers(void)
+{
+    NSMutableArray<FBAppContainer *> *out = [NSMutableArray array];
+    for (NSString *uuid in [NSFileManager.defaultManager contentsOfDirectoryAtPath:kDataParent error:nil]) {
+        FBAppContainer *c = fb_container_for_path([kDataParent stringByAppendingPathComponent:uuid], NO);
+        // Only containers of an app we can name (not leftovers or unknowns).
+        if (c.kind == FBContainerKindData && c.executableName) [out addObject:c];
+    }
+    return out;
 }
 
 void fb_containers_reset(void)

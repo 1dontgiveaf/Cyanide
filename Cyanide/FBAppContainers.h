@@ -24,6 +24,10 @@ typedef NS_ENUM(NSInteger, FBContainerKind) {
 @property (nonatomic, readonly, copy) NSString *identifier;   // bundle or group identifier
 @property (nonatomic, readonly, copy) NSString *displayName;  // app name, or the identifier
 @property (nonatomic, readonly, strong) UIImage *icon;        // app icon, nil if none found
+// Bundle and data containers of a known app: its executable (the process
+// name it runs as) and whether it is a built-in app from /Applications.
+@property (nonatomic, readonly, copy) NSString *executableName;
+@property (nonatomic, readonly) BOOL systemApp;
 @end
 
 // /var/… and /private/var/… name the same place; this returns the latter.
@@ -38,3 +42,6 @@ FBAppContainer *fb_container_for_path(NSString *path, BOOL viaRoot);
 FBAppContainer *fb_related_container(FBAppContainer *container);
 // Forget everything (pull to refresh in a container folder).
 void fb_containers_reset(void);
+// Every app data container (/var/mobile/Containers/Data/Application) that
+// belongs to a known app, installed or built-in. Blocking.
+NSArray<FBAppContainer *> *fb_app_data_containers(void);

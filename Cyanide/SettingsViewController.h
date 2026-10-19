@@ -285,6 +285,12 @@ NSDictionary *settings_kernel_access_status(void);
 void settings_battery_info_async(BOOL allowFullExploit,
                                  void (^completion)(NSDictionary *battery, NSString *source, NSString *message));
 UIViewController *settings_make_system_info_viewer(void);
+// Names of all running processes (as the kernel keeps them: at most 31
+// characters), nil when kernel access or the process list is unavailable.
+// Blocking; off the main thread.
+NSSet<NSString *> *settings_running_process_names(void);
+// The cache cleaner screen.
+UIViewController *settings_make_cleaner_viewer(void);
 // System-wide Location Services: desired 1 = on, 0 = off, -1 = toggle.
 // The result is posted as soon as it is confirmed; `completion` (optional)
 // runs on the main queue after cleanup, with how long ago that was.
