@@ -233,6 +233,10 @@ void settings_present_hide_home_bar_respring_prompt(UIViewController *host);
 // immediately; returns YES when at least one digit was written and verified.
 BOOL settings_apply_passcode_theme_now(BOOL apply);
 
+// Newest entry of the bundled changelog (keys "version", "date", "changes"),
+// or nil when the build carries none. The Home screen's What's New card.
+NSDictionary *settings_latest_changelog_entry(void);
+
 void settings_run_actions(void);
 void settings_run_pending_actions(void);
 // YES while a chain/run (not an ordinary action) owns the actions lock.

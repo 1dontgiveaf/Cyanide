@@ -5,10 +5,22 @@
 
 #import "SystemInfoViewController.h"
 #import "SettingsViewController.h"
+#import "installer/MainTabBarController.h"
 #import <fts.h>
 #import <sys/mount.h>
 #import <sys/stat.h>
 #import <sys/sysctl.h>
+
+// The pending-changes popup bar is hosted by the tab bar controller above
+// pushed content; hide it while this screen is on top, as the Process Viewer
+// and File Browser do. Each screen re-asserts it on appear, so a push between
+// screens that all hide it keeps it hidden.
+static void si_suppress_popup_bar(UIViewController *vc, BOOL suppressed)
+{
+    UITabBarController *tbc = vc.tabBarController;
+    if ([tbc isKindOfClass:MainTabBarController.class])
+        [(MainTabBarController *)tbc setPopupBarSuppressed:suppressed];
+}
 
 typedef NS_ENUM(NSInteger, SISection) {
     SISectionDevice,
@@ -197,6 +209,18 @@ typedef NS_ENUM(NSInteger, SIAppSort) { SIAppSortTotal, SIAppSortApp, SIAppSortD
 static NSString * const kSIAppSortKey = @"SystemInfoAppSort";
 
 @implementation SystemInfoViewController
+
+- (void)viewWillAppear:(BOOL)animated
+{
+    [super viewWillAppear:animated];
+    si_suppress_popup_bar(self, YES);
+}
+
+- (void)viewWillDisappear:(BOOL)animated
+{
+    [super viewWillDisappear:animated];
+    si_suppress_popup_bar(self, NO);
+}
 
 - (instancetype)init
 {

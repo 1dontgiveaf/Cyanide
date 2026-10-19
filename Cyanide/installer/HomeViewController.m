@@ -360,15 +360,30 @@ static const CGFloat kMargin = 20.0;
     UIView *card = [self card];
     UIStackView *s = [self vstackInCard:card spacing:14.0];
 
-    UILabel *header = [self sectionHeader:@"What's New"];
+    // The newest release's first bullets from the bundled changelog (the
+    // release script generates it), so this card follows every release
+    // instead of being edited by hand.
+    NSDictionary *latest = settings_latest_changelog_entry();
+    NSString *version = [latest[@"version"] isKindOfClass:NSString.class] ? latest[@"version"] : nil;
+    NSArray *changes = [latest[@"changes"] isKindOfClass:NSArray.class] ? latest[@"changes"] : nil;
+
+    UILabel *header = [self sectionHeader:version.length
+        ? [NSString stringWithFormat:@"What's New in %@", [version hasPrefix:@"v"] ? [version substringFromIndex:1] : version]
+        : @"What's New"];
     [s addArrangedSubview:header];
 
-    [s addArrangedSubview:[self compactRow:@"File Browser with a plist editor, optional write mode and read-only root access"
-                                     icon:@"folder.fill" color:UIColor.systemBlueColor]];
-    [s addArrangedSubview:[self compactRow:@"Location Services toggle for Control Center (iOS 18)"
-                                     icon:@"location.fill" color:UIColor.systemTealColor]];
-    [s addArrangedSubview:[self compactRow:@"Shortcut links: cyanide://location-services/on, /off or /toggle"
-                                     icon:@"link" color:UIColor.systemOrangeColor]];
+    NSArray<NSString *> *icons = @[ @"sparkles", @"star.fill", @"wand.and.stars" ];
+    NSArray<UIColor *> *colors = @[ UIColor.systemBlueColor, UIColor.systemOrangeColor, UIColor.systemPurpleColor ];
+    NSUInteger shown = 0;
+    for (id change in changes) {
+        if (![change isKindOfClass:NSString.class] || [change length] == 0) continue;
+        [s addArrangedSubview:[self compactRow:change icon:icons[shown] color:colors[shown]]];
+        if (++shown == icons.count) break;
+    }
+    if (shown == 0) {
+        [s addArrangedSubview:[self compactRow:@"See Settings → What's New for this version's changes"
+                                         icon:@"sparkles" color:UIColor.systemBlueColor]];
+    }
 
     return card;
 }

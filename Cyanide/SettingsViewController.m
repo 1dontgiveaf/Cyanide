@@ -9821,6 +9821,11 @@ static NSArray<NSDictionary *> *settings_changelog_entries(void)
     return entries;
 }
 
+NSDictionary *settings_latest_changelog_entry(void)
+{
+    return settings_changelog_entries().firstObject;
+}
+
 // "2026-05-15" -> "May 15". Falls back to the raw string on parse failure.
 static NSString *settings_pretty_date_for_iso(NSString *iso)
 {

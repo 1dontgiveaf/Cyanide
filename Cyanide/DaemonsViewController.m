@@ -7,6 +7,18 @@
 #import "SettingsViewController.h"
 #import "tweaks/daemon_catalog.h"
 #import "kexploit/persistence.h"
+#import "installer/MainTabBarController.h"
+
+// The pending-changes popup bar is hosted by the tab bar controller above
+// pushed content; hide it while this screen is on top, as the Process Viewer
+// and File Browser do. Each screen re-asserts it on appear, so a push between
+// screens that all hide it keeps it hidden.
+static void daemons_suppress_popup_bar(UIViewController *vc, BOOL suppressed)
+{
+    UITabBarController *tbc = vc.tabBarController;
+    if ([tbc isKindOfClass:MainTabBarController.class])
+        [(MainTabBarController *)tbc setPopupBarSuppressed:suppressed];
+}
 
 // Boot session in which the last change was saved: until the next restart
 // the screen reminds the user that changes are pending.
@@ -84,6 +96,18 @@ static void daemons_note_change(NSArray<NSString *> *labels)
     self.navigationItem.largeTitleDisplayMode = UINavigationItemLargeTitleDisplayModeNever;
 }
 
+- (void)viewWillAppear:(BOOL)animated
+{
+    [super viewWillAppear:animated];
+    daemons_suppress_popup_bar(self, YES);
+}
+
+- (void)viewWillDisappear:(BOOL)animated
+{
+    [super viewWillDisappear:animated];
+    daemons_suppress_popup_bar(self, NO);
+}
+
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
 {
     return (NSInteger)self.group.labels.count;
@@ -158,6 +182,7 @@ static void daemons_note_change(NSArray<NSString *> *labels)
 - (void)viewWillAppear:(BOOL)animated
 {
     [super viewWillAppear:animated];
+    daemons_suppress_popup_bar(self, YES);
     [self.tableView reloadData];   // a group screen may have changed something
     [self updateInteractivePopGesture];
 }
@@ -165,6 +190,7 @@ static void daemons_note_change(NSArray<NSString *> *labels)
 - (void)viewWillDisappear:(BOOL)animated
 {
     [super viewWillDisappear:animated];
+    daemons_suppress_popup_bar(self, NO);
     // The recognizer belongs to the shared navigation controller (and may be
     // used by a pushed group screen): never leave it disabled after this VC.
     self.navigationController.interactivePopGestureRecognizer.enabled = YES;
