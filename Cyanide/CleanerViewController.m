@@ -39,7 +39,7 @@ static BOOL cleaner_path_is_app_data(NSString *path)
 }
 
 // procmgr names are truncated to 31 characters. An app whose executable is
-// longer must still be recognized as running or Cleaner could delete its cache
+// longer must still be recognized as active or Cleaner could delete its cache
 // while it is live.
 // Only the two disposable roots are ever cleared. The prefix check alone would
 // also admit Documents or Library; require the exact tail as a second guard.
@@ -54,11 +54,11 @@ static BOOL cleaner_is_disposable_root(NSString *path)
            [parts[parts.count - 2] isEqualToString:@"Library"];
 }
 
-static BOOL cleaner_process_is_running(NSString *executable, NSSet<NSString *> *running)
+static BOOL cleaner_process_is_active(NSString *executable, NSSet<NSString *> *activeNames)
 {
-    if (executable.length == 0 || running.count == 0) return NO;
-    if ([running containsObject:executable]) return YES;
-    for (NSString *name in running) {
+    if (executable.length == 0 || activeNames.count == 0) return NO;
+    if ([activeNames containsObject:executable]) return YES;
+    for (NSString *name in activeNames) {
         if (name.length > 0 && executable.length > name.length &&
             [executable hasPrefix:name]) return YES;
     }
@@ -213,7 +213,7 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
 @property (nonatomic, copy) NSString *name;
 @property (nonatomic) unsigned long long cacheBytes;
 @property (nonatomic) unsigned long long tempBytes;
-@property (nonatomic) BOOL running;
+@property (nonatomic) BOOL active;
 @property (nonatomic) BOOL systemApp;
 @property (nonatomic) BOOL selected;
 @property (nonatomic) BOOL incomplete;
@@ -321,7 +321,7 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
     self.cleanHintLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
     self.cleanHintLabel.textColor = UIColor.secondaryLabelColor;
     self.cleanHintLabel.numberOfLines = 0;
-    self.cleanHintLabel.text = @"Only Library/Caches and tmp contents are removed. Documents, settings and app data are not touched. Running apps are skipped.";
+    self.cleanHintLabel.text = @"Only Library/Caches and tmp contents are removed. Documents, settings and app data are not touched. Active apps are skipped.";
     [footer addSubview:self.cleanHintLabel];
 
     UILayoutGuide *m = footer.layoutMarginsGuide;
@@ -392,9 +392,9 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
             // Keep the scan independent of the File Browser's cached metadata.
             fb_containers_reset();
             NSArray<FBAppContainer *> *containers = fb_app_data_containers();
-            NSSet<NSString *> *running = settings_running_process_names();
-            BOOL processListAvailable = (running != nil);
-            if (!running) running = [NSSet set];
+            NSSet<NSString *> *active = settings_active_process_names();
+            BOOL processListAvailable = (active != nil);
+            if (!active) active = [NSSet set];
 
             NSMutableArray<CYCleanerItem *> *items = [NSMutableArray array];
             for (FBAppContainer *container in containers) {
@@ -405,7 +405,7 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
                 item.container = container;
                 item.name = container.displayName.length ? container.displayName : container.identifier;
                 item.systemApp = container.systemApp;
-                item.running = cleaner_process_is_running(container.executableName, running);
+                item.active = cleaner_process_is_active(container.executableName, active);
 
                 NSString *cachePath = [container.path stringByAppendingPathComponent:@"Library/Caches"];
                 NSString *tmpPath = [container.path stringByAppendingPathComponent:@"tmp"];
@@ -418,7 +418,7 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
                 item.icon = container.icon;   // loaded off the main thread
                 // Apps with nothing reclaimable are noise in this screen.
                 if (item.totalBytes == 0) continue;
-                item.selected = processListAvailable && !item.running && !item.systemApp;
+                item.selected = processListAvailable && !item.active && !item.systemApp;
                 [items addObject:item];
             }
 
@@ -448,7 +448,7 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
     NSArray<CYCleanerItem *> *selectable = [self.items filteredArrayUsingPredicate:
         [NSPredicate predicateWithBlock:^BOOL(CYCleanerItem *item, NSDictionary *bindings) {
             (void)bindings;
-            return !item.running && !item.systemApp && item.totalBytes > 0;
+            return !item.active && !item.systemApp && item.totalBytes > 0;
         }]];
     BOOL allSelected = selectable.count > 0;
     for (CYCleanerItem *item in selectable) {
@@ -489,7 +489,7 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
                                  self.processListAvailable && self.items.count > 0;
     NSUInteger selectable = 0, selectedSelectable = 0;
     for (CYCleanerItem *item in self.items) {
-        if (item.running || item.systemApp || item.totalBytes == 0) continue;
+        if (item.active || item.systemApp || item.totalBytes == 0) continue;
         selectable++;
         if (item.selected) selectedSelectable++;
     }
@@ -504,7 +504,7 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
     if (!self.processListAvailable) {
         UIAlertController *alert = [UIAlertController
             alertControllerWithTitle:@"Kernel Access Needed"
-                             message:@"Cleaner cannot tell which apps are running without kernel access. Run the chain once, then try again."
+                             message:@"Cleaner cannot tell which apps are active without kernel access. Run the chain once, then try again."
                       preferredStyle:UIAlertControllerStyleAlert];
         [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:alert animated:YES completion:nil];
@@ -555,18 +555,18 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
-            NSSet<NSString *> *running = settings_running_process_names();
-            NSUInteger cleanedApps = 0, skippedRunning = 0, failedApps = 0;
+            NSSet<NSString *> *active = settings_active_process_names();
+            NSUInteger cleanedApps = 0, skippedActive = 0, failedApps = 0;
             unsigned long long freed = 0;
 
-            if (running) {
+            if (active) {
                 for (CYCleanerItem *item in self.items) {
                     if (!item.selected) continue;
                     if (!cleaner_path_is_app_data(item.container.path)) { failedApps++; continue; }
-                    if (cleaner_process_is_running(item.container.executableName, running)) {
-                        item.running = YES;
+                    if (cleaner_process_is_active(item.container.executableName, active)) {
+                        item.active = YES;
                         item.selected = NO;
-                        skippedRunning++;
+                        skippedActive++;
                         continue;
                     }
 
@@ -607,10 +607,10 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
                 [self.tableView reloadData];
                 [self updateCleanButton];
 
-                if (!running) {
+                if (!active) {
                     UIAlertController *alert = [UIAlertController
                         alertControllerWithTitle:@"Cleaner Stopped"
-                                         message:@"The running-process list was unavailable, so nothing was removed."
+                                         message:@"The active-process list was unavailable, so nothing was removed."
                                   preferredStyle:UIAlertControllerStyleAlert];
                     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
                     [self presentViewController:alert animated:YES completion:nil];
@@ -620,9 +620,9 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
                 NSMutableString *result = [NSMutableString stringWithFormat:
                     @"Freed %@ from %lu app%@.", cleaner_bytes(freed),
                     (unsigned long)cleanedApps, cleanedApps == 1 ? @"" : @"s"];
-                if (skippedRunning > 0)
-                    [result appendFormat:@" Skipped %lu running app%@.", (unsigned long)skippedRunning,
-                     skippedRunning == 1 ? @"" : @"s"];
+                if (skippedActive > 0)
+                    [result appendFormat:@" Skipped %lu active app%@.", (unsigned long)skippedActive,
+                     skippedActive == 1 ? @"" : @"s"];
                 if (failedApps > 0)
                     [result appendFormat:@" Some files in %lu app%@ could not be removed.",
                      (unsigned long)failedApps, failedApps == 1 ? @"" : @"s"];
@@ -695,7 +695,7 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
                           self.items.count == 1 ? @"" : @"s"];
             }
             if (!self.processListAvailable)
-                detail = [detail stringByAppendingString:@" Kernel access is unavailable, so running-app protection is off."];
+                detail = [detail stringByAppendingString:@" Kernel access is unavailable, so active-app protection is off."];
             cell.detailTextLabel.text = detail;
         }
         return cell;
@@ -717,7 +717,7 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
     if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
                                              reuseIdentifier:@"cleaner-app"];
     cell.textLabel.text = item.name;
-    cell.textLabel.textColor = item.running ? UIColor.secondaryLabelColor : UIColor.labelColor;
+    cell.textLabel.textColor = item.active ? UIColor.secondaryLabelColor : UIColor.labelColor;
     cell.detailTextLabel.numberOfLines = 2;
     cell.imageView.image = item.icon;
 
@@ -729,11 +729,11 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
     if (parts.count == 0) [parts addObject:@"No cache data"];
     if (item.incomplete) [parts addObject:@"≥"];
     NSString *detail = [parts componentsJoinedByString:@" · "];
-    if (item.running) detail = [detail stringByAppendingString:@" · Running — skipped"];
+    if (item.active) detail = [detail stringByAppendingString:@" · Active — skipped"];
     else if (item.systemApp) detail = [detail stringByAppendingString:@" · System"];
     cell.detailTextLabel.text = detail;
     cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
-    cell.selectionStyle = (item.running || item.totalBytes == 0 || !self.processListAvailable)
+    cell.selectionStyle = (item.active || item.totalBytes == 0 || !self.processListAvailable)
         ? UITableViewCellSelectionStyleNone : UITableViewCellSelectionStyleDefault;
     cell.accessoryType = item.selected ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
     cell.accessoryView = nil;
@@ -745,7 +745,7 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
     (void)tableView;
     if (indexPath.section != 1 || self.items.count == 0) return NO;
     CYCleanerItem *item = self.items[indexPath.row];
-    return !item.running && item.totalBytes > 0 && self.processListAvailable &&
+    return !item.active && item.totalBytes > 0 && self.processListAvailable &&
            !self.loading && !self.cleaning;
 }
 

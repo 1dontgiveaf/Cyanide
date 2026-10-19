@@ -289,6 +289,10 @@ UIViewController *settings_make_system_info_viewer(void);
 // characters), nil when kernel access or the process list is unavailable.
 // Blocking; off the main thread.
 NSSet<NSString *> *settings_running_process_names(void);
+// Names of processes that are actually running (not merely suspended/prewarmed).
+// Suspended apps — including iOS prewarming — are absent; an uncalibrated entry
+// is treated as active so it is protected. Blocking; off the main thread.
+NSSet<NSString *> *settings_active_process_names(void);
 // The cache cleaner screen.
 UIViewController *settings_make_cleaner_viewer(void);
 // System-wide Location Services: desired 1 = on, 0 = off, -1 = toggle.

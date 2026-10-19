@@ -7591,6 +7591,31 @@ NSSet<NSString *> *settings_running_process_names(void)
     return names;
 }
 
+NSSet<NSString *> *settings_active_process_names(void)
+{
+    if (!kexploit_krw_ready()) return nil;
+    // suspend_count is runtime-calibrated from our own task and launchd. A
+    // failed calibration leaves every count at -1; those names are kept in the
+    // set so Cleaner skips them rather than deleting a possibly-live cache.
+    (void)procmgr_calibrate();
+    int cap = 4096;
+    procmgr_entry_t *buf = calloc((size_t)cap, sizeof(procmgr_entry_t));
+    int n = buf ? procmgr_list(buf, cap) : -1;
+    if (n < 0) { free(buf); return nil; }
+    NSMutableSet<NSString *> *names = [NSMutableSet setWithCapacity:(NSUInteger)n];
+    for (int i = 0; i < n; i++) {
+        buf[i].name[sizeof(buf[i].name) - 1] = 0;
+        NSString *name = [NSString stringWithUTF8String:buf[i].name];
+        if (name.length == 0) continue;
+        int suspendCount = procmgr_suspend_count(buf[i].pid);
+        // 0 means running; >0 is prewarmed/background-suspended and safe to
+        // clean; -1 means we could not prove it is suspended, so protect it.
+        if (suspendCount <= 0) [names addObject:name];
+    }
+    free(buf);
+    return names;
+}
+
 UIViewController *settings_make_cleaner_viewer(void)
 {
     return [[CleanerViewController alloc] init];
