@@ -14,6 +14,7 @@ Daemons, System Info, a Reboot button and a smarter Location Services toggle, pl
 - **Faster respring.** SpringBoard is asked to restart itself instead of being forced to; the old way is still used if that request can't be confirmed.
 - **Location Services toggle goes back where you were.** From Control Center or Shortcuts over an app, Cyanide returns to that app afterwards; from the Home Screen, to the Home Screen. Run while Cyanide is open, it stays.
 - **File Browser app names.** Container folders show the app's name and icon, with a jump between an app's bundle and its data.
+- **Cache Cleaner.** Lists installed apps and the space used by their `Library/Caches` and `tmp` folders, lets you select apps, and removes only those disposable contents. Running apps and system apps are protected or opt-in, and documents/settings are never touched.
 - **What's New is back** in Settings, with Show Less at the top.
 
 ## Fixes
