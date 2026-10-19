@@ -481,7 +481,8 @@ static BOOL cleaner_intro_accepted(void)
                                  @"It has to be downloaded again — check large caches before cleaning.\n"
                                  @"• Rarely, an app asks you to sign in again or loses an unsent draft.\n"
                                  @"• An app waiting in the background may crash once when you return to it.\n\n"
-                                 @"The space is freed for a while; apps refill their caches as you use them."
+                                 @"Reported sizes are logical file sizes; actual recovered storage can differ. "
+                                 @"Apps refill their caches as you use them."
                   preferredStyle:UIAlertControllerStyleAlert];
     __weak typeof(self) weakSelf = self;
     [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
@@ -858,7 +859,7 @@ static BOOL cleaner_intro_accepted(void)
     if (count == 0) return;
 
     NSString *message = [NSString stringWithFormat:
-        @"Remove Library/Caches and tmp contents for %lu app%@ (%@)? Documents, settings and app data are not touched. Apps may need to redownload content.",
+        @"Remove Library/Caches and tmp contents for %lu app%@ (%@ in logical file sizes)? Documents, settings and app data are not touched. Apps may need to redownload content.",
         (unsigned long)count, count == 1 ? @"" : @"s", cleaner_bytes([self selectedBytes])];
     UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"Clean Caches?"
                                                                      message:message
@@ -947,7 +948,7 @@ static BOOL cleaner_intro_accepted(void)
                     self.resultText = @"Stopped: the active-app list was unavailable, so nothing was removed.";
                 } else {
                     NSMutableString *result = [NSMutableString stringWithFormat:
-                        @"Freed %@ from %lu app%@.", cleaner_bytes(freed),
+                        @"Removed %@ (logical size) from %lu app%@.", cleaner_bytes(freed),
                         (unsigned long)cleanedApps, cleanedApps == 1 ? @"" : @"s"];
                     if (skippedActive > 0)
                         [result appendFormat:@" Skipped %lu active app%@.", (unsigned long)skippedActive,
@@ -1061,13 +1062,14 @@ static BOOL cleaner_intro_accepted(void)
         cell.statusLabel.text = self.accessMessage ?: @"Filesystem access is not available.";
         return;
     }
-    cell.captionLabel.text = @"Reclaimable";
+    cell.captionLabel.text = @"Cache + Temp Size";
     cell.totalLabel.text = cleaner_bytes(total);
     cell.bar.progress = total ? (float)((double)selected / (double)total) : 0;
     NSMutableArray<NSString *> *lines = [NSMutableArray array];
     if (self.resultText) [lines addObject:self.resultText];
     [lines addObject:[NSString stringWithFormat:@"%@ selected in %lu app%@", cleaner_bytes(selected),
                       (unsigned long)[self selectedCount], [self selectedCount] == 1 ? @"" : @"s"]];
+    [lines addObject:@"Logical file sizes, not guaranteed recovered storage."];
     if (!self.processListAvailable)
         [lines addObject:@"Kernel access is unavailable, so apps in use can't be detected and nothing can be cleaned."];
     cell.statusLabel.text = [lines componentsJoinedByString:@"\n"];

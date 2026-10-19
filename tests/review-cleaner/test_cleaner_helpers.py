@@ -122,9 +122,29 @@ if (geteuid() != 0) {
     chmod(blocked.fileSystemRepresentation, 0700);
     check(bytes == 1024 && removed == 1 && failed > 0 && !exists(deletable), "partial child bytes preserved");
 }
+
+// A removed cache link is logical data removed, not guaranteed storage freed.
+a = app(); cache = [a stringByAppendingPathComponent:@"Library/Caches"]; mkdirp(cache);
+document = [a stringByAppendingPathComponent:@"Documents/original.bin"]; put(document, 8192);
+check(linkat(AT_FDCWD, document.fileSystemRepresentation, AT_FDCWD,
+    [cache stringByAppendingPathComponent:@"alias.bin"].fileSystemRepresentation, 0) == 0, "hard-link fixture");
+struct stat before, after;
+check(lstat(document.fileSystemRepresentation, &before) == 0, "stat original");
+removed = failed = 0;
+bytes = cleaner_clear_directory(cache, &removed, &failed);
+check(lstat(document.fileSystemRepresentation, &after) == 0, "original survives cache unlink");
+check(bytes == 8192 && before.st_blocks == after.st_blocks && after.st_nlink == 1, "logical bytes differ from recovered space");
 '''
 
 class CleanerHelperTests(unittest.TestCase):
+    def test_storage_labels(self):
+        source = SOURCE.read_text()
+        self.assertIn('@"Cache + Temp Size"', source)
+        self.assertIn("(logical size) from", source)
+        self.assertIn("not guaranteed recovered storage", source)
+        self.assertNotIn('@"Freed %@', source)
+        self.assertNotIn('@"Reclaimable"', source)
+
     def test_native_helpers(self):
         source = SOURCE.read_text()
         with tempfile.TemporaryDirectory(prefix="cyanide-cleaner-test-") as temporary:
