@@ -1436,6 +1436,9 @@ static BOOL cleaner_intro_accepted(void)
     contextMenuConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath point:(CGPoint)point
 {
     if (indexPath.section == CYCleanerSectionSummary) return nil;
+    // No folder browsing mid-clean: the pushed File Browser would show a
+    // tree that is actively being deleted underneath it.
+    if (self.cleaning) return nil;
     CYCleanerItem *item = [self itemsInSection:indexPath.section][(NSUInteger)indexPath.row];
     NSString *caches = [item.container.path stringByAppendingPathComponent:@"Library/Caches"];
     NSString *tmp = [item.container.path stringByAppendingPathComponent:@"tmp"];
