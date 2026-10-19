@@ -411,6 +411,11 @@ static const CGFloat kMargin = 20.0;
                                          icon:@"gearshape.2.fill"
                                         color:UIColor.systemTealColor
                                           sel:@selector(openDaemons)]];
+    [s addArrangedSubview:[self bigActionButton:@"Cleaner"
+                                          sub:@"Free space from app caches"
+                                         icon:@"trash.fill"
+                                        color:UIColor.systemOrangeColor
+                                          sel:@selector(openCleaner)]];
     [s addArrangedSubview:[self bigActionButton:@"System Info"
                                           sub:@"Battery, uptime, kernel access, storage"
                                          icon:@"info.circle.fill"
@@ -746,6 +751,11 @@ static const CGFloat kMargin = 20.0;
 - (void)openProcessViewer
 {
     [self.navigationController pushViewController:settings_make_process_viewer() animated:YES];
+}
+
+- (void)openCleaner
+{
+    [self.navigationController pushViewController:settings_make_cleaner_viewer() animated:YES];
 }
 
 - (void)openSystemInfo
