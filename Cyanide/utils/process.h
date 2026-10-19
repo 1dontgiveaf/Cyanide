@@ -44,8 +44,9 @@ typedef struct {
 // -1 if kernel r/w is not currently armed, or if any read failed during the
 // walk (a zero-filled link may have cut it short: the list is incomplete).
 // Candidates are gated by the kernel_map snapshot before their fields are
-// read; an unmapped candidate also makes the pass incomplete. Requires an
-// active KRW session.
+// read; an unmapped candidate also makes the pass incomplete. If the gate
+// cannot be brought up, the list is refused rather than read unguarded.
+// Requires an active KRW session.
 int procmgr_list(procmgr_entry_t *entries, int max);
 
 // comm (as procmgr_comm_for_pid) plus the struct proc address currently

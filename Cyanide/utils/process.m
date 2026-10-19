@@ -637,8 +637,45 @@ static size_t pm_proc_core_len(void) {
 
 static bool pm_proc_readable(uint64_t proc) {
     if (!procmgr_is_kern_ptr(proc)) return false;
-    if (!ksafe_available()) return true;   // no map = no gate (old behavior)
+    // Fail closed: without the kernel_map snapshot there is no safe way to
+    // tell a live struct proc from a trimmed/reused one. procmgr_list() brings
+    // the gate up before walking (or refuses the list).
+    if (!ksafe_available()) return false;
     return kaddr_is_mapped(proc, pm_proc_core_len());
+}
+
+// The list is the one procmgr entry point that does not go through
+// procmgr_calibrate(): the Daemons screen calls it directly. Bring the
+// mapped-address gate up here, rate-limited like the calibrator (3 tries,
+// 10 s apart), and refuse the list if it still cannot be established rather
+// than reading struct proc with no gate at all.
+static bool pm_list_ensure_ksafe_gate(void) {
+    if (ksafe_available()) return true;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static int attempts = 0;
+    static uint64_t lastNs = 0;
+    static bool logged = false;
+    pthread_mutex_lock(&lock);
+    if (!ksafe_available() && attempts < 3) {
+        uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+        if (!lastNs || now - lastNs >= 10000000000ULL) {
+            attempts++;
+            lastNs = now;
+            printf("[PROCMGR] list: bringing up kernel_map snapshot (try %d/3)...\n",
+                   attempts);
+            krw_set_nonfatal(true);
+            init_xpf();
+            krw_set_nonfatal(false);
+        }
+    }
+    bool ready = ksafe_available();
+    if (!ready && !logged) {
+        logged = true;
+        printf("[PROCMGR] refusing process list: mapped-address gate unavailable; "
+               "no unguarded struct proc reads\n");
+    }
+    pthread_mutex_unlock(&lock);
+    return ready;
 }
 
 // A newly allocated struct proc/thread is absent from the boot-time snapshot.
@@ -665,6 +702,7 @@ static bool procmgr_fill_entry(uint64_t proc, procmgr_entry_t *e) {
 int procmgr_list(procmgr_entry_t *entries, int max) {
     if (!entries || max <= 0) return 0;
     if (!kexploit_krw_ready()) return -1;
+    if (!pm_list_ensure_ksafe_gate()) return -1;
 
     // A polling UI loop must never take the app down on a transient KRW
     // hiccup: nonfatal mode zero-fills failed reads instead of crashing.

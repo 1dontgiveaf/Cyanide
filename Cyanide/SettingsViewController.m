@@ -3405,7 +3405,12 @@ static BOOL settings_handle_stale_krw(const char *why)
     printf("[SETTINGS] %s: kernel access %s\n", why, recovered ? "recovered from the parked state" : "not recoverable");
     // KRW is back: retry RemoteCall cleanup deferred while it was dead
     // (pending task_exc_guard restores, unverified synthetic threads).
-    if (recovered) remote_call_retry_pending_cleanup();
+    if (recovered) {
+        remote_call_retry_pending_cleanup();
+        // A crashed OTA write may have left the launchd plist folder widened;
+        // restore it now that kernel access is back.
+        darksword_ota_retry_pending_dir_restore();
+    }
     return recovered;
 }
 
@@ -3434,6 +3439,8 @@ static BOOL settings_ensure_kexploit(void)
     }
     g_kexploit_done = YES;
     settings_notify_remote_call_state_changed();
+    // Restore a launchd plist folder left widened by an interrupted OTA write.
+    darksword_ota_retry_pending_dir_restore();
     return YES;
 }
 
@@ -3484,8 +3491,9 @@ static BOOL settings_ensure_kexploit_for_read(void)
     g_kexploit_done = YES;
     settings_notify_remote_call_state_changed();
     // Parked KRW recovered: retry deferred RemoteCall cleanup (no-op when
-    // nothing is pending).
+    // nothing is pending), and an OTA folder-mode restore left by a crash.
     remote_call_retry_pending_cleanup();
+    darksword_ota_retry_pending_dir_restore();
     return YES;
 }
 
@@ -3545,6 +3553,7 @@ static BOOL settings_ensure_kexploit_recovery_only(void)
 
     g_kexploit_done = YES;
     settings_notify_remote_call_state_changed();
+    darksword_ota_retry_pending_dir_restore();
     return YES;
 }
 
