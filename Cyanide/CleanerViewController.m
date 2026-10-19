@@ -229,7 +229,7 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
     return freed;
 }
 
-@interface CYCleanerItem : NSObject
+@interface CYCleanerItem : NSObject <NSCopying>
 @property (nonatomic, strong) FBAppContainer *container;
 @property (nonatomic, strong) UIImage *icon;
 @property (nonatomic, copy) NSString *name;
@@ -245,6 +245,21 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
 - (unsigned long long)totalBytes
 {
     return self.cacheBytes + self.tempBytes;
+}
+
+- (id)copyWithZone:(NSZone *)zone
+{
+    CYCleanerItem *copy = [[[self class] allocWithZone:zone] init];
+    copy.container = self.container;
+    copy.icon = self.icon;
+    copy.name = self.name;
+    copy.cacheBytes = self.cacheBytes;
+    copy.tempBytes = self.tempBytes;
+    copy.active = self.active;
+    copy.systemApp = self.systemApp;
+    copy.selected = self.selected;
+    copy.incomplete = self.incomplete;
+    return copy;
 }
 @end
 
@@ -866,9 +881,10 @@ static BOOL cleaner_intro_accepted(void)
     [self updateControls];
     [self.tableView reloadData];
 
-    // The selection, taken on the main thread before the work starts.
+    // Detached worker-owned copies: section membership and sort keys of the
+    // live table must not change until results are published on the main queue.
     NSMutableArray<CYCleanerItem *> *work = [NSMutableArray array];
-    for (CYCleanerItem *item in self.items) if (item.selected) [work addObject:item];
+    for (CYCleanerItem *item in self.items) if (item.selected) [work addObject:[item copy]];
 
     __block UIBackgroundTaskIdentifier bgTask =
         [UIApplication.sharedApplication beginBackgroundTaskWithName:@"cyanide.cleaner" expirationHandler:^{}];
@@ -941,11 +957,16 @@ static BOOL cleaner_intro_accepted(void)
                          (unsigned long)failedApps, failedApps == 1 ? @"" : @"s"];
                     self.resultText = result;
                 }
-                // Emptied apps drop out of the list; the card shows the result.
-                self.items = [self.items filteredArrayUsingPredicate:
-                    [NSPredicate predicateWithBlock:^BOOL(CYCleanerItem *item, NSDictionary *b) {
-                        return item.totalBytes > 0;
-                    }]];
+                NSMutableDictionary<NSString *, CYCleanerItem *> *results = [NSMutableDictionary dictionary];
+                for (CYCleanerItem *item in work) results[item.container.path] = item;
+                NSMutableArray<CYCleanerItem *> *published = [NSMutableArray array];
+                for (CYCleanerItem *oldItem in self.items) {
+                    CYCleanerItem *item = results[oldItem.container.path] ?: oldItem;
+                    if (item.totalBytes > 0) [published addObject:item];
+                }
+                // Replace the model and reload together. Offscreen folder-review
+                // controllers keep their original stable item snapshots.
+                self.items = published;
                 [self.tableView reloadData];
                 [self updateControls];
                 UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, self.resultText);
