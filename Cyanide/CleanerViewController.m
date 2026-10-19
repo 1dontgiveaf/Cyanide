@@ -226,6 +226,10 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
 }
 @end
 
+@interface CYCleanerFoldersViewController : UITableViewController
+@property (nonatomic, copy) NSArray<CYCleanerItem *> *items;
+@end
+
 @interface CleanerViewController ()
 @property (nonatomic, copy) NSArray<CYCleanerItem *> *items;
 @property (nonatomic) BOOL processListAvailable;
@@ -233,6 +237,10 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
 @property (nonatomic) BOOL loading;
 @property (nonatomic) BOOL cleaning;
 @property (nonatomic, strong) UIBarButtonItem *selectAllItem;
+@property (nonatomic, strong) UIBarButtonItem *foldersItem;
+@property (nonatomic, strong) UIProgressView *scanProgressView;
+@property (nonatomic) NSUInteger scanDone;
+@property (nonatomic) NSUInteger scanTotal;
 @property (nonatomic, strong) UIButton *cleanButton;
 @property (nonatomic, strong) UILabel *cleanHintLabel;
 @property (nonatomic, strong) UIAlertController *progressAlert;
@@ -263,7 +271,11 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
                                                           style:UIBarButtonItemStylePlain
                                                          target:self
                                                          action:@selector(toggleSelectAll:)];
-    self.navigationItem.rightBarButtonItem = self.selectAllItem;
+    self.foldersItem = [[UIBarButtonItem alloc] initWithTitle:@"Folders"
+                                                       style:UIBarButtonItemStylePlain
+                                                      target:self
+                                                      action:@selector(showSelectedFolders:)];
+    self.navigationItem.rightBarButtonItems = @[self.foldersItem, self.selectAllItem];
 
     [self buildTopBar];
     [self buildFooter];
@@ -281,6 +293,16 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
 {
     [super viewWillDisappear:animated];
     cleaner_suppress_popup_bar(self, NO);
+}
+
+- (UIProgressView *)scanProgressView
+{
+    if (!_scanProgressView) {
+        _scanProgressView = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
+        _scanProgressView.frame = CGRectMake(0, 0, 96, 4);
+        _scanProgressView.progressTintColor = UIColor.systemBlueColor;
+    }
+    return _scanProgressView;
 }
 
 - (void)buildTopBar
@@ -313,7 +335,7 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
 
 - (void)buildFooter
 {
-    UIView *footer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 0, 56)];
+    UIView *footer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 0, 76)];
     footer.backgroundColor = UIColor.clearColor;
 
     self.cleanHintLabel = [[UILabel alloc] init];
@@ -321,7 +343,7 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
     self.cleanHintLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
     self.cleanHintLabel.textColor = UIColor.secondaryLabelColor;
     self.cleanHintLabel.numberOfLines = 0;
-    self.cleanHintLabel.text = @"Only Library/Caches and tmp contents are removed. Documents, settings and app data are not touched. Active apps are skipped.";
+    self.cleanHintLabel.text = @"Only Library/Caches and tmp contents are removed. Documents, settings and app data are not touched. Active apps are skipped. Use Folders to review the exact paths.";
     [footer addSubview:self.cleanHintLabel];
 
     UILayoutGuide *m = footer.layoutMarginsGuide;
@@ -384,19 +406,31 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
     }
 
     self.loading = YES;
+    self.scanDone = 0;
+    self.scanTotal = 0;
     [self updateCleanButton];
     [self.refreshControl beginRefreshing];
+    [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:0]
+                  withRowAnimation:UITableViewRowAnimationNone];
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
             // Keep the scan independent of the File Browser's cached metadata.
             fb_containers_reset();
             NSArray<FBAppContainer *> *containers = fb_app_data_containers();
+            NSUInteger total = containers.count;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                typeof(self) self = weakSelf;
+                if (!self || !self.loading) return;
+                self.scanTotal = total;
+                [self updateScanProgress:0 total:total name:nil];
+            });
             NSSet<NSString *> *active = settings_active_process_names();
             BOOL processListAvailable = (active != nil);
             if (!active) active = [NSSet set];
 
             NSMutableArray<CYCleanerItem *> *items = [NSMutableArray array];
+            NSUInteger scanned = 0;
             for (FBAppContainer *container in containers) {
                 if (![container isKindOfClass:FBAppContainer.class]) continue;
                 if (!cleaner_path_is_app_data(container.path)) continue;
@@ -416,6 +450,12 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
                 item.tempBytes = cleaner_tree_bytes(tmpPath, NULL, &complete);
                 item.incomplete = item.incomplete || !complete;
                 item.icon = container.icon;   // loaded off the main thread
+                scanned++;
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    typeof(self) self = weakSelf;
+                    if (!self || !self.loading) return;
+                    [self updateScanProgress:scanned total:total name:item.name];
+                });
                 // Apps with nothing reclaimable are noise in this screen.
                 if (item.totalBytes == 0) continue;
                 item.selected = processListAvailable && !item.active && !item.systemApp;
@@ -439,6 +479,32 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
             });
         }
     });
+}
+
+- (void)updateScanProgress:(NSUInteger)done total:(NSUInteger)total name:(NSString *)name
+{
+    if (total == 0) {
+        self.scanProgressView.progress = 0;
+    } else {
+        self.scanProgressView.progress = (float)MIN(done, total) / (float)total;
+    }
+    self.scanDone = done;
+    self.scanTotal = total;
+
+    NSIndexPath *summary = [NSIndexPath indexPathForRow:0 inSection:0];
+    UITableViewCell *cell = [self.tableView cellForRowAtIndexPath:summary];
+    if (!cell || !self.loading) return;
+    cell.accessoryView = self.scanProgressView;
+    if (name.length > 0) {
+        cell.detailTextLabel.text = [NSString stringWithFormat:
+            @"Scanning %@… %lu/%lu app%@", name,
+            (unsigned long)MIN(done, total), (unsigned long)total,
+            total == 1 ? @"" : @"s"];
+    } else {
+        cell.detailTextLabel.text = total > 0
+            ? [NSString stringWithFormat:@"Scanning app caches… 0/%lu", (unsigned long)total]
+            : @"Finding app containers…";
+    }
 }
 
 - (void)toggleSelectAll:(id)sender
@@ -487,6 +553,7 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
     [self.cleanButton setTitle:title forState:UIControlStateNormal];
     self.selectAllItem.enabled = !self.loading && !self.cleaning &&
                                  self.processListAvailable && self.items.count > 0;
+    self.foldersItem.enabled = !self.loading && !self.cleaning && count > 0;
     NSUInteger selectable = 0, selectedSelectable = 0;
     for (CYCleanerItem *item in self.items) {
         if (item.active || item.systemApp || item.totalBytes == 0) continue;
@@ -495,6 +562,17 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
     }
     self.selectAllItem.title = (selectable > 0 && selectedSelectable == selectable)
         ? @"Deselect All" : @"Select All";
+}
+
+- (void)showSelectedFolders:(id)sender
+{
+    (void)sender;
+    NSMutableArray<CYCleanerItem *> *selected = [NSMutableArray array];
+    for (CYCleanerItem *item in self.items) if (item.selected) [selected addObject:item];
+    if (selected.count == 0) return;
+    CYCleanerFoldersViewController *vc = [[CYCleanerFoldersViewController alloc] init];
+    vc.items = selected;
+    [self.navigationController pushViewController:vc animated:YES];
 }
 
 - (void)cleanSelected:(id)sender
@@ -671,10 +749,16 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
         cell.textLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
         cell.detailTextLabel.numberOfLines = 0;
         if (self.loading) {
-            cell.detailTextLabel.text = @"Scanning app caches…";
+            cell.detailTextLabel.text = self.scanTotal > 0
+                ? [NSString stringWithFormat:@"Scanning app caches… %lu/%lu",
+                   (unsigned long)self.scanDone, (unsigned long)self.scanTotal]
+                : @"Finding app containers…";
+            cell.accessoryView = self.scanProgressView;
         } else if (!self.accessReady) {
+            cell.accessoryView = nil;
             cell.detailTextLabel.text = @"Filesystem access is not available.";
         } else {
+            cell.accessoryView = nil;
             NSUInteger selected = [self selectedCount];
             unsigned long long selectedBytes = [self selectedBytes];
             unsigned long long total = 0;
@@ -758,6 +842,69 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
     item.selected = !item.selected;
     [tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationNone];
     [self updateCleanButton];
+}
+
+@end
+
+
+@implementation CYCleanerFoldersViewController
+
+- (instancetype)init
+{
+    self = [super initWithStyle:UITableViewStyleInsetGrouped];
+    if (self) self.title = @"Folders to Clean";
+    return self;
+}
+
+- (NSArray<NSDictionary<NSString *, id> *> *)foldersForItem:(CYCleanerItem *)item
+{
+    NSMutableArray *out = [NSMutableArray array];
+    if (item.cacheBytes > 0) {
+        [out addObject:@{ @"title": @"Library/Caches",
+                          @"path": [item.container.path stringByAppendingPathComponent:@"Library/Caches"],
+                          @"bytes": @(item.cacheBytes) }];
+    }
+    if (item.tempBytes > 0) {
+        [out addObject:@{ @"title": @"tmp",
+                          @"path": [item.container.path stringByAppendingPathComponent:@"tmp"],
+                          @"bytes": @(item.tempBytes) }];
+    }
+    return out;
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView
+{
+    (void)tableView;
+    return self.items.count;
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
+{
+    (void)tableView;
+    return [self foldersForItem:self.items[section]].count;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section
+{
+    (void)tableView;
+    return self.items[section].name;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
+{
+    NSDictionary *folder = [self foldersForItem:self.items[indexPath.section]][indexPath.row];
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"cleaner-folder"];
+    if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
+                                             reuseIdentifier:@"cleaner-folder"];
+    cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    cell.textLabel.text = folder[@"path"];
+    cell.textLabel.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+    cell.textLabel.numberOfLines = 3;
+    cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ · %@",
+        folder[@"title"], cleaner_bytes([(NSNumber *)folder[@"bytes"] unsignedLongLongValue])];
+    cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
+    cell.accessoryType = UITableViewCellAccessoryNone;
+    return cell;
 }
 
 @end
