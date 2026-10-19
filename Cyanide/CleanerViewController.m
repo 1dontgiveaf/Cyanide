@@ -416,6 +416,7 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
 // scan progress or the last result.
 @interface CYCleanerSummaryCell : UITableViewCell
 @property (nonatomic, strong) UILabel *captionLabel;
+@property (nonatomic, strong) UIActivityIndicatorView *spinner;
 @property (nonatomic, strong) UILabel *totalLabel;
 @property (nonatomic, strong) UIProgressView *bar;
 @property (nonatomic, strong) UILabel *statusLabel;
@@ -440,7 +441,14 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
         _statusLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
         _statusLabel.textColor = UIColor.secondaryLabelColor;
         _statusLabel.numberOfLines = 0;
-        UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[ _captionLabel, _totalLabel, _bar, _statusLabel ]];
+        _spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+        _spinner.hidesWhenStopped = YES;
+        UIStackView *captionRow = [[UIStackView alloc] initWithArrangedSubviews:@[ _captionLabel, _spinner ]];
+        captionRow.axis = UILayoutConstraintAxisHorizontal;
+        captionRow.spacing = 8;
+        captionRow.alignment = UIStackViewAlignmentCenter;
+        UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[ captionRow, _totalLabel, _bar, _statusLabel ]];
+        stack.alignment = UIStackViewAlignmentFill;
         stack.axis = UILayoutConstraintAxisVertical;
         stack.spacing = 6;
         [stack setCustomSpacing:10 afterView:_totalLabel];
@@ -470,6 +478,14 @@ typedef NS_ENUM(NSInteger, CYCleanerSection) {
 };
 
 typedef NS_ENUM(NSInteger, CYCleanerSort) { CYCleanerSortSize, CYCleanerSortName };
+
+// What a loading screen is busy with, so the card can say so.
+typedef NS_ENUM(NSInteger, CYCleanerPhase) {
+    CYCleanerPhaseAccess,      // lifting the sandbox (may need SpringBoard / kernel access)
+    CYCleanerPhaseFinding,     // reading every app container's metadata and icon
+    CYCleanerPhaseProcesses,   // reading the running-process list
+    CYCleanerPhaseScanning,    // measuring each app's caches
+};
 static NSString * const kCleanerSortKey = @"CleanerSort";
 // The explanation version the user acknowledged; bump to show it again.
 static NSString * const kCleanerIntroAcceptedKey = @"CleanerIntroAcceptedVersion";
@@ -489,6 +505,9 @@ static BOOL cleaner_intro_accepted(void)
 @property (nonatomic) NSUInteger scanDone;
 @property (nonatomic) NSUInteger scanTotal;
 @property (nonatomic, copy) NSString *scanName;
+@property (nonatomic) CYCleanerPhase phase;
+@property (nonatomic) NSUInteger foundDone;    // containers looked at while finding apps
+@property (nonatomic) NSUInteger foundTotal;
 @property (nonatomic, copy) NSString *resultText;     // last clean's result, shown on the card
 @property (nonatomic, copy) NSString *accessMessage;  // why there's no list
 @property (nonatomic) BOOL skippedExpanded;
@@ -537,6 +556,9 @@ static BOOL cleaner_intro_accepted(void)
 {
     [super viewWillAppear:animated];
     [self.navigationController setToolbarHidden:NO animated:animated];
+    // Start right away, not after the push animation: the card shows what's
+    // happening from the first frame.
+    if (!self.accessReady && !self.loading) [self ensureAccessAllowingFullExploit:NO];
 }
 
 - (void)viewDidAppear:(BOOL)animated
@@ -754,6 +776,7 @@ static BOOL cleaner_intro_accepted(void)
         return;
     }
     self.loading = YES;
+    self.phase = CYCleanerPhaseAccess;
     self.accessMessage = nil;
     self.scanName = nil;
     [self.tableView reloadData];
@@ -812,6 +835,9 @@ static BOOL cleaner_intro_accepted(void)
     }
 
     self.loading = YES;
+    self.phase = CYCleanerPhaseFinding;
+    self.foundDone = 0;
+    self.foundTotal = 0;
     self.scanDone = 0;
     self.scanTotal = 0;
     self.scanName = nil;
@@ -819,19 +845,42 @@ static BOOL cleaner_intro_accepted(void)
     [self.tableView reloadData];
     [self updateControls];
     __weak typeof(self) weakSelf = self;
+    void (^setPhase)(CYCleanerPhase, NSUInteger, NSUInteger) = ^(CYCleanerPhase phase, NSUInteger done, NSUInteger total) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) self = weakSelf;
+            if (!self || !self.loading) return;
+            self.phase = phase;
+            if (phase == CYCleanerPhaseFinding) { self.foundDone = done; self.foundTotal = total; }
+            [self reloadSummary];
+        });
+    };
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         @autoreleasepool {
             // Keep the scan independent of the File Browser's cached metadata.
             fb_containers_reset();
-            NSArray<FBAppContainer *> *containers = fb_app_data_containers();
+            // Same set as fb_app_data_containers(), looked up one by one so the
+            // card can count up (reading metadata and icons takes a while).
+            NSString *dataParent = [kCleanerAppDataPrefix substringToIndex:kCleanerAppDataPrefix.length - 1];
+            NSArray<NSString *> *uuids = [NSFileManager.defaultManager contentsOfDirectoryAtPath:dataParent error:nil];
+            NSMutableArray<FBAppContainer *> *containers = [NSMutableArray array];
+            NSUInteger looked = 0;
+            setPhase(CYCleanerPhaseFinding, 0, uuids.count);
+            for (NSString *uuid in uuids) {
+                FBAppContainer *c = fb_container_for_path([dataParent stringByAppendingPathComponent:uuid], NO);
+                if (c.kind == FBContainerKindData && c.executableName) [containers addObject:c];
+                looked++;
+                if (looked % 4 == 0 || looked == uuids.count) setPhase(CYCleanerPhaseFinding, looked, uuids.count);
+            }
             NSUInteger total = containers.count;
+            setPhase(CYCleanerPhaseProcesses, 0, 0);
+            NSSet<NSString *> *active = settings_active_process_names();
             dispatch_async(dispatch_get_main_queue(), ^{
                 typeof(self) self = weakSelf;
                 if (!self || !self.loading) return;
                 self.scanTotal = total;
+                self.phase = CYCleanerPhaseScanning;
                 [self reloadSummary];
             });
-            NSSet<NSString *> *active = settings_active_process_names();
             BOOL processListAvailable = (active != nil);
             if (!active) active = [NSSet set];
 
@@ -1135,25 +1184,55 @@ static BOOL cleaner_intro_accepted(void)
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section
 {
+    // Right under the card, where it's seen: how the list works.
+    if (section == CYCleanerSectionSummary)
+        return !self.loading && self.items.count
+            ? @"Tap an app to select or deselect it. Touch and hold an app to open its cache folders in the File Browser."
+            : nil;
     if (section != CYCleanerSectionSkipped) return nil;
     return @"Only Library/Caches and tmp contents are removed. Documents, settings and app data are not touched. "
-           @"Active-app checks are best-effort; built-in apps are not selected by default. Long-press an app to open its caches "
-           @"in the File Browser.";
+           @"Active-app checks are best-effort; built-in apps are not selected by default.";
 }
 
 - (void)configureSummary:(CYCleanerSummaryCell *)cell
 {
     unsigned long long total = [self totalBytes], selected = [self selectedBytes];
     if (self.loading) {
-        cell.captionLabel.text = @"Scanning";
-        cell.totalLabel.text = self.scanTotal ? [NSString stringWithFormat:@"%lu / %lu",
-                                                 (unsigned long)self.scanDone, (unsigned long)self.scanTotal] : @"…";
-        cell.bar.progress = self.scanTotal ? (float)self.scanDone / (float)self.scanTotal : 0;
+        [cell.spinner startAnimating];
         cell.bar.progressTintColor = UIColor.systemBlueColor;
-        cell.statusLabel.text = self.scanName.length ? [NSString stringWithFormat:@"Checking %@…", self.scanName]
-                              : (self.accessReady ? @"Finding app containers…" : @"Getting filesystem access…");
+        switch (self.phase) {
+            case CYCleanerPhaseAccess:
+                cell.captionLabel.text = @"Getting File Access";
+                cell.totalLabel.text = @"Preparing…";
+                cell.bar.progress = 0;
+                cell.statusLabel.text = @"Cyanide opens SpringBoard to reach other apps' folders. This takes a few "
+                                        @"seconds the first time after Cyanide starts.";
+                break;
+            case CYCleanerPhaseFinding:
+                cell.captionLabel.text = @"Finding Apps";
+                cell.totalLabel.text = self.foundTotal ? [NSString stringWithFormat:@"%lu / %lu",
+                                                          (unsigned long)self.foundDone, (unsigned long)self.foundTotal] : @"…";
+                cell.bar.progress = self.foundTotal ? (float)self.foundDone / (float)self.foundTotal : 0;
+                cell.statusLabel.text = @"Reading each app's name and icon.";
+                break;
+            case CYCleanerPhaseProcesses:
+                cell.captionLabel.text = @"Checking Running Apps";
+                cell.totalLabel.text = @"…";
+                cell.bar.progress = 1;
+                cell.statusLabel.text = @"Apps in use are left alone.";
+                break;
+            case CYCleanerPhaseScanning:
+                cell.captionLabel.text = @"Measuring Caches";
+                cell.totalLabel.text = self.scanTotal ? [NSString stringWithFormat:@"%lu / %lu",
+                                                         (unsigned long)self.scanDone, (unsigned long)self.scanTotal] : @"…";
+                cell.bar.progress = self.scanTotal ? (float)self.scanDone / (float)self.scanTotal : 0;
+                cell.statusLabel.text = self.scanName.length ? [NSString stringWithFormat:@"Checking %@…", self.scanName]
+                                                             : @"Starting…";
+                break;
+        }
         return;
     }
+    [cell.spinner stopAnimating];
     cell.bar.progressTintColor = UIColor.systemBlueColor;
     if (!self.accessReady) {
         cell.captionLabel.text = @"Cleaner";
