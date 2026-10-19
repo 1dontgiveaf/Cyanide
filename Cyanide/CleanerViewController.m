@@ -192,15 +192,14 @@ static unsigned long long cleaner_scan_directory_fd(int fd, dev_t device,
     return total;
 }
 
-static unsigned long long cleaner_tree_bytes_cancellable(NSString *root,
-                                                          NSUInteger *fileCount,
-                                                          BOOL *complete,
-                                                          int *cancelled)
+// Core byte walk. The scan phase wraps it with a fresh traversal per root;
+// the post-clean rescan passes the clean pass's own traversal so the whole
+// pass — deletions and rescans — lives under one shared deadline.
+static unsigned long long cleaner_tree_bytes_walk(NSString *root,
+                                                  BOOL *complete,
+                                                  CYCleanerTraversal *walk)
 {
-    if (fileCount) *fileCount = 0;
-    BOOL finished = YES;
-    CYCleanerTraversal walk = cleaner_traversal(kCleanerMaxScanSeconds, cancelled);
-    if (cleaner_traversal_should_stop(&walk, 0)) {
+    if (cleaner_traversal_should_stop(walk, 0)) {
         if (complete) *complete = NO;
         return 0;
     }
@@ -210,9 +209,21 @@ static unsigned long long cleaner_tree_bytes_cancellable(NSString *root,
     if (fstat(fd, &st) != 0) {
         close(fd); if (complete) *complete = NO; return 0;
     }
-    unsigned long long total = cleaner_scan_directory_fd(fd, st.st_dev, 0, &walk, &finished);
-    if (fileCount) *fileCount = walk.files;
+    BOOL finished = YES;
+    unsigned long long total = cleaner_scan_directory_fd(fd, st.st_dev, 0, walk, &finished);
     if (complete) *complete = finished;
+    return total;
+}
+
+static unsigned long long cleaner_tree_bytes_cancellable(NSString *root,
+                                                          NSUInteger *fileCount,
+                                                          BOOL *complete,
+                                                          int *cancelled)
+{
+    if (fileCount) *fileCount = 0;
+    CYCleanerTraversal walk = cleaner_traversal(kCleanerMaxScanSeconds, cancelled);
+    unsigned long long total = cleaner_tree_bytes_walk(root, complete, &walk);
+    if (fileCount) *fileCount = walk.files;
     return total;
 }
 
@@ -1139,13 +1150,15 @@ static BOOL cleaner_intro_accepted(void)
                     // interrupted/unreadable rescan proved the roots empty.
                     item.incomplete = YES;
                 } else {
+                    // Shared traversal: rescans draw from the same 60 s budget
+                    // as the deletions instead of starting fresh 15 s clocks.
                     BOOL complete = NO;
-                    item.cacheBytes = cleaner_tree_bytes_cancellable(
-                        [item.container.path stringByAppendingPathComponent:@"Library/Caches"], NULL, &complete, &cancelled);
+                    item.cacheBytes = cleaner_tree_bytes_walk(
+                        [item.container.path stringByAppendingPathComponent:@"Library/Caches"], &complete, &traversal);
                     item.incomplete = !complete;
                     complete = NO;
-                    item.tempBytes = cleaner_tree_bytes_cancellable(
-                        [item.container.path stringByAppendingPathComponent:@"tmp"], NULL, &complete, &cancelled);
+                    item.tempBytes = cleaner_tree_bytes_walk(
+                        [item.container.path stringByAppendingPathComponent:@"tmp"], &complete, &traversal);
                     item.incomplete = item.incomplete || !complete;
                 }
                 item.selected = NO;
