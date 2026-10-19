@@ -265,6 +265,7 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
                                                          action:@selector(toggleSelectAll:)];
     self.navigationItem.rightBarButtonItem = self.selectAllItem;
 
+    [self buildTopBar];
     [self buildFooter];
     [self updateCleanButton];
 }
@@ -282,18 +283,12 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
     cleaner_suppress_popup_bar(self, NO);
 }
 
-- (void)buildFooter
+- (void)buildTopBar
 {
-    UIView *footer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 0, 136)];
-    footer.backgroundColor = UIColor.clearColor;
-
-    self.cleanHintLabel = [[UILabel alloc] init];
-    self.cleanHintLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    self.cleanHintLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
-    self.cleanHintLabel.textColor = UIColor.secondaryLabelColor;
-    self.cleanHintLabel.numberOfLines = 0;
-    self.cleanHintLabel.text = @"Only Library/Caches and tmp contents are removed. Documents, settings and app data are not touched. Running apps are skipped.";
-    [footer addSubview:self.cleanHintLabel];
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0,
+        self.tableView.bounds.size.width, 64)];
+    header.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    header.backgroundColor = UIColor.clearColor;
 
     self.cleanButton = [UIButton buttonWithType:UIButtonTypeSystem];
     self.cleanButton.translatesAutoresizingMaskIntoConstraints = NO;
@@ -304,17 +299,37 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
     self.cleanButton.tintColor = UIColor.whiteColor;
     self.cleanButton.layer.cornerRadius = 12.0;
     [self.cleanButton addTarget:self action:@selector(cleanSelected:) forControlEvents:UIControlEventTouchUpInside];
-    [footer addSubview:self.cleanButton];
+    [header addSubview:self.cleanButton];
+
+    UILayoutGuide *m = header.layoutMarginsGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [self.cleanButton.leadingAnchor constraintEqualToAnchor:m.leadingAnchor],
+        [self.cleanButton.trailingAnchor constraintEqualToAnchor:m.trailingAnchor],
+        [self.cleanButton.topAnchor constraintEqualToAnchor:header.topAnchor constant:8],
+        [self.cleanButton.heightAnchor constraintEqualToConstant:44],
+    ]];
+    self.tableView.tableHeaderView = header;
+}
+
+- (void)buildFooter
+{
+    UIView *footer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 0, 56)];
+    footer.backgroundColor = UIColor.clearColor;
+
+    self.cleanHintLabel = [[UILabel alloc] init];
+    self.cleanHintLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.cleanHintLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
+    self.cleanHintLabel.textColor = UIColor.secondaryLabelColor;
+    self.cleanHintLabel.numberOfLines = 0;
+    self.cleanHintLabel.text = @"Only Library/Caches and tmp contents are removed. Documents, settings and app data are not touched. Running apps are skipped.";
+    [footer addSubview:self.cleanHintLabel];
 
     UILayoutGuide *m = footer.layoutMarginsGuide;
     [NSLayoutConstraint activateConstraints:@[
         [self.cleanHintLabel.leadingAnchor constraintEqualToAnchor:m.leadingAnchor],
         [self.cleanHintLabel.trailingAnchor constraintEqualToAnchor:m.trailingAnchor],
         [self.cleanHintLabel.topAnchor constraintEqualToAnchor:footer.topAnchor constant:8],
-        [self.cleanButton.leadingAnchor constraintEqualToAnchor:m.leadingAnchor],
-        [self.cleanButton.trailingAnchor constraintEqualToAnchor:m.trailingAnchor],
-        [self.cleanButton.topAnchor constraintEqualToAnchor:self.cleanHintLabel.bottomAnchor constant:8],
-        [self.cleanButton.heightAnchor constraintEqualToConstant:44],
+        [self.cleanHintLabel.bottomAnchor constraintEqualToAnchor:footer.bottomAnchor constant:-8],
     ]];
     self.tableView.tableFooterView = footer;
 }
@@ -401,8 +416,9 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
                 item.tempBytes = cleaner_tree_bytes(tmpPath, NULL, &complete);
                 item.incomplete = item.incomplete || !complete;
                 item.icon = container.icon;   // loaded off the main thread
-                item.selected = processListAvailable && !item.running &&
-                                !item.systemApp && item.totalBytes > 0;
+                // Apps with nothing reclaimable are noise in this screen.
+                if (item.totalBytes == 0) continue;
+                item.selected = processListAvailable && !item.running && !item.systemApp;
                 [items addObject:item];
             }
 
@@ -466,8 +482,7 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
     self.cleanButton.enabled = enabled;
     self.cleanButton.alpha = enabled ? 1.0 : 0.5;
     NSString *title = count > 0
-        ? [NSString stringWithFormat:@"Clean %lu App%@ · %@",
-           (unsigned long)count, count == 1 ? @"" : @"s", cleaner_bytes(bytes)]
+        ? [NSString stringWithFormat:@"Clean Selected · %@", cleaner_bytes(bytes)]
         : @"Clean Selected";
     [self.cleanButton setTitle:title forState:UIControlStateNormal];
     self.selectAllItem.enabled = !self.loading && !self.cleaning &&
@@ -660,11 +675,25 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
         } else if (!self.accessReady) {
             cell.detailTextLabel.text = @"Filesystem access is not available.";
         } else {
+            NSUInteger selected = [self selectedCount];
+            unsigned long long selectedBytes = [self selectedBytes];
             unsigned long long total = 0;
             for (CYCleanerItem *item in self.items) total += item.totalBytes;
-            NSString *detail = [NSString stringWithFormat:@"%@ across %lu app%@. Select the apps to clean.",
-                                cleaner_bytes(total), (unsigned long)self.items.count,
-                                self.items.count == 1 ? @"" : @"s"];
+            NSString *detail = nil;
+            if (selected > 0) {
+                detail = [NSString stringWithFormat:@"%@ across %lu selected app%@.",
+                          cleaner_bytes(selectedBytes), (unsigned long)selected,
+                          selected == 1 ? @"" : @"s"];
+                if (total != selectedBytes) {
+                    detail = [detail stringByAppendingFormat:@" %@ total across %lu app%@.",
+                              cleaner_bytes(total), (unsigned long)self.items.count,
+                              self.items.count == 1 ? @"" : @"s"];
+                }
+            } else {
+                detail = [NSString stringWithFormat:@"%@ total across %lu app%@. Select apps below.",
+                          cleaner_bytes(total), (unsigned long)self.items.count,
+                          self.items.count == 1 ? @"" : @"s"];
+            }
             if (!self.processListAvailable)
                 detail = [detail stringByAppendingString:@" Kernel access is unavailable, so running-app protection is off."];
             cell.detailTextLabel.text = detail;
