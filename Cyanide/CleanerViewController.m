@@ -8,7 +8,6 @@
 #import "SettingsViewController.h"
 #import "FileBrowserViewController.h"
 #import "installer/MainTabBarController.h"
-#import <fts.h>
 #import <sys/stat.h>
 #import <errno.h>
 #import <unistd.h>
@@ -39,22 +38,42 @@ static BOOL cleaner_path_is_app_data(NSString *path)
            [canonical hasPrefix:kCleanerAppDataPrefix];
 }
 
-// procmgr names are truncated to 31 characters. An app whose executable is
-// longer must still be recognized as active or Cleaner could delete its cache
-// while it is live.
-// Only the two disposable roots are ever cleared. The prefix check alone would
-// also admit Documents or Library; require the exact tail as a second guard.
+// Admit only a UUID container's two exact disposable roots, not any nested
+// directory whose last component happens to be tmp or Library/Caches.
 static BOOL cleaner_is_disposable_root(NSString *path)
 {
     if (!cleaner_path_is_app_data(path)) return NO;
-    NSArray<NSString *> *parts = fb_canonical_path(path).pathComponents;
-    if (parts.count < 2) return NO;
-    NSString *last = parts.lastObject;
-    if ([last isEqualToString:@"tmp"]) return YES;
-    return [last isEqualToString:@"Caches"] &&
-           [parts[parts.count - 2] isEqualToString:@"Library"];
+    NSString *relative = [fb_canonical_path(path) substringFromIndex:kCleanerAppDataPrefix.length];
+    NSArray<NSString *> *parts = relative.pathComponents;
+    if (parts.count < 2 || ![[NSUUID alloc] initWithUUIDString:parts[0]]) return NO;
+    return (parts.count == 2 && [parts[1] isEqualToString:@"tmp"]) ||
+           (parts.count == 3 && [parts[1] isEqualToString:@"Library"] &&
+            [parts[2] isEqualToString:@"Caches"]);
 }
 
+// O_NOFOLLOW on a pathname open protects only its final component. Anchor at
+// / and open EVERY component relative to the descriptor already validated.
+// Scan and delete both consume this descriptor; neither reopens the pathname.
+static int cleaner_open_root(NSString *path)
+{
+    if (!cleaner_is_disposable_root(path)) { errno = EINVAL; return -1; }
+    int fd = open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return -1;
+    NSArray<NSString *> *parts = fb_canonical_path(path).pathComponents;
+    for (NSUInteger i = 1; i < parts.count; i++) {
+        int next = openat(fd, parts[i].fileSystemRepresentation,
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        int savedError = errno;
+        close(fd);
+        if (next < 0) { errno = savedError; return -1; }
+        fd = next;
+    }
+    return fd;
+}
+
+// procmgr names are truncated to 31 characters. An app whose executable is
+// longer must still be recognized as active or Cleaner could delete its cache
+// while it is live.
 static BOOL cleaner_process_is_active(NSString *executable, NSSet<NSString *> *activeNames)
 {
     if (executable.length == 0 || activeNames.count == 0) return NO;
@@ -66,56 +85,61 @@ static BOOL cleaner_process_is_active(NSString *executable, NSSet<NSString *> *a
     return NO;
 }
 
-// Physical walk: never follows symlinks and never crosses a mount. The result
-// is a lower bound when `complete` is false (unreadable entry or scan cap).
+// Takes ownership of fd. A physical descriptor walk cannot be redirected by
+// replacing an ancestor pathname after the root was opened.
+static unsigned long long cleaner_scan_directory_fd(int fd, dev_t device,
+                                                     NSUInteger *count, BOOL *complete)
+{
+    DIR *dir = fdopendir(fd);
+    if (!dir) { close(fd); *complete = NO; return 0; }
+    unsigned long long total = 0;
+    while (*count < kCleanerMaxScanEntries) {
+        errno = 0;
+        struct dirent *entry = readdir(dir);
+        if (!entry) { if (errno) *complete = NO; break; }
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        struct stat st = {0};
+        if (fstatat(fd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno != ENOENT) *complete = NO;
+            continue;
+        }
+        if (st.st_dev != device) { *complete = NO; continue; }
+        if (S_ISREG(st.st_mode)) {
+            total += (unsigned long long)st.st_size;
+            (*count)++;
+        } else if (S_ISDIR(st.st_mode)) {
+            int child = openat(fd, entry->d_name,
+                               O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+            struct stat opened = {0};
+            if (child < 0) { *complete = NO; continue; }
+            if (fstat(child, &opened) != 0 || opened.st_dev != device ||
+                opened.st_ino != st.st_ino) {
+                close(child); *complete = NO; continue;
+            }
+            total += cleaner_scan_directory_fd(child, device, count, complete);
+        }
+    }
+    if (*count >= kCleanerMaxScanEntries) *complete = NO;
+    closedir(dir);
+    return total;
+}
+
 static unsigned long long cleaner_tree_bytes(NSString *root,
                                              NSUInteger *fileCount,
                                              BOOL *complete)
 {
     if (fileCount) *fileCount = 0;
-    if (complete) *complete = YES;
-
-    struct stat rootStat = {0};
-    if (lstat(root.fileSystemRepresentation, &rootStat) != 0) {
-        if (errno != ENOENT && complete) *complete = NO;
-        return 0;
+    BOOL finished = YES;
+    int fd = cleaner_open_root(root);
+    if (fd < 0) { if (complete) *complete = (errno == ENOENT); return 0; }
+    struct stat st = {0};
+    if (fstat(fd, &st) != 0) {
+        close(fd); if (complete) *complete = NO; return 0;
     }
-    if (!S_ISDIR(rootStat.st_mode)) {
-        if (complete) *complete = NO;
-        return 0;
-    }
-
-    char *paths[] = { (char *)root.fileSystemRepresentation, NULL };
-    FTS *fts = fts_open(paths, FTS_PHYSICAL | FTS_NOCHDIR | FTS_XDEV, NULL);
-    if (!fts) {
-        if (complete) *complete = NO;
-        return 0;
-    }
-
-    unsigned long long total = 0;
     NSUInteger count = 0;
-    FTSENT *entry;
-    while ((entry = fts_read(fts))) {
-        if (entry->fts_info == FTS_DNR || entry->fts_info == FTS_ERR ||
-            entry->fts_info == FTS_NS) {
-            if (complete) *complete = NO;
-            continue;
-        }
-        if (entry->fts_info == FTS_DP) continue;
-        if (entry->fts_level == 0) continue;   // the cache/tmp root itself
-        if (entry->fts_info == FTS_SL || entry->fts_info == FTS_SLNONE) continue;
-        if (!entry->fts_statp ||
-            (entry->fts_statp->st_mode & S_IFMT) != S_IFREG) continue;
-
-        total += (unsigned long long)entry->fts_statp->st_size;
-        count++;
-        if (count >= kCleanerMaxScanEntries) {
-            if (complete) *complete = NO;
-            break;
-        }
-    }
-    fts_close(fts);
+    unsigned long long total = cleaner_scan_directory_fd(fd, st.st_dev, &count, &finished);
     if (fileCount) *fileCount = count;
+    if (complete) *complete = finished;
     return total;
 }
 
@@ -180,10 +204,8 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
 {
     if (removed) *removed = 0;
     if (failed) *failed = 0;
-    if (!cleaner_is_disposable_root(dir)) return 0;
 
-    int rootFD = open(dir.fileSystemRepresentation,
-                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    int rootFD = cleaner_open_root(dir);
     if (rootFD < 0) {
         if (errno != ENOENT && failed) (*failed)++;
         return 0;
