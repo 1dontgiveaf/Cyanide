@@ -27,26 +27,24 @@ activity, omit it.
 
 ## Pending
 
-- [x] Restored persistent Double-Tap to Lock coverage across Home Screen and Lock Screen windows.
-- [x] Added optional SBCustomizer page arrangement with separate first-page and remaining-page icon counts.
-- [x] Added an optional SBCustomizer Dock app bundle-ID field that defaults to Watusi and moves the selected app into a free expanded-Dock slot.
-- [x] Fixed SBCustomizer page counts to redistribute icons between Home Screen pages and matched Dock apps by bundle identifier instead of object identity.
-- [x] Moved SBCustomizer to the final SpringBoard apply step so earlier tweaks cannot rebuild and discard its Dock and page layout changes.
-- [x] Fixed SBCustomizer retaining stale page-model references after grid changes, sped up verified page redistribution, and clarified that DarkSword tweaks completing is only an intermediate run stage.
-- [x] Scoped DarkSword double-tap-to-lock to the Home Screen and Lock Screen main page so passcode entry is excluded.
-- [x] Stopped persisting SBCustomizer's applied marker across app/SpringBoard lifetimes and changed its queue status to “Enabled; will apply.”
-- [x] Strengthened the iOS 17 Disable App Library path by disabling controller/configuration permission flags before clearing trailing library controllers.
-- [x] Limited Home Screen double-tap-to-lock to backmost empty-area catchers so taps on icons and the Dock cannot trigger locking.
-- [x] Updated the iOS 17 App Library path to override the read-only `SBIconController.appLibraryAllowed` source decision before clearing and relayouting the trailing page.
-- [x] Fixed SBCustomizer app matching to use the safe application bundle path instead of probing private icon identifier payloads that could restart SpringBoard.
-- [x] Fixed SBCustomizer messaging stale icon arrays after a move, reduced page-arrangement delays, and applied Home Layout Extras after final Dock arrangement.
-- [x] Added exact source and destination count verification around every SBCustomizer icon move so page arrangement cannot continue from stale indexes.
-- [x] Kept the display awake during Apply, matched Dock apps through displayed Home Screen icon views, refused duplicate fallback insertion, and stopped arrangement immediately after a failed transfer.
-- [x] Forced enabled Home Layout Extras to re-run after every SBCustomizer layout change and clarified category versus overall completion logging.
-- [x] Changed SBCustomizer's default Dock app to the Watusi WhatsApp duplicate and migrated the previous official WhatsApp selection.
-- [x] Fixed SBCustomizer retaining stale icon arrays during page arrangement and deferred layout refreshes until redistribution finishes.
 
 ## Released
+
+### v1.9.0 - 2026-10-19
+
+- [x] New Daemons screen: turn system services off and on, staged and written on Save, with each daemon's process and PID.
+- [x] New System Info screen: device, uptime, kernel access, battery health and storage per app.
+- [x] New Reboot button next to Respring in Quick Actions.
+- [x] Faster respring: SpringBoard is asked to restart itself, with the old method as fallback.
+- [x] The Location Services toggle returns to the app it was run from, or to the Home Screen; run inside Cyanide, it stays.
+- [x] File Browser shows app names and icons for container folders, with a jump between bundle and data.
+- [x] What's New is shown again in Settings, with Show Less at the top.
+- [x] Tweaks report when a change couldn't be confirmed instead of "applied".
+- [x] Turning off a DarkSword patch offers a respring; it stays active until then.
+- [x] A tweak removed from its source is stopped and uninstalled; an out-of-date repo script no longer runs.
+- [x] A failed theme apply keeps the current theme.
+- [x] Safer imports: size limits while reading, no clearing of folders with content, changed files rejected.
+- [x] pe_v3 is the default A18/M4 path, with checks after every hunt.
 
 ### v1.8.0 - 2026-10-10
 
