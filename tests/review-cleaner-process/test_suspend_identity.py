@@ -30,9 +30,9 @@ def function_body(source: str, signature: str) -> str:
 
 
 compat = function_body(PROCESS, "int procmgr_suspend_count(int pid)")
-entry = function_body(PROCESS, "int procmgr_suspend_count_for_entry(uint64_t proc, int pid)")
+entry = function_body(PROCESS, "int procmgr_suspend_count_for_entry_locked(uint64_t proc, int pid)")
 strict = function_body(PROCESS, "static bool pm_task_matches_proc_strict(uint64_t task, uint64_t proc)")
-row = function_body(PROCESS, "bool procmgr_row_info(uint64_t kproc, int pid, procmgr_row_info_t *out)")
+row = function_body(PROCESS, "bool procmgr_row_info_locked(uint64_t kproc, int pid, procmgr_row_info_t *out)")
 active = function_body(SETTINGS, "NSSet<NSString *> *settings_active_process_names(void)")
 
 assert "int procmgr_suspend_count_for_entry" in HEADER
@@ -64,7 +64,7 @@ assert "procmgr_suspend_count(buf[i].pid)" not in active
 print("suspend identity source contracts: PASS")
 
 # Calibration invoked by Cleaner must not walk foreign procs without gates.
-for signature in ("static void pm_calibrate_bsdinfo(void)", "static void pm_calibrate_suspcount(void)"):
+for signature in ("static void pm_calibrate_bsdinfo(void)", "static void pm_calibrate_suspcount_locked(void)"):
     calibration = function_body(PROCESS, signature)
     assert "proc_find(" not in calibration
     assert "pm_find_entry_task(1, &lproc, &ltask)" in calibration

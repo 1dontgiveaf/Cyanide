@@ -83,6 +83,19 @@ struct pm_rusage_v0 {
 
 // --- Process Manager --------------------------------------------------------
 
+// One owner for all mutable calibration state, including readers. Public
+// entry points take this mutex before any KRW batch/access; private _locked
+// implementations never reacquire it. Do not invoke these APIs from an existing
+// KRW batch: lock order is calibration -> KRW, never the reverse.
+static pthread_mutex_t g_pm_calibration_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void pm_calibration_lock_enter(void) {
+    pthread_mutex_lock(&g_pm_calibration_lock);
+}
+static void pm_calibration_lock_leave(void) {
+    pthread_mutex_unlock(&g_pm_calibration_lock);
+}
+
 // MUST match early_kread()'s is_kaddr_valid exactly: it accepts
 // [VM_MIN_KERNEL_ADDRESS, VM_MAX_KERNEL_ADDRESS] on this build, which is
 // NARROWER than a plain top-bits test (the old (p >> 40) == 0xffffff check
@@ -333,7 +346,7 @@ static bool pm_taskinfo_threadnum(int pid, uint32_t *out) {
     return true;
 }
 
-static void pm_calibrate_suspcount(void) {
+static void pm_calibrate_suspcount_locked(void) {
     if (g_pm_off_task_suspcount) return;
     if (g_pm_suspcount_attempts >= PM_SUSPCOUNT_MAX_ATTEMPTS) return;
     if (!kexploit_krw_ready()) return;
@@ -480,7 +493,7 @@ static bool pm_find_entry_task(int pid, uint64_t *procOut, uint64_t *taskOut) {
     return found;
 }
 
-int procmgr_suspend_count_for_entry(uint64_t proc, int pid) {
+static int procmgr_suspend_count_for_entry_locked(uint64_t proc, int pid) {
     if (pid <= 0 || !g_pm_off_task_suspcount || !kexploit_krw_session_active()) {
         return -1;
     }
@@ -520,6 +533,13 @@ int procmgr_suspend_count_for_entry(uint64_t proc, int pid) {
     return rc;
 }
 
+int procmgr_suspend_count_for_entry(uint64_t proc, int pid) {
+    pm_calibration_lock_enter();
+    int result = procmgr_suspend_count_for_entry_locked(proc, pid);
+    pm_calibration_lock_leave();
+    return result;
+}
+
 // Compatibility API: resolve the PID only through the same mapped-gated list
 // path. This is intentionally slower than the snapshot-entry API; cleaner and
 // other callers with a list row should pass its kproc directly.
@@ -549,10 +569,17 @@ int procmgr_suspend_count(int pid) {
 // offsetof(task, thread_count) from the suspend_count calibration (the three
 // counters are consecutive: thread_count, active, suspend_count). Runs the
 // calibration on first use; -1 when it can't calibrate this session.
-int procmgr_task_thread_count_offset(void) {
-    if (!g_pm_off_task_suspcount) pm_calibrate_suspcount();
+static int procmgr_task_thread_count_offset_locked(void) {
+    if (!g_pm_off_task_suspcount) pm_calibrate_suspcount_locked();
     if (!g_pm_off_task_suspcount) return -1;
     return (int)g_pm_off_task_suspcount - 8;
+}
+
+int procmgr_task_thread_count_offset(void) {
+    pm_calibration_lock_enter();
+    int result = procmgr_task_thread_count_offset_locked();
+    pm_calibration_lock_leave();
+    return result;
 }
 
 // --- task category role (foreground / background app vs daemon) -------------
@@ -593,7 +620,7 @@ static void pm_calibrate_task_role(void) {
 // Mach task-category role for pid (TASK_FOREGROUND_APPLICATION=1,
 // TASK_BACKGROUND_APPLICATION=2, TASK_UNSPECIFIED=0, ...). -1 when
 // uncalibrated/unavailable. Read-only.
-int procmgr_task_role(int pid) {
+static int procmgr_task_role_locked(int pid) {
     if (!g_pm_role_cal) return -1;
     if (!kexploit_krw_ready()) return -1;
     krw_set_nonfatal(true);
@@ -610,6 +637,13 @@ int procmgr_task_role(int pid) {
     }
     krw_set_nonfatal(false);
     return role;
+}
+
+int procmgr_task_role(int pid) {
+    pm_calibration_lock_enter();
+    int result = procmgr_task_role_locked(pid);
+    pm_calibration_lock_leave();
+    return result;
 }
 
 bool procmgr_role_is_foreground(int role) { return role == TASK_FOREGROUND_APPLICATION; }
@@ -1209,8 +1243,22 @@ static uint64_t g_pm_xpf_last_ns = 0;       // when the last try ran
 // hundreds of processes faults the kernel without that gate. CPU reads are
 // inline struct reads reached via the safe proc->task / task->thread chains
 // and need no mapped-check.
-bool procmgr_mem_calibrated(void) { return g_pm_mem_cal && ksafe_available(); }
-bool procmgr_cpu_calibrated(void) { return g_pm_thr_cal && g_pm_cpu_cal; }
+static bool procmgr_mem_calibrated_locked(void) { return g_pm_mem_cal && ksafe_available(); }
+
+bool procmgr_mem_calibrated(void) {
+    pm_calibration_lock_enter();
+    bool result = procmgr_mem_calibrated_locked();
+    pm_calibration_lock_leave();
+    return result;
+}
+static bool procmgr_cpu_calibrated_locked(void) { return g_pm_thr_cal && g_pm_cpu_cal; }
+
+bool procmgr_cpu_calibrated(void) {
+    pm_calibration_lock_enter();
+    bool result = procmgr_cpu_calibrated_locked();
+    pm_calibration_lock_leave();
+    return result;
+}
 
 static uint64_t procmgr_own_footprint(void) {
     struct pm_rusage_v0 ri;
@@ -2358,7 +2406,7 @@ static bool pm_validate_cache(void) {
 // Discover the offsets by matching our OWN known footprint + CPU times. All
 // reads, no writes. Failures just leave the feature disabled until the next
 // refresh retries. Runs on a background queue from reloadProcs.
-int procmgr_calibrate(void) {
+static int procmgr_calibrate_locked(void) {
     // Gate the WHOLE pass on a live session: the sub-calibrators below
     // (suspend_count, task role, cache validation) read kernel memory BEFORE
     // the kexploit_krw_ready() check further down, so a detached session used
@@ -2405,7 +2453,7 @@ int procmgr_calibrate(void) {
     // below and manages its own nonfatal window, so run it first (its exit
     // reset would otherwise silently end the window the stages below rely on).
     if (!g_pm_off_task_suspcount && discoverySafe)
-        pm_calibrate_suspcount();
+        pm_calibrate_suspcount_locked();
     // Same for the bsd_info back-pointer guard: independent, own nonfatal
     // window, capped retries. Arms the TOCTOU check used by every proc->task
     // path in the poll loop (stats / suspend_count / role).
@@ -2521,7 +2569,14 @@ int procmgr_calibrate(void) {
     return (g_pm_mem_cal || g_pm_cpu_cal) ? 1 : 0;
 }
 
-int procmgr_stats(int pid, uint64_t *residentBytes, uint64_t *cpuNs) {
+int procmgr_calibrate(void) {
+    pm_calibration_lock_enter();
+    int result = procmgr_calibrate_locked();
+    pm_calibration_lock_leave();
+    return result;
+}
+
+static int procmgr_stats_locked(int pid, uint64_t *residentBytes, uint64_t *cpuNs) {
     // libproc first — always works for our own pid (and others when permitted).
     struct pm_proc_taskinfo ti;
     bool havePI = proc_pidinfo(pid, PM_PROC_PIDTASKINFO, 0, &ti, sizeof(ti)) >= (int)sizeof(ti);
@@ -2569,6 +2624,13 @@ int procmgr_stats(int pid, uint64_t *residentBytes, uint64_t *cpuNs) {
     return 0;
 }
 
+int procmgr_stats(int pid, uint64_t *residentBytes, uint64_t *cpuNs) {
+    pm_calibration_lock_enter();
+    int result = procmgr_stats_locked(pid, residentBytes, cpuNs);
+    pm_calibration_lock_leave();
+    return result;
+}
+
 // One row of the Process Viewer from the proc pointer procmgr_list() found.
 // Replaces the per-row procmgr_pstat_krw + procmgr_stats +
 // procmgr_suspend_count trio, each of which re-walked allproc from the start
@@ -2583,7 +2645,7 @@ int procmgr_stats(int pid, uint64_t *residentBytes, uint64_t *cpuNs) {
 // at the start of the pass), but the pass is now short, the proc can only be
 // freed after exit AND reap, and p_pid is re-checked through the ksafe gate
 // first. Net kernel-read exposure is ~100x lower than the walk-per-call path.
-bool procmgr_row_info(uint64_t kproc, int pid, procmgr_row_info_t *out) {
+static bool procmgr_row_info_locked(uint64_t kproc, int pid, procmgr_row_info_t *out) {
     if (!out) return false;
     memset(out, 0, sizeof(*out));
     out->pstat = -1;
@@ -2667,6 +2729,13 @@ bool procmgr_row_info(uint64_t kproc, int pid, procmgr_row_info_t *out) {
         out->cpu = cpu;
     }
     return true;
+}
+
+bool procmgr_row_info(uint64_t kproc, int pid, procmgr_row_info_t *out) {
+    pm_calibration_lock_enter();
+    bool result = procmgr_row_info_locked(kproc, pid, out);
+    pm_calibration_lock_leave();
+    return result;
 }
 
 bool procmgr_pid_alive(int pid) {

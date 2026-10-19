@@ -172,6 +172,9 @@ void procmgr_resandbox(void);
 // OS build. Call once per session after KRW is ready (reloadProcs does this
 // on a background queue); safe to call again — failed steps retry, succeeded
 // steps are cached.
+// Calibration and public calibrated-state readers are serialized by one owner
+// mutex. Call these APIs outside an existing KRW batch: lock order is always
+// calibration owner first, then KRW. Private discovery never reacquires owner.
 // Returns nonzero if at least one of memory/CPU calibration succeeded.
 int  procmgr_calibrate(void);
 // True when the memory (ledger footprint) path is fully usable: offsets
