@@ -12,6 +12,7 @@ This release adds the Daemons screen and System Info, makes respring and File Br
 - **System Info.** One place for device and OS details, uptime, kernel-access status, battery and per-app storage. Apps show their icons, sizes are right-aligned, and the list can be sorted.
 - **Faster respring.** The respring cover is removed as soon as SpringBoard is back instead of waiting for a fixed timeout.
 - **File Browser app names.** Container folders now show the app's name instead of a bare UUID, with a jump between the app's bundle and data containers.
+- **Cache Cleaner.** Lists installed apps and the space used by their `Library/Caches` and `tmp` folders, lets you select apps, and removes only those disposable contents. Running apps and system apps are protected or opt-in, and documents/settings are never touched.
 
 ## Improvements
 
