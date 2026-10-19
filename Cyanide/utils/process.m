@@ -805,16 +805,53 @@ static volatile int g_pm_ksafe_refresh_pending = 0;
 // Read one proc's pid+name into an entry. Returns false if the proc looks bogus
 // or its core fields are not mapped right now.
 static bool procmgr_fill_entry(uint64_t proc, procmgr_entry_t *e) {
+    if (!e) return false;
     if (!pm_proc_readable(proc)) return false;
     uint32_t pid = kread32(proc + off_proc_p_pid);
     if (pid > 500000) return false;                 // sanity: not a real pid
-    e->pid = (int)pid;
-    e->kproc = proc;
-    e->name[0] = '\0';
     char *nm = proc_get_p_name(proc);               // gated name read, static buffer
-    if (nm) { strncpy(e->name, nm, sizeof(e->name) - 1); e->name[sizeof(e->name) - 1] = '\0'; }
-    if (e->name[0] == '\0') snprintf(e->name, sizeof(e->name), "pid %u", pid);
+    if (!nm || !nm[0]) return false;                // unknown name is not a valid row
+    procmgr_entry_t tmp = {0};
+    tmp.pid = (int)pid;
+    tmp.kproc = proc;
+    strncpy(tmp.name, nm, sizeof(tmp.name) - 1);
+    tmp.name[sizeof(tmp.name) - 1] = '\0';
+    *e = tmp;                                       // publish only a complete row
     return true;
+}
+
+static bool pm_seen_proc(const uint64_t *seen, int count, uint64_t proc) {
+    for (int i = 0; i < count; i++) if (seen[i] == proc) return true;
+    return false;
+}
+
+// LIST_ENTRY.le_prev for the first proc points at the allproc.lh_first field,
+// not at another struct proc. It is the one legitimate non-proc endpoint on
+// the reverse walk. Confirm the endpoint topology before accepting it; a
+// random/stale pointer must make the whole pass incomplete instead.
+static bool pm_is_allproc_head_link(uint64_t link, const uint64_t *seen, int count) {
+    if (!procmgr_is_kern_ptr(link) || !ksafe_available() ||
+        !kaddr_is_mapped(link, 8)) return false;
+    // A normal predecessor has the same local next/prev topology as the list
+    // head link. A complete proc fill distinguishes it before the sentinel
+    // check; only a non-proc candidate may be accepted as the endpoint.
+    // A mapped candidate with a plausible PID remains a proc even if its name
+    // is temporarily missing: never accept that uncertainty as the list head.
+    if (pm_proc_readable(link) && kread32(link + off_proc_p_pid) <= 500000) return false;
+    uint64_t first = kread64(link);
+    if (!procmgr_is_kern_ptr(first) || !pm_seen_proc(seen, count, first) ||
+        !pm_proc_readable(first)) return false;
+    return kread64(first + off_proc_p_list_le_prev) == link;
+}
+
+static bool pm_next_proc_links_back(uint64_t next, uint64_t proc) {
+    if (!pm_proc_readable(next)) return false;
+    return kread64(next + off_proc_p_list_le_prev) == proc;
+}
+
+static bool pm_prev_proc_links_forward(uint64_t prev, uint64_t proc) {
+    if (!pm_proc_readable(prev)) return false;
+    return kread64(prev + off_proc_p_list_le_next) == proc;
 }
 
 int procmgr_list(procmgr_entry_t *entries, int max) {
@@ -847,8 +884,32 @@ int procmgr_list(procmgr_entry_t *entries, int max) {
         return -1;
     }
 
+    enum { PM_PROC_WALK_LIMIT = 8192 };
+    uint64_t seen[PM_PROC_WALK_LIMIT];
+    int seenCount = 0;
     int n = 0;
     BOOL incomplete = NO;
+    BOOL truncated = NO;
+
+    // A row is committed only after its complete pid/name fill succeeds. The
+    // duplicate checks make PID reuse or a link cycle fail closed instead of
+    // publishing two meanings for one snapshot.
+    #define PM_RECORD_ENTRY(_entry) do {                                      \
+        bool _duplicate = false;                                             \
+        for (int _j = 0; _j < n; _j++)                                       \
+            if (entries[_j].pid == (_entry).pid ||                           \
+                entries[_j].kproc == (_entry).kproc) { _duplicate = true; break; } \
+        if (_duplicate) { incomplete = YES; }                                 \
+        else if (n >= max) { truncated = YES; }                               \
+        else { entries[n++] = (_entry); }                                     \
+    } while (0)
+
+    #define PM_SEEN_PROC(_proc) do {                                          \
+        if (seenCount >= PM_PROC_WALK_LIMIT ||                               \
+            pm_seen_proc(seen, seenCount, (_proc))) { incomplete = YES; }     \
+        else { seen[seenCount++] = (_proc); }                                 \
+    } while (0)
+
     // Round 13: one krwLock hold + one final repark for the whole list walk
     // (~6 kreads/proc — the per-op repark was a third syscall on every read of
     // every poll). procmgr_fill_entry() is pure kreads, so this is batch-safe.
@@ -856,10 +917,23 @@ int procmgr_list(procmgr_entry_t *entries, int max) {
     // The proc list is a doubly-linked LIST anchored at allproc. p_list.le_next
     // sits at offset 0 of proc, so le_prev conveniently reads back as the prior
     // proc pointer (same trick kutils uses). Walk both ways from self.
-    if (n < max && procmgr_fill_entry(self, &entries[n])) n++;
+    procmgr_entry_t selfEntry;
+    if (!procmgr_fill_entry(self, &selfEntry)) incomplete = YES;
+    else {
+        PM_SEEN_PROC(self);
+        PM_RECORD_ENTRY(selfEntry);
+    }
 
     uint64_t p = kread64(self + off_proc_p_list_le_next);
-    for (int i = 0; i < 8192 && n < max && procmgr_is_kern_ptr(p); i++) {
+    if (p && (!procmgr_is_kern_ptr(p) || !pm_next_proc_links_back(p, self)))
+        incomplete = YES;
+    int i = 0;
+    for (; i < PM_PROC_WALK_LIMIT && !incomplete && !truncated; i++) {
+        if (!p) break;                              // normal tail endpoint
+        if (!procmgr_is_kern_ptr(p) || pm_seen_proc(seen, seenCount, p)) {
+            incomplete = YES;
+            break;
+        }
         // Gate every dereference of the candidate, including the link read
         // below: a process can exit and its zone page be trimmed between the
         // link we followed and this iteration.
@@ -868,26 +942,73 @@ int procmgr_list(procmgr_entry_t *entries, int max) {
             __atomic_store_n(&g_pm_ksafe_refresh_pending, 1, __ATOMIC_RELAXED);
             break;
         }
-        if (procmgr_fill_entry(p, &entries[n])) n++;
+        procmgr_entry_t tmp;
+        if (!procmgr_fill_entry(p, &tmp)) {
+            incomplete = YES;
+            break;
+        }
+        PM_SEEN_PROC(p);
+        PM_RECORD_ENTRY(tmp);
         uint64_t nx = kread64(p + off_proc_p_list_le_next);
-        if (nx == p) break;
+        if (nx && (!procmgr_is_kern_ptr(nx) || !pm_next_proc_links_back(nx, p))) {
+            incomplete = YES;
+            break;
+        }
         p = nx;
     }
+    if (i >= PM_PROC_WALK_LIMIT) incomplete = YES;
 
     if (!incomplete) {
         p = kread64(self + off_proc_p_list_le_prev);
-        for (int i = 0; i < 8192 && n < max && procmgr_is_kern_ptr(p); i++) {
+        if (p && (!procmgr_is_kern_ptr(p) ||
+            (!pm_is_allproc_head_link(p, seen, seenCount) && !pm_prev_proc_links_forward(p, self))))
+            incomplete = YES;
+        i = 0;
+        for (; i < PM_PROC_WALK_LIMIT && !incomplete && !truncated; i++) {
+            if (!p) break;                          // normal empty endpoint
+            if (!procmgr_is_kern_ptr(p) || pm_seen_proc(seen, seenCount, p)) {
+                incomplete = YES;
+                break;
+            }
+            if (pm_is_allproc_head_link(p, seen, seenCount)) break;
             if (!pm_proc_readable(p)) {
                 incomplete = YES;
                 __atomic_store_n(&g_pm_ksafe_refresh_pending, 1, __ATOMIC_RELAXED);
                 break;
             }
             procmgr_entry_t tmp;
-            if (!procmgr_fill_entry(p, &tmp)) break;    // walked off the list head
-            entries[n++] = tmp;
+            if (!procmgr_fill_entry(p, &tmp)) {
+                if (pm_is_allproc_head_link(p, seen, seenCount)) break;
+                incomplete = YES;
+                break;
+            }
+            PM_SEEN_PROC(p);
+            PM_RECORD_ENTRY(tmp);
             uint64_t pv = kread64(p + off_proc_p_list_le_prev);
-            if (pv == p) break;
+            if (pv && !procmgr_is_kern_ptr(pv)) {
+                incomplete = YES;
+                break;
+            }
+            if (pv && !pm_is_allproc_head_link(pv, seen, seenCount) &&
+                !pm_prev_proc_links_forward(pv, p)) {
+                incomplete = YES;
+                break;
+            }
             p = pv;
+        }
+        if (i >= PM_PROC_WALK_LIMIT) incomplete = YES;
+    }
+    // Revalidate the tuples before publishing. This detects PID/name reuse
+    // during the walk; it is not a kernel process-lifetime pin or stable-list lease.
+    if (!incomplete && !truncated) {
+        for (int j = 0; j < n; j++) {
+            procmgr_entry_t checked;
+            if (!procmgr_fill_entry(entries[j].kproc, &checked) ||
+                checked.pid != entries[j].pid ||
+                strcmp(checked.name, entries[j].name) != 0) {
+                incomplete = YES;
+                break;
+            }
         }
     }
     if (batched) krw_batch_end();
@@ -898,7 +1019,9 @@ int procmgr_list(procmgr_entry_t *entries, int max) {
     // report "incomplete" so the caller keeps its previous list. An unmapped
     // candidate (stale snapshot or a process that exited mid-walk) is the same
     // kind of incomplete pass, never a partially trusted list.
-    if (incomplete || krw_op_error_count() != errorsBefore) return -1;
+    #undef PM_RECORD_ENTRY
+    #undef PM_SEEN_PROC
+    if (incomplete || truncated || krw_op_error_count() != errorsBefore) return -1;
     return n;
 }
 
