@@ -534,6 +534,14 @@ static BOOL cleaner_intro_accepted(void)
 // showing the stale one.
 @property (nonatomic, copy) void (^scanCancel)(void);
 @property (nonatomic) BOOL scanStale;
+// Round 53: section-array cache. itemsInSection: filters + sorts on every
+// call, and the table asks per row/count/header. Membership depends only on
+// items, filter, sort and processListAvailable — all mutated on the main
+// queue — so the arrays are rebuilt lazily and invalidated at those points.
+@property (nonatomic, copy) NSArray<CYCleanerItem *> *cachedApps;
+@property (nonatomic, copy) NSArray<CYCleanerItem *> *cachedSystem;
+@property (nonatomic, copy) NSArray<CYCleanerItem *> *cachedSkipped;
+@property (nonatomic) BOOL sectionCacheValid;
 @end
 
 @implementation CleanerViewController
@@ -704,23 +712,44 @@ static BOOL cleaner_intro_accepted(void)
             [item.container.identifier rangeOfString:self.filter options:NSCaseInsensitiveSearch].location != NSNotFound);
 }
 
+- (void)setItems:(NSArray<CYCleanerItem *> *)items
+{
+    _items = [items copy];
+    self.sectionCacheValid = NO;
+}
+
 - (NSArray<CYCleanerItem *> *)itemsInSection:(NSInteger)section
 {
-    NSMutableArray<CYCleanerItem *> *out = [NSMutableArray array];
-    for (CYCleanerItem *item in self.items) {
-        if (![self matchesFilter:item]) continue;
-        BOOL skipped = item.active || !self.processListAvailable;
-        if (section == CYCleanerSectionSkipped && skipped) [out addObject:item];
-        else if (section == CYCleanerSectionApps && !skipped && !item.systemApp) [out addObject:item];
-        else if (section == CYCleanerSectionSystem && !skipped && item.systemApp) [out addObject:item];
+    if (!self.sectionCacheValid) {
+        NSMutableArray<CYCleanerItem *> *apps = [NSMutableArray array];
+        NSMutableArray<CYCleanerItem *> *system = [NSMutableArray array];
+        NSMutableArray<CYCleanerItem *> *skipped = [NSMutableArray array];
+        for (CYCleanerItem *item in self.items) {
+            if (![self matchesFilter:item]) continue;
+            if (item.active || !self.processListAvailable) [skipped addObject:item];
+            else if (item.systemApp) [system addObject:item];
+            else [apps addObject:item];
+        }
+        CYCleanerSort sort = self.sort;
+        NSComparator cmp = ^NSComparisonResult(CYCleanerItem *a, CYCleanerItem *b) {
+            if (sort == CYCleanerSortSize && a.totalBytes != b.totalBytes)
+                return a.totalBytes > b.totalBytes ? NSOrderedAscending : NSOrderedDescending;
+            return [a.name localizedCaseInsensitiveCompare:b.name];
+        };
+        [apps sortUsingComparator:cmp];
+        [system sortUsingComparator:cmp];
+        [skipped sortUsingComparator:cmp];
+        self.cachedApps = apps;
+        self.cachedSystem = system;
+        self.cachedSkipped = skipped;
+        self.sectionCacheValid = YES;
     }
-    CYCleanerSort sort = self.sort;
-    [out sortUsingComparator:^NSComparisonResult(CYCleanerItem *a, CYCleanerItem *b) {
-        if (sort == CYCleanerSortSize && a.totalBytes != b.totalBytes)
-            return a.totalBytes > b.totalBytes ? NSOrderedAscending : NSOrderedDescending;
-        return [a.name localizedCaseInsensitiveCompare:b.name];
-    }];
-    return out;
+    switch (section) {
+        case CYCleanerSectionSkipped: return self.cachedSkipped;
+        case CYCleanerSectionSystem:  return self.cachedSystem;
+        case CYCleanerSectionApps:    return self.cachedApps;
+        default:                      return @[];
+    }
 }
 
 - (BOOL)itemSelectable:(CYCleanerItem *)item
@@ -771,6 +800,7 @@ static BOOL cleaner_intro_accepted(void)
         UIAction *a = [UIAction actionWithTitle:title image:nil identifier:nil handler:^(UIAction *x) {
             weakSelf.sort = s;
             [NSUserDefaults.standardUserDefaults setInteger:s forKey:kCleanerSortKey];
+            weakSelf.sectionCacheValid = NO;
             [weakSelf.tableView reloadData];
             [weakSelf updateControls];
         }];
@@ -812,6 +842,7 @@ static BOOL cleaner_intro_accepted(void)
 - (void)updateSearchResultsForSearchController:(UISearchController *)searchController
 {
     self.filter = [searchController.searchBar.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet] ?: @"";
+    self.sectionCacheValid = NO;
     [self.tableView reloadData];
 }
 
@@ -1007,6 +1038,7 @@ static BOOL cleaner_intro_accepted(void)
                 }
                 self.items = items;
                 self.processListAvailable = processListAvailable;
+                self.sectionCacheValid = NO;  // availability also drives membership
                 self.loading = NO;
                 [self.tableView reloadData];
                 [self updateControls];
@@ -1175,7 +1207,10 @@ static BOOL cleaner_intro_accepted(void)
                 }
                 if (!self) return;
                 self.cleaning = NO;
-                if (processUnavailable) self.processListAvailable = NO;
+                if (processUnavailable) {
+                    self.processListAvailable = NO;
+                    self.sectionCacheValid = NO;  // everything moves to Not Checked
+                }
                 NSMutableString *result = [NSMutableString stringWithFormat:
                     @"Removed %@ (logical size) from %lu app%@.", cleaner_bytes(freed),
                     (unsigned long)cleanedApps, cleanedApps == 1 ? @"" : @"s"];
