@@ -11,6 +11,8 @@
 #import <sys/stat.h>
 #import <errno.h>
 #import <unistd.h>
+#import <fcntl.h>
+#import <dirent.h>
 
 static NSString * const kCleanerAppDataPrefix =
     @"/private/var/mobile/Containers/Data/Application/";
@@ -116,24 +118,22 @@ static unsigned long long cleaner_tree_bytes(NSString *root,
     return total;
 }
 
-// Recursive removal that never follows a symlink: lstat decides, unlink removes
-// a file/symlink itself, and rmdir removes a directory only after its children
-// are gone. This is deliberately not NSFileManager removeItemAtPath: an app's
-// cache may contain a symlink pointing outside its container, and a cleaner
-// must never follow it. Returns bytes whose unlink succeeded.
-static unsigned long long cleaner_remove_tree(NSString *path,
-                                              NSUInteger *removed,
-                                              NSUInteger *failed)
+// Recursive removal relative to an open directory, with O_NOFOLLOW at every
+// step. Using fstatat/openat/unlinkat instead of path-based NSFileManager closes
+// the symlink-swap race: an app being cleaned cannot turn one of its cache
+// entries into a link to another container between our check and our delete.
+static unsigned long long cleaner_remove_tree_at(int parentFD, const char *name,
+                                                 NSUInteger *removed,
+                                                 NSUInteger *failed)
 {
     struct stat st = {0};
-    if (lstat(path.fileSystemRepresentation, &st) != 0) {
+    if (fstatat(parentFD, name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
         if (errno != ENOENT && failed) (*failed)++;
         return 0;
     }
 
-    // A symlink is an entry to remove, never a directory to descend into.
     if (!S_ISDIR(st.st_mode)) {
-        if (unlink(path.fileSystemRepresentation) == 0) {
+        if (unlinkat(parentFD, name, 0) == 0) {
             if (removed) (*removed)++;
             return S_ISREG(st.st_mode) ? (unsigned long long)st.st_size : 0;
         }
@@ -141,22 +141,30 @@ static unsigned long long cleaner_remove_tree(NSString *path,
         return 0;
     }
 
-    NSError *listError = nil;
-    NSArray<NSString *> *children = [NSFileManager.defaultManager
-        contentsOfDirectoryAtPath:path error:&listError];
-    if (!children) {
+    int dirFD = openat(parentFD, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (dirFD < 0) {
+        if (failed) (*failed)++;
+        return 0;
+    }
+    DIR *dir = fdopendir(dirFD);
+    if (!dir) {
+        close(dirFD);
         if (failed) (*failed)++;
         return 0;
     }
 
     unsigned long long freed = 0;
-    for (NSString *name in children) {
-        if (name.length == 0 || [name isEqualToString:@"."] ||
-            [name isEqualToString:@".."]) continue;
-        freed += cleaner_remove_tree([path stringByAppendingPathComponent:name],
-                                     removed, failed);
+    struct dirent *entry;
+    while ((entry = readdir(dir))) {
+        if (!entry->d_name[0] ||
+            (entry->d_name[0] == '.' && entry->d_name[1] == '\0') ||
+            (entry->d_name[0] == '.' && entry->d_name[1] == '.' &&
+             entry->d_name[2] == '\0')) continue;
+        freed += cleaner_remove_tree_at(dirFD, entry->d_name, removed, failed);
     }
-    if (rmdir(path.fileSystemRepresentation) != 0) {
+    closedir(dir);
+
+    if (unlinkat(parentFD, name, AT_REMOVEDIR) != 0) {
         if (failed) (*failed)++;
         return 0;   // partial deletion: do not claim its bytes as freed
     }
@@ -173,32 +181,29 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
     if (failed) *failed = 0;
     if (!cleaner_is_disposable_root(dir)) return 0;
 
-    struct stat st = {0};
-    if (lstat(dir.fileSystemRepresentation, &st) != 0) {
-        if (errno == ENOENT) return 0;
-        if (failed) (*failed)++;
+    int rootFD = open(dir.fileSystemRepresentation,
+                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (rootFD < 0) {
+        if (errno != ENOENT && failed) (*failed)++;
         return 0;
     }
-    if (!S_ISDIR(st.st_mode)) {
-        if (failed) (*failed)++;
-        return 0;
-    }
-
-    NSError *listError = nil;
-    NSArray<NSString *> *children = [NSFileManager.defaultManager
-        contentsOfDirectoryAtPath:dir error:&listError];
-    if (!children) {
+    DIR *root = fdopendir(rootFD);
+    if (!root) {
+        close(rootFD);
         if (failed) (*failed)++;
         return 0;
     }
 
     unsigned long long freed = 0;
-    for (NSString *name in children) {
-        if (name.length == 0 || [name isEqualToString:@"."] ||
-            [name isEqualToString:@".."]) continue;
-        freed += cleaner_remove_tree([dir stringByAppendingPathComponent:name],
-                                     removed, failed);
+    struct dirent *entry;
+    while ((entry = readdir(root))) {
+        if (!entry->d_name[0] ||
+            (entry->d_name[0] == '.' && entry->d_name[1] == '\0') ||
+            (entry->d_name[0] == '.' && entry->d_name[1] == '.' &&
+             entry->d_name[2] == '\0')) continue;
+        freed += cleaner_remove_tree_at(rootFD, entry->d_name, removed, failed);
     }
+    closedir(root);
     return freed;
 }
 
@@ -206,10 +211,8 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
 @property (nonatomic, strong) FBAppContainer *container;
 @property (nonatomic, strong) UIImage *icon;
 @property (nonatomic, copy) NSString *name;
-@property (nonatomic, copy) NSString *identifier;
 @property (nonatomic) unsigned long long cacheBytes;
 @property (nonatomic) unsigned long long tempBytes;
-@property (nonatomic) NSUInteger fileCount;
 @property (nonatomic) BOOL running;
 @property (nonatomic) BOOL systemApp;
 @property (nonatomic) BOOL selected;
@@ -225,7 +228,6 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
 
 @interface CleanerViewController ()
 @property (nonatomic, copy) NSArray<CYCleanerItem *> *items;
-@property (nonatomic, copy) NSSet<NSString *> *runningNames;
 @property (nonatomic) BOOL processListAvailable;
 @property (nonatomic) BOOL accessReady;
 @property (nonatomic) BOOL loading;
@@ -387,20 +389,17 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
                 CYCleanerItem *item = [[CYCleanerItem alloc] init];
                 item.container = container;
                 item.name = container.displayName.length ? container.displayName : container.identifier;
-                item.identifier = container.identifier;
                 item.systemApp = container.systemApp;
                 item.running = cleaner_process_is_running(container.executableName, running);
 
                 NSString *cachePath = [container.path stringByAppendingPathComponent:@"Library/Caches"];
                 NSString *tmpPath = [container.path stringByAppendingPathComponent:@"tmp"];
                 BOOL complete = NO;
-                NSUInteger cacheFiles = 0, tmpFiles = 0;
-                item.cacheBytes = cleaner_tree_bytes(cachePath, &cacheFiles, &complete);
+                item.cacheBytes = cleaner_tree_bytes(cachePath, NULL, &complete);
                 item.incomplete = !complete;
                 complete = NO;
-                item.tempBytes = cleaner_tree_bytes(tmpPath, &tmpFiles, &complete);
+                item.tempBytes = cleaner_tree_bytes(tmpPath, NULL, &complete);
                 item.incomplete = item.incomplete || !complete;
-                item.fileCount = cacheFiles + tmpFiles;
                 item.icon = container.icon;   // loaded off the main thread
                 item.selected = processListAvailable && !item.running &&
                                 !item.systemApp && item.totalBytes > 0;
@@ -416,7 +415,6 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
                 typeof(self) self = weakSelf;
                 if (!self) return;
                 self.items = items;
-                self.runningNames = running;
                 self.processListAvailable = processListAvailable;
                 self.loading = NO;
                 [self.refreshControl endRefreshing];
