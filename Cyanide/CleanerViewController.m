@@ -516,6 +516,13 @@ static BOOL cleaner_intro_accepted(void)
 @property (nonatomic, strong) UISearchController *searchCtrl;
 @property (nonatomic, strong) UIButton *cleanButton;
 @property (nonatomic, strong) UIProgressView *cleanProgress;
+// Round 53: scan cancellation. reloadData installs a fresh block per pass
+// (same __block-int pattern as performClean); viewWillDisappear and
+// backgrounding pull it. scanStale marks that a pass was cancelled or
+// invalidated, so the next appearance/foreground rescans instead of
+// showing the stale one.
+@property (nonatomic, copy) void (^scanCancel)(void);
+@property (nonatomic) BOOL scanStale;
 @end
 
 @implementation CleanerViewController
@@ -550,12 +557,26 @@ static BOOL cleaner_intro_accepted(void)
 
     [self buildBottomBar];
     [self updateControls];
+
+    // Round 53: scan invalidation across background/foreground (the VC's own
+    // viewWillDisappear does not fire when the app merely backgrounds).
+    NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+    [nc addObserver:self selector:@selector(cleaner_didEnterBackground)
+               name:UIApplicationDidEnterBackgroundNotification object:nil];
+    [nc addObserver:self selector:@selector(cleaner_willEnterForeground)
+               name:UIApplicationWillEnterForegroundNotification object:nil];
 }
 
 - (void)viewWillAppear:(BOOL)animated
 {
     [super viewWillAppear:animated];
     [self.navigationController setToolbarHidden:NO animated:animated];
+    // Round 53: a pass cancelled on disappear/backgrounding is never
+    // published — rescan on return instead of showing the stale one.
+    if (self.scanStale && self.accessReady && !self.loading && !self.cleaning) {
+        self.scanStale = NO;
+        [self reloadData];
+    }
     // Start right away, not after the push animation: the card shows what's
     // happening from the first frame.
     if (!self.accessReady && !self.loading) [self ensureAccessAllowingFullExploit:NO];
@@ -601,8 +622,28 @@ static BOOL cleaner_intro_accepted(void)
 - (void)viewWillDisappear:(BOOL)animated
 {
     [super viewWillDisappear:animated];
+    // Round 53: popping or covering the VC cancels an in-flight scan
+    // promptly instead of letting it burn CPU on results no one sees.
+    if (self.scanCancel) { self.scanCancel(); self.scanStale = YES; }
     [self.navigationController setToolbarHidden:YES animated:animated];
     cleaner_suppress_popup_bar(self, NO);
+}
+
+// Round 53: backgrounding invalidates an in-flight scan — its active-app
+// snapshot and sizes predate the suspension, so it must not publish on
+// resume. Foregrounding rescans when the viewer is on screen.
+- (void)cleaner_didEnterBackground
+{
+    if (self.scanCancel) { self.scanCancel(); self.scanStale = YES; }
+}
+
+- (void)cleaner_willEnterForeground
+{
+    if (self.scanStale && self.view.window && self.accessReady &&
+        !self.loading && !self.cleaning) {
+        self.scanStale = NO;
+        [self reloadData];
+    }
 }
 
 // The clean button lives in the toolbar so it stays put while the list scrolls.
@@ -845,6 +886,13 @@ static BOOL cleaner_intro_accepted(void)
     [self.tableView reloadData];
     [self updateControls];
     __weak typeof(self) weakSelf = self;
+    // Round 53: one cancel flag per pass, pulled by viewWillDisappear and
+    // the backgrounding observer (same __block-int pattern as performClean).
+    // Cleared when the pass ends so a late pull is a no-op.
+    __block int scanCancelled = 0;
+    self.scanCancel = ^{
+        __atomic_store_n(&scanCancelled, 1, __ATOMIC_RELAXED);
+    };
     void (^setPhase)(CYCleanerPhase, NSUInteger, NSUInteger) = ^(CYCleanerPhase phase, NSUInteger done, NSUInteger total) {
         dispatch_async(dispatch_get_main_queue(), ^{
             typeof(self) self = weakSelf;
@@ -864,8 +912,10 @@ static BOOL cleaner_intro_accepted(void)
             NSArray<NSString *> *uuids = [NSFileManager.defaultManager contentsOfDirectoryAtPath:dataParent error:nil];
             NSMutableArray<FBAppContainer *> *containers = [NSMutableArray array];
             NSUInteger looked = 0;
+            BOOL scanAborted = NO;
             setPhase(CYCleanerPhaseFinding, 0, uuids.count);
             for (NSString *uuid in uuids) {
+                if (__atomic_load_n(&scanCancelled, __ATOMIC_RELAXED)) { scanAborted = YES; break; }
                 FBAppContainer *c = fb_container_for_path([dataParent stringByAppendingPathComponent:uuid], NO);
                 if (c.kind == FBContainerKindData && c.executableName) [containers addObject:c];
                 looked++;
@@ -887,6 +937,7 @@ static BOOL cleaner_intro_accepted(void)
             NSMutableArray<CYCleanerItem *> *items = [NSMutableArray array];
             NSUInteger scanned = 0;
             for (FBAppContainer *container in containers) {
+                if (__atomic_load_n(&scanCancelled, __ATOMIC_RELAXED)) { scanAborted = YES; break; }
                 if (![container isKindOfClass:FBAppContainer.class]) continue;
                 if (!cleaner_path_is_app_data(container.path)) continue;
 
@@ -899,10 +950,10 @@ static BOOL cleaner_intro_accepted(void)
                 NSString *cachePath = [container.path stringByAppendingPathComponent:@"Library/Caches"];
                 NSString *tmpPath = [container.path stringByAppendingPathComponent:@"tmp"];
                 BOOL complete = NO;
-                item.cacheBytes = cleaner_tree_bytes(cachePath, NULL, &complete);
+                item.cacheBytes = cleaner_tree_bytes_cancellable(cachePath, NULL, &complete, &scanCancelled);
                 item.incomplete = !complete;
                 complete = NO;
-                item.tempBytes = cleaner_tree_bytes(tmpPath, NULL, &complete);
+                item.tempBytes = cleaner_tree_bytes_cancellable(tmpPath, NULL, &complete, &scanCancelled);
                 item.incomplete = item.incomplete || !complete;
                 item.icon = container.icon;   // loaded off the main thread
                 scanned++;
@@ -924,6 +975,16 @@ static BOOL cleaner_intro_accepted(void)
             dispatch_async(dispatch_get_main_queue(), ^{
                 typeof(self) self = weakSelf;
                 if (!self) return;
+                self.scanCancel = nil;   // late pulls are no-ops once the pass ends
+                if (scanAborted || __atomic_load_n(&scanCancelled, __ATOMIC_RELAXED)) {
+                    // Round 53: never publish a cancelled pass — the side
+                    // that cancelled set scanStale, and the next appearance/
+                    // foreground rescans instead of showing stale data.
+                    self.loading = NO;
+                    [self.tableView reloadData];
+                    [self updateControls];
+                    return;
+                }
                 self.items = items;
                 self.processListAvailable = processListAvailable;
                 self.loading = NO;
