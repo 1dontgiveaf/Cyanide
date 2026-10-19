@@ -86,6 +86,11 @@ int procmgr_pid_status_krw(int pid, bool *outPresent, bool *outKnown);
 // iOS-preloaded or background-suspended apps). Read-only.
 int procmgr_suspend_count(int pid);
 
+// Same classification from the mapped-gated procmgr_list snapshot. The kproc
+// and pid must be the pair returned by one list pass; returns -1 on any
+// identity, mapping, or KRW-read uncertainty.
+int procmgr_suspend_count_for_entry(uint64_t kproc, int pid);
+
 // Runtime-calibrated offsetof(task, thread_count), or -1 when uncalibrated.
 // Derived by the suspend_count calibration above (task layout: thread_count,
 // active_thread_count, suspend_count consecutive, so thread_count sits at

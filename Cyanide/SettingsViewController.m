@@ -7606,8 +7606,8 @@ NSSet<NSString *> *settings_active_process_names(void)
     for (int i = 0; i < n; i++) {
         buf[i].name[sizeof(buf[i].name) - 1] = 0;
         NSString *name = [NSString stringWithUTF8String:buf[i].name];
-        if (name.length == 0) continue;
-        int suspendCount = procmgr_suspend_count(buf[i].pid);
+        if (name.length == 0) { free(buf); return nil; } // undecodable/truncated UTF-8: fail closed
+        int suspendCount = procmgr_suspend_count_for_entry(buf[i].kproc, buf[i].pid);
         // 0 means running; >0 is prewarmed/background-suspended and safe to
         // clean; -1 means we could not prove it is suspended, so protect it.
         if (suspendCount <= 0) [names addObject:name];

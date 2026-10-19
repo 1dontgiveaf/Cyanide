@@ -237,6 +237,9 @@ static uint64_t g_pm_task_proc_delta = 0;
 static int      g_pm_bsdinfo_attempts = 0;
 #define PM_BSDINFO_MAX_ATTEMPTS 3   // then give up for the session (log-quiet)
 
+static bool pm_task_for_entry(uint64_t proc, uint64_t *taskOut);
+static bool pm_find_entry_task(int pid, uint64_t *procOut, uint64_t *taskOut);
+
 static void pm_calibrate_bsdinfo(void) {
     if (g_pm_off_task_bsdinfo || g_pm_task_proc_delta) return;
     if (g_pm_bsdinfo_attempts >= PM_BSDINFO_MAX_ATTEMPTS) return;
@@ -244,12 +247,12 @@ static void pm_calibrate_bsdinfo(void) {
     if (!kexploit_krw_ready()) return;
 
     krw_set_nonfatal(true);
-    uint64_t selfProc = proc_self();
-    uint64_t task = proc_task(selfProc);
-    uint32_t cap = procmgr_is_kern_ptr(task) ? pm_scan_cap(task, 0x800) : 0;
-    uint64_t lproc = proc_find(1);
-    uint64_t ltask = procmgr_is_kern_ptr(lproc) ? proc_task(lproc) : 0;
-    bool haveLaunchd = procmgr_is_kern_ptr(ltask);
+    uint64_t selfProc = proc_self(), task = 0;
+    if (!pm_task_for_entry(selfProc, &task)) { krw_set_nonfatal(false); return; }
+    uint32_t cap = pm_scan_cap(task, 0x800);
+    uint64_t lproc = 0, ltask = 0;
+    bool haveLaunchd = pm_find_entry_task(1, &lproc, &ltask);
+    uint32_t lcap = haveLaunchd ? pm_scan_cap(ltask, 0x800) : 0;
 
     uint32_t found = 0;
     int matches = 0;
@@ -258,7 +261,7 @@ static void pm_calibrate_bsdinfo(void) {
         kreadbuf(task, tb, cap);
         for (uint32_t off = 0x40; off + 8 <= cap; off += 8) {
             if (*(uint64_t *)(tb + off) != selfProc) continue;   // == our proc
-            if (haveLaunchd && kread64(ltask + off) != lproc) continue;
+            if (haveLaunchd && (off + 8 > lcap || kread64(ltask + off) != lproc)) continue;
             matches++;
             found = off;
         }
@@ -343,8 +346,9 @@ static void pm_calibrate_suspcount(void) {
     }
 
     krw_set_nonfatal(true);
-    uint64_t task = proc_task(proc_self());
-    uint32_t cap = procmgr_is_kern_ptr(task) ? pm_scan_cap(task, 0x800) : 0;
+    uint64_t task = 0;
+    if (!pm_task_for_entry(proc_self(), &task)) { krw_set_nonfatal(false); return; }
+    uint32_t cap = pm_scan_cap(task, 0x800);
     if (cap < 0x40 + 12) {
         krw_set_nonfatal(false);
         printf("[PROCMGR] suspend_count calib deferred: task at page edge (cap=0x%x)\n", cap);
@@ -363,10 +367,10 @@ static void pm_calibrate_suspcount(void) {
     // launchd's own task struct fields: launchd always has a plausible
     // thread_count, an active count close to it, and suspend_count == 0 (it is
     // never suspended). That needs only kernel reads, which work.
-    uint64_t lproc = proc_find(1);
-    uint64_t ltask = procmgr_is_kern_ptr(lproc) ? proc_task(lproc) : 0;
-    uint32_t lcap  = procmgr_is_kern_ptr(ltask) ? pm_scan_cap(ltask, 0x800) : 0;
-    bool haveLaunchd = procmgr_is_kern_ptr(ltask) && lcap >= 0x40 + 12;
+    uint64_t lproc = 0, ltask = 0;
+    bool foundLaunchd = pm_find_entry_task(1, &lproc, &ltask);
+    uint32_t lcap = foundLaunchd ? pm_scan_cap(ltask, 0x800) : 0;
+    bool haveLaunchd = foundLaunchd && lcap >= 0x40 + 12;
 
     // Require a UNIQUE candidate: the layout is three consecutive int32
     //   thread_count == nSelf, active_thread_count ~= nSelf, suspend_count == 0
@@ -408,23 +412,137 @@ static void pm_calibrate_suspcount(void) {
 // Runtime-calibrated task->suspend_count for pid. Returns -1 when
 // uncalibrated/unavailable, else the count (>0 means the task is suspended:
 // iOS-preloaded or background-suspended apps). Read-only.
-int procmgr_suspend_count(int pid) {
-    if (!g_pm_off_task_suspcount) return -1;
-    if (!kexploit_krw_ready()) return -1;
+// A task/proc pair is usable for destructive classification only when the
+// identity calibration itself is available. pm_task_matches_proc() returns -1
+// for that uncalibrated state, so callers must never use its old != 0 pattern
+// before dereferencing the task. Every address touched below is also gated by
+// the kernel_map snapshot; the plain canonical-address check is not sufficient
+// for a reaped proc whose zone page was trimmed after the list pass.
+static bool pm_task_matches_proc_strict(uint64_t task, uint64_t proc) {
+    if (!ksafe_available()) return false;
+    if (!g_pm_off_task_bsdinfo && !g_pm_task_proc_delta)
+        return false;  // identity is uncalibrated: classification is unknown
+    if (!procmgr_is_kern_ptr(proc) || !procmgr_is_kern_ptr(task)) return false;
+
+    uint32_t procSpan = MAX(off_proc_p_pid + 4, off_proc_p_proc_ro + 8);
+    if (!kaddr_is_mapped(proc, procSpan)) return false;
+
+    uint32_t taskSpan = g_pm_off_task_suspcount
+        ? g_pm_off_task_suspcount + 4 : 8;
+    if (g_pm_off_task_bsdinfo)
+        taskSpan = MAX(taskSpan, g_pm_off_task_bsdinfo + 8);
+    if (!kaddr_is_mapped(task, taskSpan)) return false;
+
+    // Strictly require the calibrated verdict: -1 (uncalibrated) is unknown,
+    // not a license to read through a merely canonical task pointer.
+    return pm_task_matches_proc(task, proc) == 1;
+}
+
+// Resolve task from a procmgr_list() entry without re-walking allproc. Both
+// pointer fields are mapped-gated before their first dereference, and the
+// caller rechecks the pid/identity after reading suspend_count.
+static bool pm_task_for_entry(uint64_t proc, uint64_t *taskOut) {
+    if (taskOut) *taskOut = 0;
+    if (!taskOut || !ksafe_available() || !procmgr_is_kern_ptr(proc)) return false;
+    if (!off_proc_p_proc_ro || !off_proc_ro_pr_task) return false;
+
+    uint32_t procSpan = MAX(off_proc_p_pid + 4, off_proc_p_proc_ro + 8);
+    if (!kaddr_is_mapped(proc, procSpan)) return false;
+    uint64_t procRo = kread64(proc + off_proc_p_proc_ro);
+    if (!procmgr_is_kern_ptr(procRo) ||
+        !kaddr_is_mapped(procRo, off_proc_ro_pr_task + 8)) return false;
+    uint64_t task = kread64(procRo + off_proc_ro_pr_task);
+    if (!procmgr_is_kern_ptr(task)) return false;
+    *taskOut = task;
+    return true;
+}
+
+// Calibration needs a task before identity offsets exist; it may still only
+// resolve a foreign PID from a complete mapped-gated enumeration, never a raw
+// allproc re-walk. Missing mapping or a changing PID means no reference task.
+static bool pm_find_entry_task(int pid, uint64_t *procOut, uint64_t *taskOut) {
+    *procOut = 0; *taskOut = 0;
+    const int cap = 8192;
+    procmgr_entry_t *entries = calloc((size_t)cap, sizeof(*entries));
+    if (!entries) return false;
+    int n = procmgr_list(entries, cap);
+    bool found = false;
+    for (int i = 0; i < n; i++) {
+        if (entries[i].pid != pid) continue;
+        uint64_t proc = entries[i].kproc, task = 0;
+        if (!pm_task_for_entry(proc, &task) ||
+            !kaddr_is_mapped(proc, off_proc_p_pid + 4) ||
+            (int)kread32(proc + off_proc_p_pid) != pid) break;
+        *procOut = proc; *taskOut = task; found = true;
+        break;
+    }
+    free(entries);
+    return found;
+}
+
+int procmgr_suspend_count_for_entry(uint64_t proc, int pid) {
+    if (pid <= 0 || !g_pm_off_task_suspcount || !kexploit_krw_session_active()) {
+        return -1;
+    }
+    if (!ksafe_available()) {
+        return -1;
+    }
+
+    if (!krw_batch_begin()) return -1;
     krw_set_nonfatal(true);
+    uint64_t errorsBefore = krw_op_error_count();
     int rc = -1;
-    uint64_t proc = proc_find(pid);
-    if (procmgr_is_kern_ptr(proc)) {
-        uint64_t task = proc_task(proc);
-        // TOCTOU guard (round 14): the proc can exit between the walk and
-        // this read; require the task's bsd_info back-pointer to still name
-        // this proc (uncalibrated -> no verdict, read as before).
-        if (procmgr_is_kern_ptr(task) && pm_task_matches_proc(task, proc) != 0) {
-            uint32_t sc = kread32(task + g_pm_off_task_suspcount);
-            if (sc <= 64) rc = (int)sc;     // >64 is implausible: torn/bad read
+    do {
+        if (!procmgr_is_kern_ptr(proc) ||
+            !kaddr_is_mapped(proc, MAX(off_proc_p_pid + 4, off_proc_p_proc_ro + 8))) break;
+
+        // The list entry is a snapshot, not an identity proof. Revalidate the
+        // pid before resolving task and again after the counter read.
+        if ((int)kread32(proc + off_proc_p_pid) != pid) break;
+        uint64_t task = 0;
+        if (!pm_task_for_entry(proc, &task)) break;
+        if (!pm_task_matches_proc_strict(task, proc)) break;
+
+        if (!kaddr_is_mapped(task, g_pm_off_task_suspcount + 4)) break;
+        uint32_t sc = kread32(task + g_pm_off_task_suspcount);
+        if (sc > 64) break;  // implausible: torn/bad read
+
+        // A task can exit/recycle between the identity check and the field
+        // read. Any drift or failed read makes this pass unknown.
+        if ((int)kread32(proc + off_proc_p_pid) != pid ||
+            !pm_task_matches_proc_strict(task, proc)) break;
+        rc = (int)sc;
+    } while (0);
+    krw_batch_end();
+    krw_set_nonfatal(false);
+
+    if (krw_op_error_count() != errorsBefore) rc = -1;
+    return rc;
+}
+
+// Compatibility API: resolve the PID only through the same mapped-gated list
+// path. This is intentionally slower than the snapshot-entry API; cleaner and
+// other callers with a list row should pass its kproc directly.
+int procmgr_suspend_count(int pid) {
+    if (pid <= 0) {
+        return -1;
+    }
+    const int cap = 8192;
+    procmgr_entry_t *entries = calloc((size_t)cap, sizeof(*entries));
+    if (!entries) {
+        return -1;
+    }
+    int n = procmgr_list(entries, cap);
+    int rc = -1;
+    if (n >= 0) {
+        for (int i = 0; i < n; i++) {
+            if (entries[i].pid == pid) {
+                rc = procmgr_suspend_count_for_entry(entries[i].kproc, pid);
+                break;
+            }
         }
     }
-    krw_set_nonfatal(false);
+    free(entries);
     return rc;
 }
 
@@ -2371,8 +2489,8 @@ bool procmgr_row_info(uint64_t kproc, int pid, procmgr_row_info_t *out) {
                   (out->pstat >= 0 && (out->pstat < 1 || out->pstat > 7));
         if (exiting) break;
 
-        uint64_t task = proc_task(kproc);
-        if (!procmgr_is_kern_ptr(task) || pm_task_matches_proc(task, kproc) == 0) {
+        uint64_t task = 0;
+        if (!pm_task_for_entry(kproc, &task) || !pm_task_matches_proc_strict(task, kproc)) {
             // The proc pointer still had this pid, but its task was torn down
             // or no longer belongs to it. That is not a live, usable row:
             // return false so the controller marks it exiting/non-selectable.
@@ -2381,15 +2499,22 @@ bool procmgr_row_info(uint64_t kproc, int pid, procmgr_row_info_t *out) {
         }
 
         if (g_pm_off_task_suspcount) {
+            uint64_t errorsBefore = krw_op_error_count();
             uint32_t sc = kread32(task + g_pm_off_task_suspcount);
-            if (sc <= 64) out->suspend_count = (int)sc;     // >64 is implausible: torn/bad read
+            if (krw_op_error_count() == errorsBefore && sc <= 64 &&
+                pm_task_matches_proc_strict(task, kproc))
+                out->suspend_count = (int)sc;     // >64/read failure/drift => unknown
+            else {
+                valid = false;
+                break;
+            }
         }
         if ((g_pm_mem_cal && ksafe_available()) || g_pm_thr_cal) {
             uint64_t errorsBefore = krw_op_error_count();
             kv = pm_kernel_stats(task, &kMem, &kCpu);
             // Re-verify after the reads: a death mid-read with fast task
             // reuse can tear past the double-read consistency checks.
-            if (pm_task_matches_proc(task, kproc) == 0) kv = 0;
+            if (!pm_task_matches_proc_strict(task, kproc)) kv = 0;
             // A failed-safe read zero-fills silently; a zeroed word can still
             // pass the double-read checks (e.g. 0 == 0), so any read error
             // during the stats reads voids the kernel values for this row.
