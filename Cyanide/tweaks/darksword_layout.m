@@ -288,6 +288,46 @@ typedef enum {
     RCResizeDone,
 } RCResizeResult;
 
+// TEMPORARY diagnostics (uneven icon sizes, white strip under the Clock):
+// one log line per icon view before/after the resize and once settled.
+// Remove once the cause is fixed.
+static const bool kRCResizeDiagnostics = true;
+
+static void rc_diag_class_name(uint64_t obj, char *out, size_t outLen)
+{
+    snprintf(out, outLen, "%s", obj ? "?" : "-");
+    if (!r_is_objc_ptr(obj)) return;
+    uint64_t remoteName = r_dlsym_call(R_TIMEOUT, "object_getClassName", obj, 0, 0, 0, 0, 0, 0, 0);
+    if (!remoteName) return;
+    uint64_t copy = r_dlsym_call(R_TIMEOUT, "strdup", remoteName, 0, 0, 0, 0, 0, 0, 0);
+    if (!copy) return;
+    if (!remote_read(copy, out, outLen - 1)) snprintf(out, outLen, "?");
+    out[outLen - 1] = '\0';
+    r_free(copy);
+}
+
+static void rc_diag_icon_view(uint64_t iconView, const char *when, int page)
+{
+    if (!kRCResizeDiagnostics || !r_is_objc_ptr(iconView)) return;
+    char viewCls[64], iconCls[64], imgCls[64];
+    uint64_t icon = r_msg2_main(iconView, "icon", 0, 0, 0, 0);
+    uint64_t img = 0;
+    if (r_responds(iconView, "_iconImageView")) img = r_msg2_main(iconView, "_iconImageView", 0, 0, 0, 0);
+    rc_diag_class_name(iconView, viewCls, sizeof(viewCls));
+    rc_diag_class_name(icon, iconCls, sizeof(iconCls));
+    rc_diag_class_name(img, imgCls, sizeof(imgCls));
+    double vf[4] = {0}, imf[4] = {0}, info[4] = {0};
+    (void)r_msg2_main_struct_ret(iconView, "frame", vf, sizeof(vf), NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+    if (r_is_objc_ptr(img))
+        (void)r_msg2_main_struct_ret(img, "frame", imf, sizeof(imf), NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+    if (r_responds(iconView, "iconImageInfo"))
+        (void)r_msg2_main_struct_ret(iconView, "iconImageInfo", info, sizeof(info), NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+    log_user("[ICONDIAG] %-7s p%-2d icon=%s view=%s img=%s view=%.1fx%.1f img=(%.1f,%.1f %.1fx%.1f) "
+             "info=%.1fx%.1f@%.0fx r=%.1f\n",
+             when, page, iconCls, viewCls, imgCls, vf[2], vf[3], imf[0], imf[1], imf[2], imf[3],
+             info[0], info[1], info[2], info[3]);
+}
+
 static RCResizeResult rc_resize_icon_view(RCResizeCtx *ctx, uint64_t iconView)
 {
     if (!iconView) return RCResizeSkipped;
@@ -346,10 +386,16 @@ static int rc_refresh_list_view(RCResizeCtx *ctx, uint64_t listView, int *outTot
     int n = rc_list_view_icon_views(listView, views, ICON_CAP, &subs);
     int resized = 0, resizable = 0;
     for (int i = 0; i < n; i++) {
+        rc_diag_icon_view(views[i], "before", -1);
         RCResizeResult r = rc_resize_icon_view(ctx, views[i]);
+        rc_diag_icon_view(views[i], "after", -1);
         if (r == RCResizeSkipped) continue;
         resizable++;
         if (r == RCResizeDone) resized++;
+    }
+    if (kRCResizeDiagnostics) {
+        usleep(300000);
+        for (int i = 0; i < n; i++) rc_diag_icon_view(views[i], "settled", -1);
     }
     if (outTotal) *outTotal += resizable;
     if (subs) r_msg(subs, r_sel("release"), 0, 0, 0, 0);
@@ -576,12 +622,19 @@ bool darksword_layout_home_scale_in_session(double scale)
     int resized = 0, resizable = 0;
     for (int p = 0; p < npages; p++) {
         for (int i = pageFirst[p]; i < pageFirst[p + 1]; i++) {
+            rc_diag_icon_view(views[i], "before", p);
             RCResizeResult r = rc_resize_icon_view(&ctx, views[i]);
+            rc_diag_icon_view(views[i], "after", p);
             if (r == RCResizeSkipped) continue;
             resizable++;
             if (r == RCResizeDone) resized++;
         }
         rc_report_progress(p + 1, npages, pageFirst[p + 1], nviews);
+    }
+    if (kRCResizeDiagnostics) {
+        usleep(300000);   // let SpringBoard's relayout land
+        for (int p = 0; p < npages; p++)
+            for (int i = pageFirst[p]; i < pageFirst[p + 1]; i++) rc_diag_icon_view(views[i], "settled", p);
     }
     rc_resize_ctx_destroy(&ctx);
     uint64_t selRel = r_sel("release");
