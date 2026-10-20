@@ -2406,7 +2406,11 @@ static bool pm_validate_cache(void) {
 // Discover the offsets by matching our OWN known footprint + CPU times. All
 // reads, no writes. Failures just leave the feature disabled until the next
 // refresh retries. Runs on a background queue from reloadProcs.
-static int procmgr_calibrate_locked(void) {
+// The part of a calibration pass every caller needs: the live-session gate,
+// the mapped-address gate and the identity offsets (suspend_count, the
+// proc->task back-pointer). Returns -1 when the session isn't live, else
+// whether speculative discovery is safe (the mapped-address gate is up).
+static int pm_calibrate_identity_locked(void) {
     // Gate the WHOLE pass on a live session: the sub-calibrators below
     // (suspend_count, task role, cache validation) read kernel memory BEFORE
     // the kexploit_krw_ready() check further down, so a detached session used
@@ -2420,7 +2424,7 @@ static int procmgr_calibrate_locked(void) {
             printf("[PROCMGR] calibrate: pass skipped (KRW not ready/detached) — "
                    "further skips quiet until a pass runs\n");
         }
-        return 0;
+        return -1;
     }
     sCalibSkipLogged = false;
 
@@ -2462,6 +2466,13 @@ static int procmgr_calibrate_locked(void) {
     // so the tried-flag is set, never per poll.
     if (!g_pm_role_tried)
         pm_calibrate_task_role();
+    return discoverySafe ? 1 : 0;
+}
+
+static int procmgr_calibrate_locked(void) {
+    int identity = pm_calibrate_identity_locked();
+    if (identity < 0) return 0;
+    bool discoverySafe = identity == 1;
 
     // Nonfatal for the whole calibration: this runs on a UI background queue
     // and a transient KRW hiccup (idle-detach race, reattach failure) must
@@ -2572,6 +2583,18 @@ static int procmgr_calibrate_locked(void) {
 int procmgr_calibrate(void) {
     pm_calibration_lock_enter();
     int result = procmgr_calibrate_locked();
+    pm_calibration_lock_leave();
+    return result;
+}
+
+// Only what procmgr_suspend_count_for_entry needs. Skips the CPU and memory
+// column calibrations: they probe candidate task/ledger offsets, and on A18
+// one of those probes read a per-CPU allocation and panicked the kernel
+// ("zone bound checks: ... is a per-cpu allocation") during a Cleaner scan.
+int procmgr_calibrate_suspend_count(void) {
+    pm_calibration_lock_enter();
+    int identity = pm_calibrate_identity_locked();
+    int result = identity >= 0 && g_pm_off_task_suspcount ? 1 : 0;
     pm_calibration_lock_leave();
     return result;
 }

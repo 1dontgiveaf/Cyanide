@@ -177,6 +177,9 @@ void procmgr_resandbox(void);
 // calibration owner first, then KRW. Private discovery never reacquires owner.
 // Returns nonzero if at least one of memory/CPU calibration succeeded.
 int  procmgr_calibrate(void);
+// Only the suspend_count offset and the proc->task guard: no CPU/memory
+// column probing. For callers that just need procmgr_suspend_count_for_entry.
+int  procmgr_calibrate_suspend_count(void);
 // True when the memory (ledger footprint) path is fully usable: offsets
 // calibrated AND the mapped-check is up this session.
 bool procmgr_mem_calibrated(void);

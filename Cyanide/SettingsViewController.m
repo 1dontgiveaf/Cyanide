@@ -7791,7 +7791,9 @@ NSSet<NSString *> *settings_active_process_names(void)
     // suspend_count is runtime-calibrated from our own task and launchd. A
     // failed calibration leaves every count at -1; those names are kept in the
     // set so Cleaner skips them rather than deleting a possibly-live cache.
-    (void)procmgr_calibrate();
+    // Not procmgr_calibrate(): its CPU/memory column probing panicked an A18
+    // device during a Cleaner scan, and the Cleaner never uses those columns.
+    (void)procmgr_calibrate_suspend_count();
     int cap = 4096;
     procmgr_entry_t *buf = calloc((size_t)cap, sizeof(procmgr_entry_t));
     int n = buf ? procmgr_list(buf, cap) : -1;
