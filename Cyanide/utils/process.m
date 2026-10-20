@@ -859,6 +859,8 @@ static bool pm_seen_proc(const uint64_t *seen, int count, uint64_t proc) {
     return false;
 }
 
+static bool pm_next_proc_links_back(uint64_t next, uint64_t proc);
+
 // LIST_ENTRY.le_prev for the first proc points at the allproc.lh_first field,
 // not at another struct proc. It is the one legitimate non-proc endpoint on
 // the reverse walk. Confirm the endpoint topology before accepting it; a
@@ -866,16 +868,29 @@ static bool pm_seen_proc(const uint64_t *seen, int count, uint64_t proc) {
 static bool pm_is_allproc_head_link(uint64_t link, const uint64_t *seen, int count) {
     if (!procmgr_is_kern_ptr(link) || !ksafe_available() ||
         !kaddr_is_mapped(link, 8)) return false;
-    // A normal predecessor has the same local next/prev topology as the list
-    // head link. A complete proc fill distinguishes it before the sentinel
-    // check; only a non-proc candidate may be accepted as the endpoint.
-    // A mapped candidate with a plausible PID remains a proc even if its name
-    // is temporarily missing: never accept that uncertainty as the list head.
-    if (pm_proc_readable(link) && kread32(link + off_proc_p_pid) <= 500000) return false;
+    // The reverse-list sentinel is an allproc.lh_first field, not a struct
+    // proc. Do not inspect proc-only fields at this address: a mapped head
+    // field can contain arbitrary neighboring bytes that happen to look like
+    // a plausible PID. The only safe discriminator is the exact LIST topology:
+    // the head field points at the first proc and that proc points back to the
+    // same field. Validate the first proc's forward link too, so a stale or
+    // malformed predecessor cannot be accepted as the sentinel.
+    uint32_t linkSpan = off_proc_p_list_le_prev + 8 > 8
+        ? off_proc_p_list_le_prev + 8 : 8;
+    if (!kaddr_is_mapped(link, linkSpan)) return false;
+    uint64_t prior = kread64(link + off_proc_p_list_le_prev);
+    // A real proc has a predecessor whose forward link points back to it.
+    // The allproc head field has no such proc-list predecessor. This is a
+    // topology check only; in particular, never interpret link+p_pid.
+    if (procmgr_is_kern_ptr(prior) && pm_proc_readable(prior) &&
+        kread64(prior + off_proc_p_list_le_next) == link) return false;
     uint64_t first = kread64(link);
     if (!procmgr_is_kern_ptr(first) || !pm_seen_proc(seen, count, first) ||
         !pm_proc_readable(first)) return false;
-    return kread64(first + off_proc_p_list_le_prev) == link;
+    if (kread64(first + off_proc_p_list_le_prev) != link) return false;
+    uint64_t next = kread64(first + off_proc_p_list_le_next);
+    return !next || (procmgr_is_kern_ptr(next) &&
+                     pm_next_proc_links_back(next, first));
 }
 
 static bool pm_next_proc_links_back(uint64_t next, uint64_t proc) {

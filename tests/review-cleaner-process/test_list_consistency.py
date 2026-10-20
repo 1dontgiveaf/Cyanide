@@ -40,7 +40,10 @@ for needle in (
     assert needle in listing, needle
 
 assert "if (_duplicate) { incomplete = YES; }" in listing
-assert "return kread64(first + off_proc_p_list_le_prev) == link;" in head
+assert "Do not inspect proc-only fields at this address" in head
+assert "kread64(first + off_proc_p_list_le_prev) != link" in head
+assert "pm_next_proc_links_back(next, first)" in head
+assert "off_proc_p_pid" not in head
 # The old silent-cap loop must not reappear.
 assert "n < max && procmgr_is_kern_ptr" not in listing
 print("process-list consistency source contracts: PASS")

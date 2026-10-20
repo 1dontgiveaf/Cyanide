@@ -33,9 +33,12 @@ static int index_of(uint64_t address) {
 static bool procmgr_is_kern_ptr(uint64_t address) { return address >= 0x1000; }
 static bool ksafe_available(void) { return true; }
 static bool kaddr_is_mapped(uint64_t address, uint32_t size) {
-    return index_of(address) >= 0 || (address == head && size <= 8);
+    // The fake allproc.lh_first field is itself mapped and contains plausible
+    // neighboring data, just like the review trigger. Sentinel recognition
+    // must use list topology rather than a proc-only PID read there.
+    return index_of(address) >= 0 || (address == head && size <= 0x40);
 }
-static bool pm_proc_readable(uint64_t address) { return index_of(address) >= 0; }
+static bool pm_proc_readable(uint64_t address) { return index_of(address) >= 0 || address == head; }
 static bool pm_list_ensure_ksafe_gate(void) { return true; }
 static bool kexploit_krw_ready(void) { return true; }
 static void krw_set_nonfatal(bool value) { (void)value; }
@@ -46,6 +49,7 @@ static int ksafe_refresh_status(void) { return KSAFE_REFRESH_DONE; }
 static uint64_t proc_self(void) { return selfAddress; }
 static uint64_t kread64(uint64_t address) {
     if (address == head) return nodes[0].address;
+    if (address == head + 8) return 0;
     for (int i=0; i<3; i++) {
         if (address == nodes[i].address) return nodes[i].next;
         if (address == nodes[i].address + 8) return nodes[i].prev;
@@ -53,6 +57,7 @@ static uint64_t kread64(uint64_t address) {
     errors++; return 0;
 }
 static uint32_t kread32(uint64_t address) {
+    if (address == head + 16) return 4242; // plausible, but unrelated to allproc
     for (int i=0; i<3; i++) if (address == nodes[i].address + 16) {
         pidReads[i]++;
         if (churnPid && i == 1 && pidReads[i] > 1) return nodes[i].pid + 100;
@@ -90,6 +95,7 @@ int main(void) {
     reset(); nodes[0].next=0x3000; check(procmgr_list(entries,4)==-1, "broken forward link unavailable");
     reset(); nodes[2].name[0]=0; check(procmgr_list(entries,4)==-1, "unknown forward name unavailable");
     reset(); nodes[0].name[0]=0; check(procmgr_list(entries,4)==-1, "unknown reverse name is not a sentinel");
+    reset(); check(procmgr_list(entries,4)==3, "mapped allproc head with plausible neighbor is accepted");
     reset(); churnPid=1; check(procmgr_list(entries,4)==-1, "PID drift during publication unavailable");
     puts("process-list mocked-native regressions: PASS");
     return 0;
