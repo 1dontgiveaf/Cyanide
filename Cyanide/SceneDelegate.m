@@ -737,6 +737,16 @@ static const double kQuietMinPhase = 0.35;   // a phase stays readable at least 
         if (requester) requester(NO, parseError);
         return;
     }
+    // The initial no-kernel result is not terminal on A18/M4: the user may
+    // confirm a manual exploit and the same request will then be retried.
+    // Keep the caller's completion at the transaction boundary so it cannot
+    // observe that intermediate failure or be lost on the retry.
+    __block BOOL completionDelivered = NO;
+    CYLocationRequestCompletion finish = ^(BOOL ok, NSString *message) {
+        if (completionDelivered) return;
+        completionDelivered = YES;
+        if (requester) requester(ok, message ?: @"");
+    };
     // A newly accepted action supersedes a deferred return owned by an older
     // run. Invalid or rejected requests leave the completed run's intent alone.
     self.homeOnNextActivation = NO;
@@ -773,6 +783,7 @@ static const double kQuietMinPhase = 0.35;   // a phase stays readable at least 
     }
     // log=1: the result stays readable for a moment before Home.
     static const double kLogResultPause = 0.75;
+    __block BOOL operationCallbackHandled = NO;
     __weak typeof(self) weakSelf = self;
     dispatch_block_t run = ^{
         SettingsProgressBlock progress = showLog ? nil : ^(float fraction, NSString *step, NSTimeInterval over, int target) {
@@ -788,26 +799,56 @@ static const double kQuietMinPhase = 0.35;   // a phase stays readable at least 
         settings_location_services_set_async(desired, NO, removeCard, broughtToFront,
                                              showLog ? kLogResultPause : 0, progress,
                                              ^(BOOL ok, NSString *rawMessage, NSTimeInterval resultAge) {
+            if (operationCallbackHandled) return;
+            operationCallbackHandled = YES;
             NSString *message = [rawMessage isEqualToString:kSettingsFullExploitRequiredMessage]
                 ? @"Cyanide has no saved kernel access (for example after a restart). Open Cyanide and run it once, then try again."
                 : rawMessage;
             if (observer) [NSNotificationCenter.defaultCenter removeObserver:observer];
-            // The requester hears the outcome first, before Cyanide leaves.
-            if (requester) requester(ok, message);
             typeof(self) me = weakSelf;
-            if (!me || generation != me.actionGeneration) return;
-            me.actionInProgress = NO;
+            if (!me || generation != me.actionGeneration) {
+                finish(NO, @"The Location Services request was superseded before it finished.");
+                return;
+            }
             if (!ok && [rawMessage isEqualToString:kSettingsFullExploitRequiredMessage]) {
                 // A18/M4 without saved kernel access (other devices run the
                 // exploit by themselves): offer Run Exploit with its log, then
                 // repeat this request.
                 [me hideQuietCover];
                 settings_run_exploit_with_log([me topViewController], ^(BOOL ready) {
-                    if (ready) [weakSelf handleActionURL:url completion:nil coldLaunched:cold
-                                          broughtToFront:broughtToFront];
+                    typeof(self) retryOwner = weakSelf;
+                    if (!retryOwner || generation != retryOwner.actionGeneration ||
+                        !retryOwner.actionInProgress) {
+                        finish(NO, @"The Location Services retry was superseded before it finished.");
+                        return;
+                    }
+                    if (!ready) {
+                        retryOwner.actionInProgress = NO;
+                        NSString *retryMessage =
+                            @"Location Services request cancelled: kernel access was not acquired.";
+                        finish(NO, retryMessage);
+                        if (!showLog) {
+                            UIViewController *top = [retryOwner topViewController];
+                            if (![top isKindOfClass:UIAlertController.class]) {
+                                [retryOwner showAlertTitle:@"Location Services" message:retryMessage];
+                            }
+                        } else {
+                            scene_announce(retryMessage);
+                        }
+                        return;
+                    }
+                    // Re-enter the normal action path with the same completion;
+                    // this is one user transaction, not a new request.
+                    retryOwner.actionInProgress = NO;
+                    [retryOwner handleActionURL:url completion:finish coldLaunched:cold
+                                  broughtToFront:broughtToFront];
                 });
                 return;
             }
+            // The requester hears the terminal outcome first, before Cyanide
+            // leaves or exposes a failure alert.
+            finish(ok, message);
+            me.actionInProgress = NO;
             if (!ok) {
                 if (!showLog) {
                     [me hideQuietCover];
