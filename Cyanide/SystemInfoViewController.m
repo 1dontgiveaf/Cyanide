@@ -384,7 +384,7 @@ static NSString * const kSIAppSortKey = @"SystemInfoAppSort";
         } else {
             me.batteryRows = nil;   // never show an old reading as current
             me.batteryStatus = [message isEqualToString:kSettingsFullExploitRequiredMessage]
-                ? @"Needs kernel access, and there is no saved session. Tap to run the full exploit."
+                ? @"Needs kernel access, and there is no saved session. Tap to run the exploit (the log is shown)."
                 : (message ?: @"Unavailable.");
         }
         [me refreshLocal];   // kernel state may have changed too
@@ -419,21 +419,10 @@ static NSString * const kSIAppSortKey = @"SystemInfoAppSort";
         if (ok) { scan(); return; }
         me.scanningApps = NO;
         me.appsStatus = [message isEqualToString:kSettingsFullExploitRequiredMessage]
-            ? @"Needs kernel access, and there is no saved session. Tap to run the full exploit."
+            ? @"Needs kernel access, and there is no saved session. Tap to run the exploit (the log is shown)."
             : (message ?: @"Filesystem access is not available.");
         [me.tableView reloadData];
     });
-}
-
-- (void)confirmFullExploitThen:(void (^)(void))run
-{
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"No parked kernel state"
-        message:@"This needs kernel access, and there is no saved session to reuse. Running the full exploit can reboot the device on A18/M4. Continue?"
-        preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"Run Full Exploit" style:UIAlertActionStyleDefault
-                                         handler:^(UIAlertAction *a) { run(); }]];
-    [self presentViewController:ac animated:YES completion:nil];
 }
 
 #pragma mark Table
@@ -569,12 +558,12 @@ static NSString * const kSIAppSortKey = @"SystemInfoAppSort";
     __weak typeof(self) weakSelf = self;
     if (indexPath.section == SISectionBattery && !self.batteryRows.count && !self.readingBattery) {
         if ([self.batteryStatus hasPrefix:@"Needs kernel access"])
-            [self confirmFullExploitThen:^{ [weakSelf readBatteryAllowingFullExploit:YES]; }];
+            settings_run_exploit_with_log(self, ^(BOOL ready) { if (ready) [weakSelf readBatteryAllowingFullExploit:NO]; });
         else
             [self readBatteryAllowingFullExploit:NO];
     } else if (indexPath.section == SISectionApps && self.appsStatus && indexPath.row == 0 && !self.scanningApps) {
         if ([self.appsStatus hasPrefix:@"Needs kernel access"])
-            [self confirmFullExploitThen:^{ [weakSelf scanAppsAllowingFullExploit:YES]; }];
+            settings_run_exploit_with_log(self, ^(BOOL ready) { if (ready) [weakSelf scanAppsAllowingFullExploit:NO]; });
         else
             [self scanAppsAllowingFullExploit:NO];
     }

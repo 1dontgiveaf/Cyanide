@@ -626,15 +626,16 @@ static BOOL cleaner_intro_accepted(void)
         [self reloadData];
     }
     // Start right away, not after the push animation: the card shows what's
-    // happening from the first frame.
-    if (!self.accessReady && !self.loading) [self ensureAccessAllowingFullExploit:NO];
+    // happening from the first frame. On first open the explanation comes
+    // first; nothing is read until it is accepted.
+    if (cleaner_intro_accepted() && !self.accessReady && !self.loading) [self ensureAccessAllowingFullExploit:NO];
 }
 
 - (void)viewDidAppear:(BOOL)animated
 {
     [super viewDidAppear:animated];
     cleaner_suppress_popup_bar(self, YES);
-    if (!self.accessReady && !self.loading) [self ensureAccessAllowingFullExploit:NO];
+    if (cleaner_intro_accepted() && !self.accessReady && !self.loading) [self ensureAccessAllowingFullExploit:NO];
     [self showIntroIfNeeded];
 }
 
@@ -663,6 +664,7 @@ static BOOL cleaner_intro_accepted(void)
     [ac addAction:[UIAlertAction actionWithTitle:@"Got It" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         [NSUserDefaults.standardUserDefaults setInteger:kCleanerIntroVersion forKey:kCleanerIntroAcceptedKey];
         [weakSelf updateControls];
+        if (!weakSelf.accessReady && !weakSelf.loading) [weakSelf ensureAccessAllowingFullExploit:NO];
     }]];
     [self presentViewController:ac animated:YES completion:nil];
 }
@@ -941,25 +943,20 @@ static BOOL cleaner_intro_accepted(void)
         }
         BOOL needsFullRun = [message isEqualToString:kSettingsFullExploitRequiredMessage];
         self.accessMessage = needsFullRun
-            ? @"Needs kernel access, and there is no saved session. Tap here to run the full exploit."
+            ? @"Needs kernel access, and there is no saved session. Tap here to run the exploit (the log is shown)."
             : (message ?: @"Filesystem access is not available.");
         [self.tableView reloadData];
         [self updateControls];
-        if (needsFullRun && !allowFullExploit && self.view.window && !self.presentedViewController)
-            [self confirmFullExploit];
     });
 }
 
-- (void)confirmFullExploit
+// Never started by itself: only from the summary card, with the log shown.
+- (void)runExploit
 {
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"No parked kernel state"
-        message:@"Cleaner needs kernel access, and there is no saved session to reuse. Running the full exploit can reboot the device on A18/M4. Continue?"
-        preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     __weak typeof(self) weakSelf = self;
-    [ac addAction:[UIAlertAction actionWithTitle:@"Run Full Exploit" style:UIAlertActionStyleDefault
-                                         handler:^(UIAlertAction *a) { [weakSelf ensureAccessAllowingFullExploit:YES]; }]];
-    [self presentViewController:ac animated:YES completion:nil];
+    settings_run_exploit_with_log(self, ^(BOOL ready) {
+        if (ready) [weakSelf ensureAccessAllowingFullExploit:NO];
+    });
 }
 
 - (void)refreshPulled:(UIRefreshControl *)sender
@@ -1519,7 +1516,8 @@ static BOOL cleaner_intro_accepted(void)
         cell.captionLabel.text = @"Cleaner";
         cell.totalLabel.text = @"—";
         cell.bar.progress = 0;
-        cell.statusLabel.text = self.accessMessage ?: @"Filesystem access is not available.";
+        cell.statusLabel.text = self.accessMessage ?: (cleaner_intro_accepted() ? @"Filesystem access is not available."
+                                                                                : @"Read the note first; nothing is scanned until then.");
         return;
     }
     cell.captionLabel.text = @"Reclaimable";
@@ -1579,7 +1577,7 @@ static BOOL cleaner_intro_accepted(void)
 - (BOOL)tableView:(UITableView *)tableView shouldHighlightRowAtIndexPath:(NSIndexPath *)indexPath
 {
     if (indexPath.section == CYCleanerSectionSummary)
-        return !self.accessReady && !self.loading && self.accessMessage != nil;
+        return !self.accessReady && !self.loading && (self.accessMessage != nil || !cleaner_intro_accepted());
     return [self itemSelectable:[self itemsInSection:indexPath.section][(NSUInteger)indexPath.row]];
 }
 
@@ -1587,8 +1585,9 @@ static BOOL cleaner_intro_accepted(void)
 {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     if (indexPath.section == CYCleanerSectionSummary) {
+        if (!cleaner_intro_accepted()) { [self showIntroIfNeeded]; return; }
         if (!self.accessReady && !self.loading) {
-            if ([self.accessMessage hasPrefix:@"Needs kernel access"]) [self confirmFullExploit];
+            if ([self.accessMessage hasPrefix:@"Needs kernel access"]) [self runExploit];
             else [self ensureAccessAllowingFullExploit:NO];
         }
         return;

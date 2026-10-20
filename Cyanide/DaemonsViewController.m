@@ -335,6 +335,7 @@ static void daemons_note_change(NSArray<NSString *> *labels)
         if (!me) return;
         me.busy = NO;
         if (disabled) {
+            settings_set_kernel_access_banner(me.tableView, nil, nil);
             me.disabled = disabled;
             me.running = running;
             me.status = nil;
@@ -342,7 +343,7 @@ static void daemons_note_change(NSArray<NSString *> *labels)
             me.status = message;
         }
         [me refreshUI];
-        if (!disabled) [me handleFailure:message retry:^{ [weakSelf loadAllowingFullExploit:YES]; } from:me];
+        if (!disabled) [me handleFailure:message retry:^{ [weakSelf loadAllowingFullExploit:NO]; } from:me];
     });
 }
 
@@ -415,28 +416,33 @@ static void daemons_note_change(NSArray<NSString *> *labels)
                 if ([me.staged[label] isEqual:changes[label]]) [me.staged removeObjectForKey:label];
         }
         [me refreshUI];
-        if (!ok) [me handleFailure:message retry:^{ [weakSelf saveAllowingFullExploit:YES]; } from:me];
+        if (!ok) [me handleFailure:message retry:^{ [weakSelf saveAllowingFullExploit:NO]; } from:me];
     });
 }
 
-// A failure that only a full exploit run can fix is asked about first (it can
-// reboot A18/M4 devices), like the File Browser does; anything else is shown.
+// A failure that only a full exploit run can fix shows a banner that runs it
+// (with the log) when tapped -- never started or offered by itself, since it
+// can reboot A18/M4 devices. Then `retry` runs again. Anything else is shown.
 - (void)handleFailure:(NSString *)message retry:(void (^)(void))retry from:(UIViewController *)presenter
 {
-    if (!presenter.view.window || presenter.presentedViewController) return;
-    UIAlertController *ac;
     if ([message isEqualToString:kSettingsFullExploitRequiredMessage]) {
-        ac = [UIAlertController alertControllerWithTitle:@"No parked kernel state"
-                                                 message:@"Daemons need kernel access, and there is no saved session to reuse. Running the full exploit can reboot the device on A18/M4. Continue?"
-                                          preferredStyle:UIAlertControllerStyleAlert];
-        [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-        [ac addAction:[UIAlertAction actionWithTitle:@"Run Full Exploit" style:UIAlertActionStyleDefault
-                                             handler:^(UIAlertAction *a) { retry(); }]];
-    } else {
-        ac = [UIAlertController alertControllerWithTitle:@"Daemons" message:message ?: @"Something went wrong."
-                                          preferredStyle:UIAlertControllerStyleAlert];
-        [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        if (!self.disabled) self.status = @"No kernel access yet";
+        [self refreshUI];
+        __weak typeof(self) weakSelf = self;
+        void (^again)(void) = [retry copy];
+        settings_set_kernel_access_banner(self.tableView,
+            @"Reading and changing daemons needs kernel access, and there is no saved session. "
+            @"Run the exploit once; no tweaks are applied.", ^{
+                typeof(self) me = weakSelf;
+                if (!me) return;
+                settings_run_exploit_with_log(me, ^(BOOL ready) { if (ready && again) again(); });
+            });
+        return;
     }
+    if (!presenter.view.window || presenter.presentedViewController) return;
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Daemons" message:message ?: @"Something went wrong."
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
     [presenter presentViewController:ac animated:YES completion:nil];
 }
 

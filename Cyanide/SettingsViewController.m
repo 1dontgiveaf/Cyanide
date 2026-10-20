@@ -7365,6 +7365,167 @@ void settings_unlock_filesystem_async(BOOL allowFullExploit,
     });
 }
 
+// Runs the exploit on its own -- no tweaks applied -- with the log window up,
+// so a manual run is never hidden. A parked session is restored without
+// asking; a fresh run (which can reboot A18/M4 devices) is confirmed first.
+// On success the log closes and completion(YES) runs; on failure the log
+// stays up so the reason is visible, and completion(NO) runs.
+static BOOL g_settings_manual_exploit_running = NO;
+
+static void settings_simple_alert(UIViewController *presenter, NSString *title, NSString *message)
+{
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:title message:message
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [presenter presentViewController:ac animated:YES completion:nil];
+}
+
+static void settings_run_exploit_with_log_confirmed(UIViewController *presenter, void (^completion)(BOOL ready))
+{
+    g_settings_manual_exploit_running = YES;
+    LogViewController *log = [[LogViewController alloc] init];
+    log.title = @"Run Exploit";
+    UINavigationController *lnav = [[UINavigationController alloc] initWithRootViewController:log];
+    __weak UINavigationController *weakNav = lnav;
+    log.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc]
+        initWithBarButtonSystemItem:UIBarButtonSystemItemDone
+                      primaryAction:[UIAction actionWithHandler:^(UIAction *a) {
+        [weakNav.presentingViewController dismissViewControllerAnimated:YES completion:nil];
+    }]];
+    [presenter presentViewController:lnav animated:YES completion:^{
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            BOOL ready = NO;
+            if (settings_try_claim_actions_lock("Run Exploit",
+                                                "[KRW] Another action is already running; try again when it has finished.")) {
+                @try {
+                    log_user("[KRW] Getting kernel access (no tweaks are applied)…\n");
+                    ready = settings_ensure_kexploit_for_read();
+                    if (!ready) ready = settings_ensure_kexploit();
+                    ready = ready && kexploit_krw_ready();
+                    log_user(ready ? "[OK] Kernel access is ready. The tools can use it now.\n"
+                                   : "[WARN] Kernel access could not be acquired. See the log above.\n");
+                } @finally {
+                    settings_release_actions_lock();
+                }
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                g_settings_manual_exploit_running = NO;
+                UINavigationController *nav = weakNav;
+                if (ready && nav.presentingViewController) {
+                    [nav.presentingViewController dismissViewControllerAnimated:YES completion:^{
+                        if (completion) completion(YES);
+                    }];
+                    return;
+                }
+                if (completion) completion(ready);
+            });
+        });
+    }];
+}
+
+void settings_run_exploit_with_log(UIViewController *presenter, void (^completion)(BOOL ready))
+{
+    if (!presenter.view.window || presenter.presentedViewController) return;
+    if (!settings_device_supported()) {
+        settings_simple_alert(presenter, @"Not Supported", settings_unsupported_message());
+        return;
+    }
+    if (g_settings_manual_exploit_running || settings_run_in_flight()) {
+        settings_simple_alert(presenter, @"Already Running",
+                              @"Another run is in progress. Try again when it has finished.");
+        return;
+    }
+    if (g_kexploit_done && kexploit_krw_session_active()) {
+        if (completion) completion(YES);
+        return;
+    }
+    if (krw_persistence_has_saved_recovery()) {   // restoring a parked session is safe
+        settings_run_exploit_with_log_confirmed(presenter, completion);
+        return;
+    }
+    NSString *message = settings_device_is_a18_above()
+        ? @"This gets kernel access without applying any tweaks, and shows the log while it runs.\n\n"
+          @"On A18 / M4 a run can reboot the device (about a 50/50 chance). If it does, just try again."
+        : @"This gets kernel access without applying any tweaks, and shows the log while it runs.";
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Run Exploit?" message:message
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
+        if (completion) completion(NO);
+    }]];
+    __weak UIViewController *weakPresenter = presenter;
+    [ac addAction:[UIAlertAction actionWithTitle:@"Run Exploit" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        UIViewController *p = weakPresenter;
+        if (p) settings_run_exploit_with_log_confirmed(p, completion);
+    }]];
+    [presenter presentViewController:ac animated:YES completion:nil];
+}
+
+BOOL settings_kernel_access_available(void)
+{
+    return settings_krw_available_without_exploit();
+}
+
+void settings_set_kernel_access_banner(UITableView *tableView, NSString *text, void (^onRun)(void))
+{
+    if (!text) {
+        if (tableView.tableHeaderView.tag == 0x4B52) tableView.tableHeaderView = nil;
+        return;
+    }
+    CGFloat w = MAX(CGRectGetWidth(tableView.bounds), 320.0);
+    UIView *wrap = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 10)];
+    wrap.tag = 0x4B52;
+
+    UIView *box = [[UIView alloc] init];
+    box.translatesAutoresizingMaskIntoConstraints = NO;
+    box.backgroundColor = [UIColor.systemBlueColor colorWithAlphaComponent:0.10];
+    box.layer.cornerRadius = 14.0;
+    box.layer.cornerCurve = kCACornerCurveContinuous;
+    [wrap addSubview:box];
+
+    UILabel *title = [[UILabel alloc] init];
+    title.text = @"Kernel Access Needed";
+    title.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
+    UILabel *body = [[UILabel alloc] init];
+    body.text = text;
+    body.numberOfLines = 0;
+    body.font = [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline];
+    body.textColor = UIColor.secondaryLabelColor;
+
+    UIButtonConfiguration *cfg = [UIButtonConfiguration filledButtonConfiguration];
+    cfg.title = @"Run Exploit…";
+    cfg.image = [UIImage systemImageNamed:@"bolt.fill"];
+    cfg.imagePadding = 6.0;
+    cfg.cornerStyle = UIButtonConfigurationCornerStyleMedium;
+    void (^run)(void) = [onRun copy];
+    UIButton *button = [UIButton buttonWithConfiguration:cfg primaryAction:[UIAction actionWithHandler:^(UIAction *a) {
+        if (run) run();
+    }]];
+
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[ title, body, button ]];
+    stack.axis = UILayoutConstraintAxisVertical;
+    stack.alignment = UIStackViewAlignmentLeading;
+    stack.spacing = 8.0;
+    [stack setCustomSpacing:12.0 afterView:body];
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    [box addSubview:stack];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [box.leadingAnchor constraintEqualToAnchor:wrap.leadingAnchor constant:16.0],
+        [box.trailingAnchor constraintEqualToAnchor:wrap.trailingAnchor constant:-16.0],
+        [box.topAnchor constraintEqualToAnchor:wrap.topAnchor constant:8.0],
+        [box.bottomAnchor constraintEqualToAnchor:wrap.bottomAnchor constant:-8.0],
+        [stack.leadingAnchor constraintEqualToAnchor:box.leadingAnchor constant:16.0],
+        [stack.trailingAnchor constraintEqualToAnchor:box.trailingAnchor constant:-16.0],
+        [stack.topAnchor constraintEqualToAnchor:box.topAnchor constant:14.0],
+        [stack.bottomAnchor constraintEqualToAnchor:box.bottomAnchor constant:-14.0],
+    ]];
+    CGSize fit = [wrap systemLayoutSizeFittingSize:CGSizeMake(w, 0)
+                     withHorizontalFittingPriority:UILayoutPriorityRequired
+                           verticalFittingPriority:UILayoutPriorityFittingSizeLevel];
+    wrap.frame = CGRectMake(0, 0, w, fit.height);
+    tableView.tableHeaderView = wrap;
+}
+
 // Daemons screen: launchd's disabled.plist. Like the File Browser, only a
 // live or parked kernel session is used unless the user confirmed a full run.
 static BOOL settings_daemons_kernel_ready(BOOL allowFullExploit, NSString **message)
@@ -10206,6 +10367,8 @@ typedef NS_ENUM(NSInteger, PMSortKey) { PMSortPID = 0, PMSortCPU, PMSortMem, PMS
 @property (nonatomic, copy)   NSString *filter;
 @property (nonatomic, assign) BOOL krwReady;
 @property (nonatomic, assign) BOOL arming;
+// No live or parked kernel access: only a manual Run Exploit helps.
+@property (nonatomic, assign) BOOL exploitNeeded;
 // Round 8: routine foreground restore in flight (KRW detached, anchored in
 // launchd). Separate from arming so the viewer keeps its rows and the neutral
 // "Restoring kernel access…" prompt — "Arming kernel access…" is reserved for
@@ -10921,6 +11084,7 @@ static NSString *pm_chip_name(NSString *machine) {
         return;
     }
     self.krwReady = YES;
+    self.exploitNeeded = NO;
     if (self.killsInFlight > 0) {
         self.reloadPending = YES;   // runs when the last kill's verdict is in (pmKillEnded)
         [self.refreshControl endRefreshing];
@@ -11333,64 +11497,17 @@ static NSString *pm_chip_name(NSString *machine) {
                 // trigger; kills warm on demand only).
                 return;
             }
-            // No parked state to recover — a full exploit is the only way, and on
-            // A18/M4 that can reboot the device. Ask before doing it.
-            printf("[PROCMGR] arm: showing full-exploit alert (reason=%s)\n",
+            // No parked state to recover: only a full exploit run helps, and on
+            // A18/M4 that can reboot the device. Never start (or offer) it on
+            // open; the row says so and runs it, with the log, when tapped.
+            printf("[PROCMGR] arm: no kernel access (%s) — waiting for a manual Run Exploit\n",
                    krw_persistence_has_saved_recovery()
                        ? "parked state exists but restore failed after all retries"
                        : "no parked kernel state");
-            UIAlertController *ac = [UIAlertController
-                alertControllerWithTitle:@"No parked kernel state"
-                                 message:@"Kernel access couldn't be restored from a parked state. Running the full exploit can reboot the device on A18/M4. Continue?"
-                          preferredStyle:UIAlertControllerStyleAlert];
-            [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel
-                                                 handler:^(UIAlertAction *a) {
-                self.arming = NO;
-                self.silentRestoring = NO;
-                [self.tableView reloadData];
-            }]];
-            [ac addAction:[UIAlertAction actionWithTitle:@"Run Full Exploit"
-                                                   style:UIAlertActionStyleDefault
-                                                 handler:^(UIAlertAction *a) {
-                // Show the live log while the exploit runs, like a normal Run.
-                LogViewController *log = [[LogViewController alloc] init];
-                UINavigationController *lnav = [[UINavigationController alloc] initWithRootViewController:log];
-                [self presentViewController:lnav animated:YES completion:^{
-                    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                        BOOL ran = settings_ensure_kexploit();   // sets g_kexploit_done on success
-                        BOOL ready = ran && kexploit_krw_ready();
-                        dispatch_async(dispatch_get_main_queue(), ^{
-                            self.arming = NO;
-                            self.silentRestoring = NO;
-                            if (ready) {
-                                // Success: drop the user straight into the working
-                                // Process Viewer. Dismiss from the window root —
-                                // an equality check against lnav is too fragile
-                                // (anything chained on top of the log defeats it
-                                // and the log then stays up forever).
-                                printf("[PROCMGR] exploit succeeded from viewer prompt — "
-                                       "dismissing log, entering Process Viewer\n");
-                                UIViewController *root = self.view.window.rootViewController;
-                                if (root.presentedViewController) {
-                                    [root dismissViewControllerAnimated:YES completion:^{
-                                        [self reloadProcs];
-                                    }];
-                                } else {
-                                    [self reloadProcs];
-                                }
-                                // Round 8: no pre-warm after the exploit either —
-                                // first kill warms up lazily (churn reduction).
-                            } else {
-                                // Failure: keep the log up so the reason stays visible.
-                                printf("[PROCMGR] exploit from viewer prompt did not yield KRW — "
-                                       "leaving log on screen\n");
-                                [self.tableView reloadData];
-                            }
-                        });
-                    });
-                }];
-            }]];
-            [self presentViewController:ac animated:YES completion:nil];
+            self.arming = NO;
+            self.silentRestoring = NO;
+            self.exploitNeeded = YES;
+            [self.tableView reloadData];
         });
     });
 }
@@ -11418,6 +11535,12 @@ static NSString *pm_chip_name(NSString *machine) {
             [spin startAnimating];
             cell.accessoryView = spin;
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        } else if (self.exploitNeeded) {
+            cell.textLabel.text = @"Run Exploit";
+            cell.detailTextLabel.text = @"No saved kernel access. Tap to run the exploit; the log is shown while it runs.";
+            cell.detailTextLabel.numberOfLines = 0;
+            cell.textLabel.textColor = [UIColor systemBlueColor];
+            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
         } else {
             cell.textLabel.text = @"Arm Kernel Access";
             cell.detailTextLabel.text = @"Tap to restore kernel r/w (no tweaks re-applied).";
@@ -11522,7 +11645,17 @@ static NSString *pm_chip_name(NSString *machine) {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
 
     if (!self.krwReady) {
-        if (!self.arming) [self armKRW];
+        if (self.arming) return;
+        if (self.exploitNeeded) {
+            __weak typeof(self) weakSelf = self;
+            settings_run_exploit_with_log(self, ^(BOOL ready) {
+                if (!ready) return;
+                weakSelf.exploitNeeded = NO;
+                [weakSelf reloadProcs];
+            });
+            return;
+        }
+        [self armKRW];
         return;
     }
     if (indexPath.row >= (NSInteger)self.procs.count) return;

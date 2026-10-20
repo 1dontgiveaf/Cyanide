@@ -396,6 +396,12 @@ static const CGFloat kMargin = 20.0;
     UIStackView *s = [self vstackInCard:card spacing:12.0];
 
     [s addArrangedSubview:[self sectionHeader:@"Tools"]];
+    // Kernel access without applying tweaks; the tools never run it themselves.
+    [s addArrangedSubview:[self bigActionButton:@"Run Exploit"
+                                          sub:@"Kernel access for the tools, no tweaks applied"
+                                         icon:@"lock.open.fill"
+                                        color:UIColor.systemPurpleColor
+                                          sel:@selector(runExploit)]];
     [s addArrangedSubview:[self bigActionButton:@"Process Viewer"
                                           sub:@"See and quit running processes"
                                          icon:@"list.bullet.rectangle.fill"
@@ -746,6 +752,20 @@ static const CGFloat kMargin = 20.0;
             return;
         }
     }
+}
+
+- (void)runExploit
+{
+    __weak typeof(self) weakSelf = self;
+    settings_run_exploit_with_log(self, ^(BOOL ready) {
+        typeof(self) me = weakSelf;
+        if (!ready || !me || me.presentedViewController) return;
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Kernel Access Ready"
+            message:@"Process Viewer, File Browser, Daemons, Cleaner and System Info can use it now."
+            preferredStyle:UIAlertControllerStyleAlert];
+        [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [me presentViewController:ac animated:YES completion:nil];
+    });
 }
 
 - (void)openProcessViewer

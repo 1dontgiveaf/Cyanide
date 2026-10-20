@@ -2067,48 +2067,42 @@ static NSString *fb_related_title(FBAppContainer *c)
     [self unlockThenReloadAllowingFullExploit:NO];
 }
 
-// First try without a fresh exploit (live or parked kernel access). If only a
-// full run would do, ask -- it can reboot A18/M4 devices -- the same way the
-// Process Viewer does, and run it only on "Run Full Exploit".
+// Live or parked kernel access only. When just a full exploit run would do,
+// a banner offers it (with the log shown) -- it is never started or offered
+// by itself on open, since it can reboot A18/M4 devices.
 - (void)unlockThenReloadAllowingFullExploit:(BOOL)allowFullExploit
 {
+    (void)allowFullExploit;
     [self.refreshControl endRefreshing];
     if (self.unlocking) return;
     self.unlocking = YES;
     self.status = @"Lifting the filesystem sandbox through SpringBoard… (one time per app launch)";
     [self applyFilter];
     __weak typeof(self) weakSelf = self;
-    settings_unlock_filesystem_async(allowFullExploit, ^(BOOL ok, NSString *message) {
+    settings_unlock_filesystem_async(NO, ^(BOOL ok, NSString *message) {
         typeof(self) s = weakSelf;
         if (!s) return;
         s.unlocking = NO;
         if (ok) {
+            settings_set_kernel_access_banner(s.tableView, nil, nil);
             [s reload];
             return;
         }
-        s.status = message ?: @"Filesystem access is not available.";
+        BOOL needsRun = [message isEqualToString:kSettingsFullExploitRequiredMessage];
+        s.status = needsRun ? @"No kernel access yet." : (message ?: @"Filesystem access is not available.");
         [s applyFilter];
-        if (!allowFullExploit && [message isEqualToString:kSettingsFullExploitRequiredMessage] &&
-            !s.presentedViewController && s.view.window) {
-            [s confirmFullExploitForUnlock];
+        if (needsRun) {
+            settings_set_kernel_access_banner(s.tableView,
+                @"Browsing outside Cyanide's own folder needs kernel access, and there is no saved session. "
+                @"Run the exploit once; no tweaks are applied.", ^{
+                    typeof(self) me = weakSelf;
+                    if (!me) return;
+                    settings_run_exploit_with_log(me, ^(BOOL ready) {
+                        if (ready) [weakSelf unlockThenReloadAllowingFullExploit:NO];
+                    });
+                });
         }
     });
-}
-
-- (void)confirmFullExploitForUnlock
-{
-    UIAlertController *ac = [UIAlertController
-        alertControllerWithTitle:@"No parked kernel state"
-                         message:@"The File Browser needs kernel access, and there is no saved session to reuse. Running the full exploit can reboot the device on A18/M4. Continue?"
-                  preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    __weak typeof(self) weakSelf = self;
-    [ac addAction:[UIAlertAction actionWithTitle:@"Run Full Exploit"
-                                           style:UIAlertActionStyleDefault
-                                         handler:^(UIAlertAction *a) {
-        [weakSelf unlockThenReloadAllowingFullExploit:YES];
-    }]];
-    [self presentViewController:ac animated:YES completion:nil];
 }
 
 - (void)applyFilter
