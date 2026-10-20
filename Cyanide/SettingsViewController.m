@@ -3549,6 +3549,17 @@ static BOOL settings_device_is_a18_above(void)
     return result;
 }
 
+// The tools may run the exploit by themselves only where a run can't reboot
+// the device. On A18/M4 (about a 50/50 panic chance) the user starts it with
+// Run Exploit, which shows the log.
+static BOOL settings_tool_may_run_exploit(BOOL userAsked)
+{
+    if (userAsked) return YES;
+    if (settings_device_is_a18_above()) return NO;
+    log_user("[KRW] No saved kernel access; running the exploit (no tweaks are applied)…\n");
+    return YES;
+}
+
 BOOL settings_device_is_a18_family(void)
 {
     return settings_device_is_a18_above();
@@ -7334,7 +7345,7 @@ void settings_unlock_filesystem_async(BOOL allowFullExploit,
             // Live or parked kernel access only, unless the user confirmed a
             // full run: opening a browser must not reboot an A18 device unasked.
             BOOL kernelReady = settings_ensure_kexploit_for_read();
-            if (!kernelReady && !allowFullExploit) {
+            if (!kernelReady && !settings_tool_may_run_exploit(allowFullExploit)) {
                 message = kSettingsFullExploitRequiredMessage;
                 return;
             }
@@ -7439,14 +7450,14 @@ void settings_run_exploit_with_log(UIViewController *presenter, void (^completio
         if (completion) completion(YES);
         return;
     }
-    if (krw_persistence_has_saved_recovery()) {   // restoring a parked session is safe
+    if (krw_persistence_has_saved_recovery() || !settings_device_is_a18_above()) {
+        // Restoring a parked session, or a run that can't reboot this device.
         settings_run_exploit_with_log_confirmed(presenter, completion);
         return;
     }
-    NSString *message = settings_device_is_a18_above()
-        ? @"This gets kernel access without applying any tweaks, and shows the log while it runs.\n\n"
-          @"On A18 / M4 a run can reboot the device (about a 50/50 chance). If it does, just try again."
-        : @"This gets kernel access without applying any tweaks, and shows the log while it runs.";
+    NSString *message = @"This gets kernel access without applying any tweaks, and shows the log while it runs. "
+                        @"It can take a while.\n\n"
+                        @"On A18 / M4 a run can reboot the device (about a 50/50 chance). If it does, just try again.";
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Run Exploit?" message:message
                                                          preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
@@ -7531,7 +7542,7 @@ void settings_set_kernel_access_banner(UITableView *tableView, NSString *text, v
 static BOOL settings_daemons_kernel_ready(BOOL allowFullExploit, NSString **message)
 {
     if (settings_ensure_kexploit_for_read()) return YES;
-    if (!allowFullExploit) { *message = kSettingsFullExploitRequiredMessage; return NO; }
+    if (!settings_tool_may_run_exploit(allowFullExploit)) { *message = kSettingsFullExploitRequiredMessage; return NO; }
     if (settings_ensure_kexploit()) return YES;
     *message = @"Kernel access could not be acquired. Run the chain, then try again.";
     return NO;
@@ -11482,6 +11493,17 @@ static NSString *pm_chip_name(NSString *machine) {
             [NSThread sleepForTimeInterval:2.0];
             ok = settings_ensure_kexploit_for_read() || kexploit_krw_ready();
         }
+        // Where a run can't reboot the device, just run it (A18/M4: the row
+        // offers Run Exploit with the log instead).
+        if (!ok && settings_tool_may_run_exploit(NO) &&
+            settings_try_claim_actions_lock("Process Viewer exploit",
+                                            "[PROCMGR] Another action is running; try again when it has finished.")) {
+            @try {
+                ok = settings_ensure_kexploit() && kexploit_krw_ready();
+            } @finally {
+                settings_release_actions_lock();
+            }
+        }
         dispatch_async(dispatch_get_main_queue(), ^{
             // Peek, don't kexploit_krw_ready(): this is the main thread, and
             // ready() can block on krwReattachLock behind a background recovery
@@ -11528,7 +11550,7 @@ static NSString *pm_chip_name(NSString *machine) {
         cell.accessoryView = nil;
         if (self.arming) {
             cell.textLabel.text = @"Arming kernel access…";
-            cell.detailTextLabel.text = @"Restoring the parked primitive.";
+            cell.detailTextLabel.text = @"This can take a few seconds.";
             cell.textLabel.textColor = [UIColor labelColor];
             UIActivityIndicatorView *spin = [[UIActivityIndicatorView alloc]
                 initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
