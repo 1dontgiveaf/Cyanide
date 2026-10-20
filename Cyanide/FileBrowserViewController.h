@@ -13,6 +13,12 @@
 
 // Whether the user has enabled changes (lock button) for this app launch.
 BOOL filebrowser_write_enabled(void);
+// Share sheet (AirDrop, Mail, Files …) for a COPY of a file in a per-share
+// temp folder, never the original. `preloaded` shares those bytes instead of
+// reading `path`. `source` anchors the popover (bar item or view). Up to 64 MB.
+// `finished` runs on main once the copy is ready or failed.
+void filebrowser_share_file(UIViewController *presenter, NSString *path, BOOL viaRoot, NSData *preloaded,
+                            id source, void (^finished)(void));
 // Call after any accepted change on disk, so open folders refresh.
 void filebrowser_note_filesystem_changed(void);
 // Serial queue for every file change (saves included), in request order.

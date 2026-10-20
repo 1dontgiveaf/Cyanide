@@ -516,6 +516,23 @@ static const NSUInteger kPLMaxDataEditBytes = 64 * 1024;
         [items addObject:[[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"plus"]
                                                            menu:[UIMenu menuWithChildren:menu]]];
     }
+    // Share the file as saved (a file read as root: the bytes as loaded).
+    // Not while there are unsaved changes: they wouldn't be in the copy.
+    if (self.isRoot && !self.doc.dirty && !self.tableView.editing) {
+        __weak typeof(self) weakSelf = self;
+        UIBarButtonItem *share = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAction
+                                                                        primaryAction:nil];
+        __weak UIBarButtonItem *weakShare = share;
+        share.primaryAction = [UIAction actionWithHandler:^(UIAction *a) {
+            typeof(self) me = weakSelf;
+            if (!me) return;
+            weakShare.enabled = NO;
+            filebrowser_share_file(me, me.doc.path, NO, me.doc.readOnly ? me.doc.original : nil, weakShare, ^{
+                weakShare.enabled = YES;
+            });
+        }];
+        [items addObject:share];
+    }
     self.navigationItem.rightBarButtonItems = items;
     // At the root, unsaved changes need an explicit Save or Revert: leaving
     // would otherwise silently drop them.

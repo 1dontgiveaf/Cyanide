@@ -1386,20 +1386,20 @@ static NSUInteger fb_hex_line_chars(NSUInteger digits, NSUInteger per)
 // the launchd warm-up and transfer up to 64 MB.
 static const NSUInteger kFBMaxShareBytes = 64 * 1024 * 1024;
 
-- (void)shareCopy:(UIBarButtonItem *)sender
+void filebrowser_share_file(UIViewController *presenter, NSString *path, BOOL viaRoot, NSData *preloaded,
+                            id source, void (^finished)(void))
 {
-    if (self.sharing) return;
-    self.sharing = YES;
-    sender.enabled = NO;
     NSString *dir = [[NSTemporaryDirectory() stringByAppendingPathComponent:@"FileBrowserShare"]
                      stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
-    NSString *copy = [dir stringByAppendingPathComponent:self.entry.name];
-    NSString *path = self.entry.path;
-    BOOL viaRoot = self.entry.viaRoot;
+    NSString *copy = [dir stringByAppendingPathComponent:path.lastPathComponent];
+    void (^end)(void) = [finished copy];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSString *failure = nil;
         [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-        if (viaRoot) {
+        if (preloaded) {
+            if (preloaded.length > kFBMaxShareBytes) failure = @"The file is larger than 64 MB. Sharing files that large is not supported.";
+            else if (![preloaded writeToFile:copy atomically:YES]) failure = @"The copy could not be written.";
+        } else if (viaRoot) {
             NSString *rootErr = nil;
             BOOL truncated = NO;
             NSData *full = settings_root_read_file(path, kFBMaxShareBytes, &truncated, &rootErr);
@@ -1452,15 +1452,14 @@ static const NSUInteger kFBMaxShareBytes = 64 * 1024 * 1024;
             if (out >= 0) close(out);
         }
         dispatch_async(dispatch_get_main_queue(), ^{
-            self.sharing = NO;
-            sender.enabled = YES;
-            if (!self.view.window) {   // left the screen meanwhile
+            if (end) end();
+            if (!presenter.view.window) {   // left the screen meanwhile
                 [NSFileManager.defaultManager removeItemAtPath:dir error:nil];
                 return;
             }
             if (failure) {
                 [NSFileManager.defaultManager removeItemAtPath:dir error:nil];
-                fb_alert(self, @"Couldn't Share", failure);
+                fb_alert(presenter, @"Couldn't Share", failure);
                 return;
             }
             UIActivityViewController *avc =
@@ -1469,9 +1468,29 @@ static const NSUInteger kFBMaxShareBytes = 64 * 1024 * 1024;
             avc.completionWithItemsHandler = ^(UIActivityType type, BOOL completed, NSArray *items, NSError *err) {
                 [NSFileManager.defaultManager removeItemAtPath:dir error:nil];
             };
-            avc.popoverPresentationController.barButtonItem = sender;
-            [self presentViewController:avc animated:YES completion:nil];
+            UIPopoverPresentationController *pop = avc.popoverPresentationController;
+            if ([source isKindOfClass:UIBarButtonItem.class]) pop.barButtonItem = source;
+            else if ([source isKindOfClass:UIView.class]) {
+                pop.sourceView = source;
+                pop.sourceRect = [(UIView *)source bounds];
+            } else {
+                pop.sourceView = presenter.view;
+                pop.sourceRect = CGRectMake(CGRectGetMidX(presenter.view.bounds), CGRectGetMidY(presenter.view.bounds), 1, 1);
+            }
+            [presenter presentViewController:avc animated:YES completion:nil];
         });
+    });
+}
+
+- (void)shareCopy:(UIBarButtonItem *)sender
+{
+    if (self.sharing) return;
+    self.sharing = YES;
+    sender.enabled = NO;
+    __weak typeof(self) weakSelf = self;
+    filebrowser_share_file(self, self.entry.path, self.entry.viaRoot, nil, sender, ^{
+        weakSelf.sharing = NO;
+        sender.enabled = YES;
     });
 }
 
@@ -2318,7 +2337,15 @@ static NSString *fb_related_title(FBAppContainer *c)
             [self.navigationController pushViewController:vc animated:YES];
         }];
         NSMutableArray<UIMenuElement *> *items = [NSMutableArray arrayWithObject:copy];
-        if (!e.isDirectory) [items addObject:info];
+        if (!e.isDirectory) {
+            [items addObject:info];
+            // AirDrop, Mail, Save to Files … a copy, never the original.
+            [items addObject:[UIAction actionWithTitle:@"Share…" image:[UIImage systemImageNamed:@"square.and.arrow.up"]
+                                            identifier:nil handler:^(UIAction *a) {
+                UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
+                filebrowser_share_file(self, e.path, e.viaRoot, nil, cell, nil);
+            }]];
+        }
         FBAppContainer *c = e.container;
         if (c) {
             NSString *relatedTitle = fb_related_title(c);
