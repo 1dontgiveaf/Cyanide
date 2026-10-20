@@ -31,6 +31,10 @@ A Cache Cleaner, accurate icon resizing, a cleaner respring screen, plus steadie
 - **Icon scale (Home Layout Extras)** now starts from your device's real icon size. Before, it assumed 60 pt icons drawn at 2x. On iPhones with 64 pt icons, the percentage therefore shrank icons more than set, and icons came out slightly blurry on 3x screens. Clock and Calendar now match the other icons too.
 - **Location Services toggle:** returning to the app you ran it from also works when Cyanide comes to the foreground in between.
 
+## Removed
+
+- **Auto-Upload Logs** in Settings. Logs stay on your device; use **Share Log** to send one.
+
 ## Good to know
 
 > [!CAUTION]
