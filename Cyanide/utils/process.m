@@ -208,11 +208,11 @@ int procmgr_identity_for_pid(int pid, char *buf, size_t len, uint64_t *kprocOut)
 // Returns the proc's p_stat (PM_SRUN, PM_SSTOP, PM_SZOMB, ...) via libproc,
 // or -1 when proc_pidinfo can't inspect the pid. Read-only, never crashes.
 int procmgr_pstat(int pid) {
-    // The libproc proc_pidinfo syscall is the path implicated by the
-    // 2026-10-20 panic. Only our own pid is safe to inspect here; callers
-    // looking at another process should use procmgr_pstat_krw / row_info.
-    if (pid != (int)getpid()) return -1;
-    return procmgr_pstat_krw(pid);
+    struct pm_proc_bsdinfo bi;
+    memset(&bi, 0, sizeof(bi));
+    int rc = proc_pidinfo(pid, PM_PROC_PIDTBSDINFO, 0, &bi, (int)sizeof(bi));
+    if (rc < 8) return -1;  // needs at least pbi_flags + pbi_status
+    return (int)bi.pbi_status;
 }
 
 // Same p_stat (PM_SRUN, PM_SSTOP, PM_SZOMB, ...) but read straight out of
@@ -387,11 +387,10 @@ static uint32_t g_pm_off_task_suspcount = 0;
 static int      g_pm_suspcount_attempts = 0;
 #define PM_SUSPCOUNT_MAX_ATTEMPTS 5   // then give up for the session (log-quiet)
 
-// Own-thread count via Mach, not proc_pidinfo. On iOS 18.5/T8140 the
-// proc_pidinfo copy path can reach zalloc_validate with a per-CPU allocation
-// and panic (panic-full-2026-10-20-130110); Cleaner's scan called this during
-// suspend_count calibration. task_threads is a normal Mach trap and does not
-// use the proc-info copyout path.
+// Own-thread count via Mach. Kept independent of proc_pidinfo: task_threads
+// is a normal Mach trap and avoids an unnecessary libproc syscall during
+// Cleaner's suspend_count calibration. (The 2026-10-20 panic itself was a
+// getsockopt KRW read, not proc_pidinfo.)
 static bool pm_taskinfo_threadnum(uint32_t *out) {
     thread_act_array_t threads = NULL;
     mach_msg_type_number_t count = 0;
@@ -1347,17 +1346,13 @@ static uint64_t procmgr_own_footprint(void) {
 static uint64_t pm_abs_to_ns(uint64_t abs);   // fwd — defined just below
 
 static void procmgr_own_cpu_ns(uint64_t *u, uint64_t *s) {
-    // Own-task CPU via Mach, not proc_pidinfo. task_info returns time_value_t
-    // (seconds + microseconds); convert to nanoseconds for the calibration
-    // comparisons.
-    struct task_basic_info ti;
-    mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
-    if (task_info(mach_task_self(), TASK_BASIC_INFO,
-                  (task_info_t)&ti, &count) == KERN_SUCCESS) {
-        *u = (uint64_t)ti.user_time.seconds * 1000000000ULL +
-             (uint64_t)ti.user_time.microseconds * 1000ULL;
-        *s = (uint64_t)ti.system_time.seconds * 1000000000ULL +
-             (uint64_t)ti.system_time.microseconds * 1000ULL;
+    struct pm_proc_taskinfo ti;
+    if (proc_pidinfo(getpid(), PM_PROC_PIDTASKINFO, 0, &ti, sizeof(ti)) >= (int)sizeof(ti)) {
+        // pti_total_user/system are MACH ABSOLUTE TICKS, not nanoseconds
+        // (native timebase units; equal to ns only on Intel where the
+        // timebase ratio is 1). Convert before mixing with ns values.
+        *u = pm_abs_to_ns(ti.pti_total_user);
+        *s = pm_abs_to_ns(ti.pti_total_system);
     } else { *u = 0; *s = 0; }
 }
 
@@ -2753,12 +2748,11 @@ int procmgr_calibrate_suspend_count(void) {
 }
 
 static int procmgr_stats_locked(int pid, uint64_t *residentBytes, uint64_t *cpuNs) {
-    // Do not use proc_pidinfo here. On iOS 18.5/T8140 its copy path can panic
-    // in zalloc_validate with a per-CPU allocation (panic 2026-10-20-130110).
-    // The kernel reads below are the complete source when calibrated; when
-    // they are not, report no stats rather than entering the syscall.
-    uint64_t mem = 0;
-    uint64_t cpu = 0;
+    // libproc first — always works for our own pid (and others when permitted).
+    struct pm_proc_taskinfo ti;
+    bool havePI = proc_pidinfo(pid, PM_PROC_PIDTASKINFO, 0, &ti, sizeof(ti)) >= (int)sizeof(ti);
+    uint64_t mem = havePI ? ti.pti_resident_size : 0;
+    uint64_t cpu = havePI ? pm_abs_to_ns(ti.pti_total_user + ti.pti_total_system) : 0;   // ticks → ns
 
     // Kernel reads (any pid) once calibrated — read-only, no privilege
     // needed. pm_kernel_stats double-reads every counter and only reports
@@ -2888,13 +2882,17 @@ static bool procmgr_row_info_locked(uint64_t kproc, int pid, procmgr_row_info_t 
 
     if (!valid || exiting) return valid;
 
-    // No proc_pidinfo fallback: this is the per-row syscall that reached the
-    // zalloc per-CPU check on iOS 18.5/T8140. Use only the KRW values already
-    // read above; if calibration is unavailable, leave stats empty.
-    uint64_t mem = 0;
-    uint64_t cpu = 0;
+    // libproc first (our own pid, or others when permitted), kernel values
+    // override — same precedence as procmgr_stats.
+    struct pm_proc_taskinfo ti;
+    bool havePI = proc_pidinfo(pid, PM_PROC_PIDTASKINFO, 0, &ti, sizeof(ti)) >= (int)sizeof(ti);
+    uint64_t mem = havePI ? ti.pti_resident_size : 0;
+    uint64_t cpu = havePI ? pm_abs_to_ns(ti.pti_total_user + ti.pti_total_system) : 0;   // ticks → ns
     if (kv & 1) mem = kMem;
     if ((kv & 2) && kCpu) cpu = kCpu;
+    // A failed CPU read leaves cpu 0 (libproc is sandboxed for other pids).
+    // It must not become the %CPU baseline: the next good read would turn the
+    // process's whole lifetime CPU into one refresh interval (the 800% rows).
     out->have_cpu = cpu != 0;
     if (mem || cpu) {
         out->have_stats = true;
