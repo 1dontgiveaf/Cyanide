@@ -748,7 +748,7 @@ static BOOL cleaner_intro_accepted(void)
 - (instancetype)init
 {
     self = [super initWithStyle:UITableViewStyleInsetGrouped];
-    if (self) self.title = @"Cleaner";
+    if (self) self.title = @"Cache Cleaner";
     return self;
 }
 
@@ -813,7 +813,7 @@ static BOOL cleaner_intro_accepted(void)
     if (cleaner_intro_accepted() || self.presentedViewController) return;
     UIAlertController *ac = [UIAlertController
         alertControllerWithTitle:@"Before You Clean"
-                         message:@"Cleaner removes the contents of each app's Library/Caches and tmp folders, plus optional CrashReporter logs. "
+                         message:@"Cache Cleaner removes the contents of each app's Library/Caches and tmp folders, plus optional CrashReporter logs. "
                                  @"Documents, settings, logins and other app data are not touched. Active apps are checked again before each folder. "
                                  @"Detection is best-effort; close apps before cleaning.\n\n"
                                  @"What can happen:\n"
@@ -1136,7 +1136,7 @@ static BOOL cleaner_intro_accepted(void)
         [self.tableView reloadData];
         [self updateControls];
         if (needsFullRun) {
-            settings_tool_needs_exploit(self, self.tableView, @"Cleaner", ^{
+            settings_tool_needs_exploit(self, self.tableView, @"Cache Cleaner", ^{
                 [weakSelf ensureAccessAllowingFullExploit:NO];
             });
         }
@@ -1425,7 +1425,7 @@ static BOOL cleaner_intro_accepted(void)
     if (appCount > 0 && !self.processListAvailable) {
         UIAlertController *alert = [UIAlertController
             alertControllerWithTitle:@"Kernel Access Needed"
-                             message:@"Cleaner cannot tell which apps are active without kernel access. Run the chain once, then try again."
+                             message:@"Cache Cleaner cannot tell which apps are active without kernel access. Run the chain once, then try again."
                       preferredStyle:UIAlertControllerStyleAlert];
         [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:alert animated:YES completion:nil];
@@ -1800,7 +1800,7 @@ static BOOL cleaner_intro_accepted(void)
     [cell.spinner stopAnimating];
     cell.bar.progressTintColor = UIColor.systemBlueColor;
     if (!self.accessReady) {
-        cell.captionLabel.text = @"Cleaner";
+        cell.captionLabel.text = @"Cache Cleaner";
         cell.totalLabel.text = @"—";
         cell.bar.progress = 0;
         cell.statusLabel.text = self.accessMessage ?: (cleaner_intro_accepted() ? @"Filesystem access is not available."

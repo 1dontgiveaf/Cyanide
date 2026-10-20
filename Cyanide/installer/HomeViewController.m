@@ -454,7 +454,7 @@ static const CGFloat kMargin = 20.0;
                                          icon:@"gearshape.2.fill"
                                         color:UIColor.systemTealColor
                                           sel:@selector(openDaemons)]];
-    [s addArrangedSubview:[self bigActionButton:@"Cleaner"
+    [s addArrangedSubview:[self bigActionButton:@"Cache Cleaner"
                                           sub:@"Free space from app caches"
                                          icon:@"trash.fill"
                                         color:UIColor.systemCyanColor
@@ -810,7 +810,7 @@ static const CGFloat kMargin = 20.0;
         [me updateKernelAccessRow];
         if (!ready || !me || me.presentedViewController) return;
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Kernel Access Ready"
-            message:@"Process Viewer, File Browser, Daemons, Cleaner and System Info can use it now."
+            message:@"Process Viewer, File Browser, Daemons, Cache Cleaner and System Info can use it now."
             preferredStyle:UIAlertControllerStyleAlert];
         [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
         [me presentViewController:ac animated:YES completion:nil];
