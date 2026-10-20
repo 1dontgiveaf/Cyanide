@@ -37,6 +37,10 @@ BOOL fb_is_container_parent(NSString *dir);
 // The container `path` is or lies inside, nil if none. viaRoot: read its
 // metadata through launchd when mobile can't. Cached; blocking.
 FBAppContainer *fb_container_for_path(NSString *path, BOOL viaRoot);
+// Re-read the container metadata and associated app Info.plist for a safety
+// decision. This never decodes icons and returns nil on a missing/mismatched
+// bundle association or executable.
+FBAppContainer *fb_current_container_for_path(NSString *path, BOOL viaRoot);
 // The app's other container: data for a bundle container and vice versa
 // (also the app's data container for an extension). Blocking.
 FBAppContainer *fb_related_container(FBAppContainer *container);

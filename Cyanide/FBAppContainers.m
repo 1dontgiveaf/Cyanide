@@ -137,6 +137,22 @@ static FBAppRecord *fb_app_record_for_app(NSString *appPath, NSString *container
     return app;
 }
 
+// Safety callers must not use a cached executable or accept an Info.plist
+// from a different bundle. This deliberately does not load an icon: Cleaner
+// already has the display icon from its ordinary container cache.
+static BOOL fb_current_bundle_metadata_matches(NSString *expectedIdentifier,
+                                                NSDictionary *info,
+                                                NSString **executableOut)
+{
+    NSString *identifier = info[@"CFBundleIdentifier"];
+    NSString *executable = info[@"CFBundleExecutable"];
+    if (![expectedIdentifier isKindOfClass:NSString.class] || !expectedIdentifier.length ||
+        ![identifier isKindOfClass:NSString.class] || ![identifier isEqualToString:expectedIdentifier] ||
+        ![executable isKindOfClass:NSString.class] || !executable.length) return NO;
+    if (executableOut) *executableOut = executable;
+    return YES;
+}
+
 static NSString *fb_app_in_container(NSString *container)
 {
     for (NSString *item in [NSFileManager.defaultManager contentsOfDirectoryAtPath:container error:nil])
@@ -179,6 +195,40 @@ static NSDictionary<NSString *, FBAppRecord *> *fb_apps_index(void)
             return g_apps;
         }
     }
+}
+
+static FBAppRecord *fb_current_app_record_for_identifier(NSString *identifier)
+{
+    if (![identifier isKindOfClass:NSString.class] || !identifier.length) return nil;
+
+    // The cached path is only a lookup hint. Re-read its Info.plist and
+    // require the bundle identifier to still match before trusting it.
+    FBAppRecord *cached = fb_apps_index()[identifier];
+    if (cached) {
+        NSString *freshIdentifier = nil;
+        FBAppRecord *fresh = fb_app_record_for_app(cached.appPath, cached.bundleContainer, &freshIdentifier);
+        if (fresh && [freshIdentifier isEqualToString:identifier]) return fresh;
+    }
+
+    // A newly installed/replaced app may not be represented by the old index.
+    // This fallback reads metadata only; it intentionally does not decode any
+    // icons while refreshing a Cleaner safety decision.
+    NSFileManager *fm = NSFileManager.defaultManager;
+    for (NSString *uuid in [fm contentsOfDirectoryAtPath:kBundleParent error:nil]) {
+        NSString *container = [kBundleParent stringByAppendingPathComponent:uuid];
+        NSString *appPath = fb_app_in_container(container);
+        NSString *freshIdentifier = nil;
+        FBAppRecord *fresh = appPath ? fb_app_record_for_app(appPath, container, &freshIdentifier) : nil;
+        if (fresh && [freshIdentifier isEqualToString:identifier]) return fresh;
+    }
+    for (NSString *item in [fm contentsOfDirectoryAtPath:@"/Applications" error:nil]) {
+        if (![item.pathExtension isEqualToString:@".app"]) continue;
+        NSString *freshIdentifier = nil;
+        FBAppRecord *fresh = fb_app_record_for_app([@"/Applications" stringByAppendingPathComponent:item], nil,
+                                                    &freshIdentifier);
+        if (fresh && [freshIdentifier isEqualToString:identifier]) return fresh;
+    }
+    return nil;
 }
 
 // Round 53: the decode/render runs OUTSIDE the lock; only the cache
@@ -295,6 +345,66 @@ FBAppContainer *fb_container_for_path(NSString *path, BOOL viaRoot)
                 return c;
             }
         }
+    }
+    return nil;
+}
+
+static FBAppContainer *fb_make_current_container(NSString *dir, FBContainerKind kind, BOOL viaRoot)
+{
+    NSDictionary *meta = fb_read_plist([dir stringByAppendingPathComponent:kMetadataName], viaRoot);
+    NSString *identifier = meta[@"MCMMetadataIdentifier"];
+    if (![identifier isKindOfClass:NSString.class] || !identifier.length) return nil;
+
+    FBAppRecord *app = nil;
+    if (kind == FBContainerKindBundle) {
+        NSString *appPath = fb_app_in_container(dir);
+        if (!appPath) return nil;
+        NSDictionary *info = fb_read_plist([appPath stringByAppendingPathComponent:@"Info.plist"], viaRoot);
+        NSString *executable = nil;
+        if (!fb_current_bundle_metadata_matches(identifier, info, &executable)) return nil;
+        NSString *freshIdentifier = nil;
+        app = fb_app_record_for_app(appPath, dir, &freshIdentifier);
+        if (!app || ![freshIdentifier isEqualToString:identifier]) return nil;
+    } else if (kind == FBContainerKindData) {
+        app = fb_current_app_record_for_identifier(identifier);
+        if (!app) return nil;
+        NSDictionary *info = fb_read_plist([app.appPath stringByAppendingPathComponent:@"Info.plist"], viaRoot);
+        NSString *executable = nil;
+        if (!fb_current_bundle_metadata_matches(identifier, info, &executable)) return nil;
+    } else if (kind == FBContainerKindPlugin) {
+        NSString *owner = fb_owner_app_id(identifier);
+        app = owner ? fb_current_app_record_for_identifier(owner) : nil;
+    }
+
+    FBAppContainer *c = [FBAppContainer new];
+    c.kind = kind;
+    c.path = dir;
+    c.identifier = identifier;
+    c.viaRoot = viaRoot;
+    c.icon = nil; // callers retain the ordinary cached icon; no rescan here
+    if (app && (kind == FBContainerKindBundle || kind == FBContainerKindData || kind == FBContainerKindPlugin)) {
+        c.displayName = app.name;
+        if (kind != FBContainerKindPlugin) {
+            c.executableName = app.executable;
+            c.systemApp = app.bundleContainer == nil;
+        }
+    } else {
+        c.displayName = identifier;
+    }
+    return c;
+}
+
+FBAppContainer *fb_current_container_for_path(NSString *path, BOOL viaRoot)
+{
+    NSString *p = fb_canonical_path(path);
+    NSArray<NSString *> *parents = fb_container_parents();
+    for (NSUInteger i = 0; i < parents.count; i++) {
+        NSString *parent = [parents[i] stringByAppendingString:@"/"];
+        if (![p hasPrefix:parent]) continue;
+        NSString *uuid = [p substringFromIndex:parent.length].pathComponents.firstObject;
+        if (!uuid.length) return nil;
+        NSString *dir = [parents[i] stringByAppendingPathComponent:uuid];
+        return fb_make_current_container(dir, (FBContainerKind)i, viaRoot);
     }
     return nil;
 }
