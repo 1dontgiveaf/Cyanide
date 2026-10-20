@@ -1470,7 +1470,7 @@ static BOOL cleaner_intro_accepted(void)
         @autoreleasepool {
             CYCleanerTraversal traversal = cleaner_traversal(kCleanerMaxCleanSeconds, &cancelled);
             BOOL processUnavailable = NO;
-            NSUInteger cleanedApps = 0, skippedActive = 0, failedItems = 0, done = 0;
+            NSUInteger cleanedApps = 0, skippedActive = 0, skippedChanged = 0, failedItems = 0, done = 0;
             BOOL cleanedLogs = NO;
             unsigned long long freed = 0;
 
@@ -1491,11 +1491,17 @@ static BOOL cleaner_intro_accepted(void)
                 int trustedContainerFD = -1;
                 dev_t trustedContainerDevice = 0;
                 if (!isLogs) {
+                    // Round 54: a container that can no longer be re-verified
+                    // (uninstalled or replaced since the scan) skips THIS app
+                    // only. The pass continues; processUnavailable stays
+                    // reserved for a genuine process-list outage, which is the
+                    // only fail-closed stop that justifies aborting everything.
                     FBAppContainer *current = fb_current_container_for_path(item.container.path, NO);
                     if (!current || current.kind != FBContainerKindData || current.executableName.length == 0 ||
                         !item.hasContainerIdentity) {
-                        processUnavailable = YES;
                         item.incomplete = YES;
+                        skippedChanged++;
+                        skipApp = YES;
                     } else {
                         // Open and verify the path once, then keep this
                         // descriptor as the trusted parent for both roots.
@@ -1506,18 +1512,16 @@ static BOOL cleaner_intro_accepted(void)
                                                                 item.containerInode)) {
                             if (trustedContainerFD >= 0) close(trustedContainerFD);
                             trustedContainerFD = -1;
-                            processUnavailable = YES;
                             item.incomplete = YES;
+                            skippedChanged++;
+                            skipApp = YES;
                         } else {
                             item.container = current;
                             trustedContainerDevice = currentStat.st_dev;
                         }
                     }
                     NSSet<NSString *> *activeNames = settings_active_process_names();
-                    if (processUnavailable) {
-                        // A metadata or identity refresh failure is a hard
-                        // stop; do not consult stale executable state.
-                    } else if (!activeNames || item.container.executableName.length == 0) {
+                    if (!activeNames || item.container.executableName.length == 0) {
                         processUnavailable = YES;
                     } else if (cleaner_process_is_active(item.container.executableName, activeNames)) {
                         item.active = YES;
@@ -1559,7 +1563,7 @@ static BOOL cleaner_intro_accepted(void)
                     }
                     item.cacheBytes = remaining;
                     item.incomplete = !complete;
-                } else {
+                } else if (trustedContainerFD >= 0) {
                     // Shared traversal: rescans draw from the same 60 s budget
                     // as the deletions instead of starting fresh 15 s clocks.
                     BOOL complete = NO;
@@ -1570,6 +1574,11 @@ static BOOL cleaner_intro_accepted(void)
                     item.tempBytes = cleaner_tree_bytes_at(trustedContainerFD, @"tmp",
                                                            trustedContainerDevice, &complete, &traversal);
                     item.incomplete = item.incomplete || !complete;
+                } else {
+                    // Identity could not be re-verified (app changed since the
+                    // scan): keep the last known sizes — the row must not
+                    // resurface looking empty or cleaned.
+                    item.incomplete = YES;
                 }
                 if (trustedContainerFD >= 0) close(trustedContainerFD);
                 item.selected = NO;
@@ -1609,6 +1618,9 @@ static BOOL cleaner_intro_accepted(void)
                 if (skippedActive > 0)
                     [result appendFormat:@" Skipped %lu active app%@.", (unsigned long)skippedActive,
                      skippedActive == 1 ? @"" : @"s"];
+                if (skippedChanged > 0)
+                    [result appendFormat:@" Skipped %lu app%@ that changed since the scan; rescan to clean.",
+                     (unsigned long)skippedChanged, skippedChanged == 1 ? @"" : @"s"];
                 if (failedItems > 0)
                     [result appendFormat:@" Some files in %lu item%@ could not be removed.",
                      (unsigned long)failedItems, failedItems == 1 ? @"" : @"s"];
