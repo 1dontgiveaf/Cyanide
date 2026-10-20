@@ -335,7 +335,6 @@ static void daemons_note_change(NSArray<NSString *> *labels)
         if (!me) return;
         me.busy = NO;
         if (disabled) {
-            settings_set_kernel_access_banner(me.tableView, nil, nil);
             me.disabled = disabled;
             me.running = running;
             me.status = nil;
@@ -426,7 +425,7 @@ static void daemons_note_change(NSArray<NSString *> *labels)
 - (void)handleFailure:(NSString *)message retry:(void (^)(void))retry from:(UIViewController *)presenter
 {
     if ([message isEqualToString:kSettingsFullExploitRequiredMessage]) {
-        if (!self.disabled) self.status = @"No kernel access yet";
+        if (!self.disabled) self.status = kSettingsNoKernelAccessHint;
         [self refreshUI];
         settings_tool_needs_exploit(self, self.tableView, @"Daemons", retry);
         return;

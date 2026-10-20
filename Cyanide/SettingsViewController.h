@@ -267,18 +267,14 @@ extern NSString * const kSettingsLocationServicesLinksEnabled;
 void settings_unlock_filesystem_async(BOOL allowFullExploit,
                                       void (^completion)(BOOL ok, NSString *message));
 // Runs the exploit on its own (no tweaks applied) with the log window shown;
-// a fresh run is confirmed first (it can reboot A18/M4). The tools never
-// start one by themselves: they show settings_set_kernel_access_banner and
-// call this from its button. completion on main.
+// a fresh run is confirmed first (it can reboot A18/M4). completion on main.
 void settings_run_exploit_with_log(UIViewController *presenter, void (^completion)(BOOL ready));
 // Live kernel access, or a parked session that can be restored without a run.
 BOOL settings_kernel_access_available(void);
-// Shows (text non-nil) or removes (nil) a "Kernel Access Needed" header with
-// a Run Exploit button on a tool's table.
-void settings_set_kernel_access_banner(UITableView *tableView, NSString *text, void (^onRun)(void));
 // What every tool does when only a fresh exploit run would give it kernel
-// access: a "Run Exploit?" popup once per screen plus a banner with a Run
-// Exploit button; `retry` runs once access is ready. Main thread.
+// access: a "Run Exploit?" popup once per screen; `retry` runs once access is
+// ready. Declined, the tool shows kSettingsNoKernelAccessHint. Main thread.
+extern NSString * const kSettingsNoKernelAccessHint;
 void settings_tool_needs_exploit(UIViewController *tool, UITableView *tableView, NSString *toolName,
                                  void (^retry)(void));
 // Daemons screen (launchd disabled.plist). `disabled` maps label -> value as

@@ -937,14 +937,13 @@ static BOOL cleaner_intro_accepted(void)
         if (!self) return;
         self.loading = NO;
         if (ok) {
-            settings_set_kernel_access_banner(self.tableView, nil, nil);
             self.accessReady = YES;
             [self reloadData];
             return;
         }
         BOOL needsFullRun = [message isEqualToString:kSettingsFullExploitRequiredMessage];
         self.accessMessage = needsFullRun
-            ? @"Needs kernel access, and there is no saved session. Tap here to run the exploit (the log is shown)."
+            ? kSettingsNoKernelAccessHint
             : (message ?: @"Filesystem access is not available.");
         [self.tableView reloadData];
         [self updateControls];
@@ -953,15 +952,6 @@ static BOOL cleaner_intro_accepted(void)
                 [weakSelf ensureAccessAllowingFullExploit:NO];
             });
         }
-    });
-}
-
-// Never started by itself: only from the summary card, with the log shown.
-- (void)runExploit
-{
-    __weak typeof(self) weakSelf = self;
-    settings_run_exploit_with_log(self, ^(BOOL ready) {
-        if (ready) [weakSelf ensureAccessAllowingFullExploit:NO];
     });
 }
 
@@ -1583,7 +1573,9 @@ static BOOL cleaner_intro_accepted(void)
 - (BOOL)tableView:(UITableView *)tableView shouldHighlightRowAtIndexPath:(NSIndexPath *)indexPath
 {
     if (indexPath.section == CYCleanerSectionSummary)
-        return !self.accessReady && !self.loading && (self.accessMessage != nil || !cleaner_intro_accepted());
+        return !self.accessReady && !self.loading && !cleaner_intro_accepted() ? YES
+             : !self.accessReady && !self.loading && self.accessMessage != nil &&
+               ![self.accessMessage isEqualToString:kSettingsNoKernelAccessHint];
     return [self itemSelectable:[self itemsInSection:indexPath.section][(NSUInteger)indexPath.row]];
 }
 
@@ -1593,8 +1585,8 @@ static BOOL cleaner_intro_accepted(void)
     if (indexPath.section == CYCleanerSectionSummary) {
         if (!cleaner_intro_accepted()) { [self showIntroIfNeeded]; return; }
         if (!self.accessReady && !self.loading) {
-            if ([self.accessMessage hasPrefix:@"Needs kernel access"]) [self runExploit];
-            else [self ensureAccessAllowingFullExploit:NO];
+            if (![self.accessMessage isEqualToString:kSettingsNoKernelAccessHint])
+                [self ensureAccessAllowingFullExploit:NO];
         }
         return;
     }

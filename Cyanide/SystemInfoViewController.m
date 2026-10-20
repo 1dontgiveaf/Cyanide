@@ -380,13 +380,12 @@ static NSString * const kSIAppSortKey = @"SystemInfoAppSort";
         if (!me) return;
         me.readingBattery = NO;
         if (battery) {
-            settings_set_kernel_access_banner(me.tableView, nil, nil);
             [me applyBattery:battery source:source];
         } else {
             me.batteryRows = nil;   // never show an old reading as current
             BOOL needsRun = [message isEqualToString:kSettingsFullExploitRequiredMessage];
             me.batteryStatus = needsRun
-                ? @"Needs kernel access, and there is no saved session. Tap to run the exploit (the log is shown)."
+                ? kSettingsNoKernelAccessHint
                 : (message ?: @"Unavailable.");
             if (needsRun) [me needsExploit];
         }
@@ -423,7 +422,7 @@ static NSString * const kSIAppSortKey = @"SystemInfoAppSort";
         me.scanningApps = NO;
         BOOL needsRun = [message isEqualToString:kSettingsFullExploitRequiredMessage];
         me.appsStatus = needsRun
-            ? @"Needs kernel access, and there is no saved session. Tap to run the exploit (the log is shown)."
+            ? kSettingsNoKernelAccessHint
             : (message ?: @"Filesystem access is not available.");
         [me.tableView reloadData];
         if (needsRun) [me needsExploit];
@@ -439,7 +438,7 @@ static NSString * const kSIAppSortKey = @"SystemInfoAppSort";
         typeof(self) me = weakSelf;
         if (!me) return;
         if (!me.batteryRows.count) [me readBatteryAllowingFullExploit:NO];
-        if ([me.appsStatus hasPrefix:@"Needs kernel access"]) [me scanAppsAllowingFullExploit:NO];
+        if ([me.appsStatus isEqualToString:kSettingsNoKernelAccessHint]) [me scanAppsAllowingFullExploit:NO];
         [me refreshLocal];
     });
 }
@@ -574,16 +573,11 @@ static NSString * const kSIAppSortKey = @"SystemInfoAppSort";
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath
 {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
-    __weak typeof(self) weakSelf = self;
     if (indexPath.section == SISectionBattery && !self.batteryRows.count && !self.readingBattery) {
-        if ([self.batteryStatus hasPrefix:@"Needs kernel access"])
-            settings_run_exploit_with_log(self, ^(BOOL ready) { if (ready) [weakSelf readBatteryAllowingFullExploit:NO]; });
-        else
+        if (![self.batteryStatus isEqualToString:kSettingsNoKernelAccessHint])
             [self readBatteryAllowingFullExploit:NO];
     } else if (indexPath.section == SISectionApps && self.appsStatus && indexPath.row == 0 && !self.scanningApps) {
-        if ([self.appsStatus hasPrefix:@"Needs kernel access"])
-            settings_run_exploit_with_log(self, ^(BOOL ready) { if (ready) [weakSelf scanAppsAllowingFullExploit:NO]; });
-        else
+        if (![self.appsStatus isEqualToString:kSettingsNoKernelAccessHint])
             [self scanAppsAllowingFullExploit:NO];
     }
 }

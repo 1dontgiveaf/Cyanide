@@ -7472,71 +7472,13 @@ BOOL settings_kernel_access_available(void)
     return settings_krw_available_without_exploit();
 }
 
-void settings_set_kernel_access_banner(UITableView *tableView, NSString *text, void (^onRun)(void))
-{
-    if (!text) {
-        if (tableView.tableHeaderView.tag == 0x4B52) tableView.tableHeaderView = nil;
-        return;
-    }
-    CGFloat w = MAX(CGRectGetWidth(tableView.bounds), 320.0);
-    UIView *wrap = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 10)];
-    wrap.tag = 0x4B52;
-
-    UIView *box = [[UIView alloc] init];
-    box.translatesAutoresizingMaskIntoConstraints = NO;
-    box.backgroundColor = [UIColor.systemBlueColor colorWithAlphaComponent:0.10];
-    box.layer.cornerRadius = 14.0;
-    box.layer.cornerCurve = kCACornerCurveContinuous;
-    [wrap addSubview:box];
-
-    UILabel *title = [[UILabel alloc] init];
-    title.text = @"Kernel Access Needed";
-    title.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
-    UILabel *body = [[UILabel alloc] init];
-    body.text = text;
-    body.numberOfLines = 0;
-    body.font = [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline];
-    body.textColor = UIColor.secondaryLabelColor;
-
-    UIButtonConfiguration *cfg = [UIButtonConfiguration filledButtonConfiguration];
-    cfg.title = @"Run Exploit…";
-    cfg.image = [UIImage systemImageNamed:@"bolt.fill"];
-    cfg.imagePadding = 6.0;
-    cfg.cornerStyle = UIButtonConfigurationCornerStyleMedium;
-    void (^run)(void) = [onRun copy];
-    UIButton *button = [UIButton buttonWithConfiguration:cfg primaryAction:[UIAction actionWithHandler:^(UIAction *a) {
-        if (run) run();
-    }]];
-
-    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[ title, body, button ]];
-    stack.axis = UILayoutConstraintAxisVertical;
-    stack.alignment = UIStackViewAlignmentLeading;
-    stack.spacing = 8.0;
-    [stack setCustomSpacing:12.0 afterView:body];
-    stack.translatesAutoresizingMaskIntoConstraints = NO;
-    [box addSubview:stack];
-
-    [NSLayoutConstraint activateConstraints:@[
-        [box.leadingAnchor constraintEqualToAnchor:wrap.leadingAnchor constant:16.0],
-        [box.trailingAnchor constraintEqualToAnchor:wrap.trailingAnchor constant:-16.0],
-        [box.topAnchor constraintEqualToAnchor:wrap.topAnchor constant:8.0],
-        [box.bottomAnchor constraintEqualToAnchor:wrap.bottomAnchor constant:-8.0],
-        [stack.leadingAnchor constraintEqualToAnchor:box.leadingAnchor constant:16.0],
-        [stack.trailingAnchor constraintEqualToAnchor:box.trailingAnchor constant:-16.0],
-        [stack.topAnchor constraintEqualToAnchor:box.topAnchor constant:14.0],
-        [stack.bottomAnchor constraintEqualToAnchor:box.bottomAnchor constant:-14.0],
-    ]];
-    CGSize fit = [wrap systemLayoutSizeFittingSize:CGSizeMake(w, 0)
-                     withHorizontalFittingPriority:UILayoutPriorityRequired
-                           verticalFittingPriority:UILayoutPriorityFittingSizeLevel];
-    wrap.frame = CGRectMake(0, 0, w, fit.height);
-    tableView.tableHeaderView = wrap;
-}
+NSString * const kSettingsNoKernelAccessHint =
+    @"No kernel access. Run the exploit from Home, or open this screen again.";
 
 // One behaviour for every tool without kernel access (A18/M4 only; other
-// devices run the exploit by themselves): a "Run Exploit?" popup the first
-// time, and a banner with a Run Exploit button that stays until access works.
-// After a successful run the banner goes and `retry` runs.
+// devices run the exploit by themselves): a "Run Exploit?" popup, once per
+// screen. Declined, the tool shows kSettingsNoKernelAccessHint; Home's Run
+// Exploit or opening the screen again asks again. `retry` runs after a run.
 static const void *kSettingsExploitOfferedKey = &kSettingsExploitOfferedKey;
 
 // The popup, once per screen. A screen still being pushed (no window yet, or
@@ -7561,20 +7503,10 @@ static void settings_offer_exploit_popup(UIViewController *tool, NSString *reaso
 void settings_tool_needs_exploit(UIViewController *tool, UITableView *tableView, NSString *toolName,
                                  void (^retry)(void))
 {
+    (void)tableView;
     NSString *reason = [NSString stringWithFormat:@"%@ needs kernel access, and there is no saved session.", toolName];
-    __weak UIViewController *weakTool = tool;
-    __weak UITableView *weakTable = tableView;
     void (^again)(void) = [retry copy];
-    void (^done)(BOOL) = ^(BOOL ready) {
-        if (!ready) return;
-        settings_set_kernel_access_banner(weakTable, nil, nil);
-        if (again) again();
-    };
-    settings_set_kernel_access_banner(tableView,
-        [NSString stringWithFormat:@"%@ No tweaks are applied.", reason], ^{
-            UIViewController *t = weakTool;
-            if (t) settings_run_exploit_with_log_reason(t, nil, done);
-        });
+    void (^done)(BOOL) = ^(BOOL ready) { if (ready && again) again(); };
     settings_offer_exploit_popup(tool, reason, done, 10);
 }
 
@@ -11099,7 +11031,6 @@ static NSString *pm_chip_name(NSString *machine) {
     }
     self.krwReady = YES;
     self.exploitNeeded = NO;
-    settings_set_kernel_access_banner(self.tableView, nil, nil);
     if (self.killsInFlight > 0) {
         self.reloadPending = YES;   // runs when the last kill's verdict is in (pmKillEnded)
         [self.refreshControl endRefreshing];
@@ -11547,8 +11478,7 @@ static NSString *pm_chip_name(NSString *machine) {
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
 {
-    // Without kernel access the shared Run Exploit banner is the only content.
-    if (!self.krwReady) return self.exploitNeeded ? 0 : 1;
+    if (!self.krwReady) return 1;
     return (NSInteger)self.procs.count;
 }
 
@@ -11559,7 +11489,13 @@ static NSString *pm_chip_name(NSString *machine) {
         if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
                                                  reuseIdentifier:@"pmarm"];
         cell.accessoryView = nil;
-        if (self.arming) {
+        if (self.exploitNeeded && !self.arming) {
+            cell.textLabel.text = @"No Kernel Access";
+            cell.detailTextLabel.text = kSettingsNoKernelAccessHint;
+            cell.detailTextLabel.numberOfLines = 0;
+            cell.textLabel.textColor = [UIColor secondaryLabelColor];
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        } else if (self.arming) {
             cell.textLabel.text = @"Arming kernel access…";
             cell.detailTextLabel.text = @"This can take a few seconds.";
             cell.textLabel.textColor = [UIColor labelColor];
@@ -11672,7 +11608,7 @@ static NSString *pm_chip_name(NSString *machine) {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
 
     if (!self.krwReady) {
-        if (self.arming) return;
+        if (self.arming || self.exploitNeeded) return;
         [self armKRW];
         return;
     }

@@ -2083,12 +2083,11 @@ static NSString *fb_related_title(FBAppContainer *c)
         if (!s) return;
         s.unlocking = NO;
         if (ok) {
-            settings_set_kernel_access_banner(s.tableView, nil, nil);
             [s reload];
             return;
         }
         BOOL needsRun = [message isEqualToString:kSettingsFullExploitRequiredMessage];
-        s.status = needsRun ? @"No kernel access yet." : (message ?: @"Filesystem access is not available.");
+        s.status = needsRun ? kSettingsNoKernelAccessHint : (message ?: @"Filesystem access is not available.");
         [s applyFilter];
         if (needsRun) {
             settings_tool_needs_exploit(s, s.tableView, @"The File Browser", ^{
