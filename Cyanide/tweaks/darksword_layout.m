@@ -14,6 +14,7 @@
 #import "../LogTextView.h"
 
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #import <stdio.h>
 #import <stdint.h>
 #import <stdlib.h>
@@ -227,6 +228,18 @@ static void rc_info_to_defaults(NSString *key, const RC_SBIconImageInfo *i)
                                               forKey:key];
 }
 
+// The native geometry expected for this device class. Only used to recognize
+// a pre-1.10 applied value and as the last-resort fallback; a readable config
+// is still preferred.
+static RC_SBIconImageInfo rc_expected_native_icon_info(void)
+{
+    if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad)
+        return (RC_SBIconImageInfo){ 76.0, 76.0, 2.0, 17.1 };
+    if (UIScreen.mainScreen.scale >= 2.5)
+        return (RC_SBIconImageInfo){ 64.0, 64.0, 3.0, 14.4 };
+    return (RC_SBIconImageInfo){ 60.0, 60.0, 2.0, 13.5 };
+}
+
 // The scaled icon info for `cfg` (where = "Home" or "Dock").
 static RC_SBIconImageInfo rc_scaled_icon_info(uint64_t cfg, double scale, NSString *where, const char *tag)
 {
@@ -236,17 +249,20 @@ static RC_SBIconImageInfo rc_scaled_icon_info(uint64_t cfg, double scale, NSStri
     // still recorded its value, so the config may hold the previous one.
     NSString *prevKey = [@"LayoutIconInfoAppliedPrev" stringByAppendingString:where];
     RC_SBIconImageInfo cur = {0}, native = {0}, applied = {0}, prev = {0};
+    RC_SBIconImageInfo expected = rc_expected_native_icon_info();
     bool curOK = cfg && r_responds(cfg, "iconImageInfo") &&
                  r_msg2_main_struct_ret(cfg, "iconImageInfo", &cur, sizeof(cur),
                                         NULL, 0, NULL, 0, NULL, 0, NULL, 0) &&
                  rc_info_plausible(&cur);
     bool haveApplied = rc_info_from_defaults(appliedKey, &applied);
     bool havePrev = rc_info_from_defaults(prevKey, &prev);
-    // Cyanide 1.9.0 and earlier applied 60 pt @2x x slider (radius 13.5 x
-    // slider) and recorded nothing. Such a value still in the config (updated
-    // without a respring) is not this device's native size.
+    // Cyanide 1.9.0 and earlier always applied a 60 pt @2x base with a
+    // 13.5 radius ratio, recording nothing. Compare against THIS device's
+    // expected native width: an iPad's native 76 pt @2x must not be mistaken
+    // for a slider-scaled 60 pt value.
     bool legacyApplied = curOK && !haveApplied && fabs(cur.scale - 2.0) < 0.01 &&
-                         fabs(cur.width - 60.0) > 0.01 &&
+                         fabs(cur.height - cur.width) < 0.01 &&
+                         fabs(cur.width - expected.width) > 0.01 &&
                          fabs(cur.cornerRadius - cur.width * (13.5 / 60.0)) < 0.05;
     const char *source;
     if (curOK && ((haveApplied && rc_info_equal(&cur, &applied)) || (havePrev && rc_info_equal(&cur, &prev))) &&
@@ -254,7 +270,7 @@ static RC_SBIconImageInfo rc_scaled_icon_info(uint64_t cfg, double scale, NSStri
         source = "remembered";               // the config still holds one of our values
     } else if (legacyApplied) {
         // Same base 1.9.0 used, kept until a respring shows the real one.
-        if (!rc_info_from_defaults(nativeKey, &native)) native = (RC_SBIconImageInfo){ 60.0, 60.0, 2.0, 13.5 };
+        if (!rc_info_from_defaults(nativeKey, &native)) native = expected;
         rc_info_to_defaults(nativeKey, &native);
         source = "remembered (config holds an older Cyanide size; respring to re-read)";
     } else if (curOK) {
@@ -264,7 +280,7 @@ static RC_SBIconImageInfo rc_scaled_icon_info(uint64_t cfg, double scale, NSStri
     } else if (rc_info_from_defaults(nativeKey, &native)) {
         source = "remembered (config unreadable)";
     } else {
-        native = (RC_SBIconImageInfo){ 60.0, 60.0, 2.0, 13.5 };
+        native = expected;
         source = "fallback";
     }
     RC_SBIconImageInfo info = {
