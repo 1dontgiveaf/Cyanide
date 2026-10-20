@@ -380,12 +380,15 @@ static NSString * const kSIAppSortKey = @"SystemInfoAppSort";
         if (!me) return;
         me.readingBattery = NO;
         if (battery) {
+            settings_set_kernel_access_banner(me.tableView, nil, nil);
             [me applyBattery:battery source:source];
         } else {
             me.batteryRows = nil;   // never show an old reading as current
-            me.batteryStatus = [message isEqualToString:kSettingsFullExploitRequiredMessage]
+            BOOL needsRun = [message isEqualToString:kSettingsFullExploitRequiredMessage];
+            me.batteryStatus = needsRun
                 ? @"Needs kernel access, and there is no saved session. Tap to run the exploit (the log is shown)."
                 : (message ?: @"Unavailable.");
+            if (needsRun) [me needsExploit];
         }
         [me refreshLocal];   // kernel state may have changed too
     });
@@ -418,10 +421,26 @@ static NSString * const kSIAppSortKey = @"SystemInfoAppSort";
         if (!me) return;
         if (ok) { scan(); return; }
         me.scanningApps = NO;
-        me.appsStatus = [message isEqualToString:kSettingsFullExploitRequiredMessage]
+        BOOL needsRun = [message isEqualToString:kSettingsFullExploitRequiredMessage];
+        me.appsStatus = needsRun
             ? @"Needs kernel access, and there is no saved session. Tap to run the exploit (the log is shown)."
             : (message ?: @"Filesystem access is not available.");
         [me.tableView reloadData];
+        if (needsRun) [me needsExploit];
+    });
+}
+
+// The shared Run Exploit popup and banner; afterwards whatever needed kernel
+// access reads again.
+- (void)needsExploit
+{
+    __weak typeof(self) weakSelf = self;
+    settings_tool_needs_exploit(self, self.tableView, @"System Info", ^{
+        typeof(self) me = weakSelf;
+        if (!me) return;
+        if (!me.batteryRows.count) [me readBatteryAllowingFullExploit:NO];
+        if ([me.appsStatus hasPrefix:@"Needs kernel access"]) [me scanAppsAllowingFullExploit:NO];
+        [me refreshLocal];
     });
 }
 

@@ -937,6 +937,7 @@ static BOOL cleaner_intro_accepted(void)
         if (!self) return;
         self.loading = NO;
         if (ok) {
+            settings_set_kernel_access_banner(self.tableView, nil, nil);
             self.accessReady = YES;
             [self reloadData];
             return;
@@ -947,6 +948,11 @@ static BOOL cleaner_intro_accepted(void)
             : (message ?: @"Filesystem access is not available.");
         [self.tableView reloadData];
         [self updateControls];
+        if (needsFullRun) {
+            settings_tool_needs_exploit(self, self.tableView, @"Cleaner", ^{
+                [weakSelf ensureAccessAllowingFullExploit:NO];
+            });
+        }
     });
 }
 

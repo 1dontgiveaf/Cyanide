@@ -7414,7 +7414,16 @@ static void settings_run_exploit_with_log_confirmed(UIViewController *presenter,
     }];
 }
 
+static void settings_run_exploit_with_log_reason(UIViewController *presenter, NSString *reason,
+                                                void (^completion)(BOOL ready));
+
 void settings_run_exploit_with_log(UIViewController *presenter, void (^completion)(BOOL ready))
+{
+    settings_run_exploit_with_log_reason(presenter, nil, completion);
+}
+
+static void settings_run_exploit_with_log_reason(UIViewController *presenter, NSString *reason,
+                                                void (^completion)(BOOL ready))
 {
     // On top of whatever is shown (e.g. the activity log), but never over an alert.
     while (presenter.presentedViewController && !presenter.presentedViewController.isBeingDismissed)
@@ -7440,9 +7449,11 @@ void settings_run_exploit_with_log(UIViewController *presenter, void (^completio
         settings_run_exploit_with_log_confirmed(presenter, completion);
         return;
     }
-    NSString *message = @"This gets kernel access without applying any tweaks, and shows the log while it runs. "
+    NSString *message = [NSString stringWithFormat:@"%@"
+                        @"Run the exploit now? No tweaks are applied, and the log is shown while it runs. "
                         @"It can take a while.\n\n"
-                        @"On A18 / M4 a run can reboot the device (about a 50/50 chance). If it does, just try again.";
+                        @"On A18 / M4 a run can reboot the device (about a 50/50 chance). If it does, just try again.",
+                        reason.length ? [reason stringByAppendingString:@"\n\n"] : @""];
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Run Exploit?" message:message
                                                          preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
@@ -7520,6 +7531,51 @@ void settings_set_kernel_access_banner(UITableView *tableView, NSString *text, v
                            verticalFittingPriority:UILayoutPriorityFittingSizeLevel];
     wrap.frame = CGRectMake(0, 0, w, fit.height);
     tableView.tableHeaderView = wrap;
+}
+
+// One behaviour for every tool without kernel access (A18/M4 only; other
+// devices run the exploit by themselves): a "Run Exploit?" popup the first
+// time, and a banner with a Run Exploit button that stays until access works.
+// After a successful run the banner goes and `retry` runs.
+static const void *kSettingsExploitOfferedKey = &kSettingsExploitOfferedKey;
+
+// The popup, once per screen. A screen still being pushed (no window yet, or
+// another popup up) is retried briefly instead of skipped.
+static void settings_offer_exploit_popup(UIViewController *tool, NSString *reason,
+                                         void (^done)(BOOL), int triesLeft)
+{
+    if (!tool || objc_getAssociatedObject(tool, kSettingsExploitOfferedKey)) return;
+    if (!tool.view.window || tool.presentedViewController || tool.isMovingToParentViewController) {
+        if (triesLeft <= 0) return;
+        __weak UIViewController *weakTool = tool;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(400 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+            settings_offer_exploit_popup(weakTool, reason, done, triesLeft - 1);
+        });
+        return;
+    }
+    if (settings_krw_available_without_exploit()) { done(YES); return; }
+    objc_setAssociatedObject(tool, kSettingsExploitOfferedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    settings_run_exploit_with_log_reason(tool, reason, done);
+}
+
+void settings_tool_needs_exploit(UIViewController *tool, UITableView *tableView, NSString *toolName,
+                                 void (^retry)(void))
+{
+    NSString *reason = [NSString stringWithFormat:@"%@ needs kernel access, and there is no saved session.", toolName];
+    __weak UIViewController *weakTool = tool;
+    __weak UITableView *weakTable = tableView;
+    void (^again)(void) = [retry copy];
+    void (^done)(BOOL) = ^(BOOL ready) {
+        if (!ready) return;
+        settings_set_kernel_access_banner(weakTable, nil, nil);
+        if (again) again();
+    };
+    settings_set_kernel_access_banner(tableView,
+        [NSString stringWithFormat:@"%@ No tweaks are applied.", reason], ^{
+            UIViewController *t = weakTool;
+            if (t) settings_run_exploit_with_log_reason(t, nil, done);
+        });
+    settings_offer_exploit_popup(tool, reason, done, 10);
 }
 
 // Daemons screen: launchd's disabled.plist. Like the File Browser, only a
@@ -11043,6 +11099,7 @@ static NSString *pm_chip_name(NSString *machine) {
     }
     self.krwReady = YES;
     self.exploitNeeded = NO;
+    settings_set_kernel_access_banner(self.tableView, nil, nil);
     if (self.killsInFlight > 0) {
         self.reloadPending = YES;   // runs when the last kill's verdict is in (pmKillEnded)
         [self.refreshControl endRefreshing];
@@ -11477,6 +11534,11 @@ static NSString *pm_chip_name(NSString *machine) {
             self.silentRestoring = NO;
             self.exploitNeeded = YES;
             [self.tableView reloadData];
+            __weak typeof(self) weakSelf = self;
+            settings_tool_needs_exploit(self, self.tableView, @"The Process Viewer", ^{
+                weakSelf.exploitNeeded = NO;
+                [weakSelf armKRW];
+            });
         });
     });
 }
@@ -11485,7 +11547,9 @@ static NSString *pm_chip_name(NSString *machine) {
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
 {
-    return self.krwReady ? (NSInteger)self.procs.count : 1;
+    // Without kernel access the shared Run Exploit banner is the only content.
+    if (!self.krwReady) return self.exploitNeeded ? 0 : 1;
+    return (NSInteger)self.procs.count;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
@@ -11504,12 +11568,6 @@ static NSString *pm_chip_name(NSString *machine) {
             [spin startAnimating];
             cell.accessoryView = spin;
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
-        } else if (self.exploitNeeded) {
-            cell.textLabel.text = @"Run Exploit";
-            cell.detailTextLabel.text = @"No saved kernel access. Tap to run the exploit; the log is shown while it runs.";
-            cell.detailTextLabel.numberOfLines = 0;
-            cell.textLabel.textColor = [UIColor systemBlueColor];
-            cell.selectionStyle = UITableViewCellSelectionStyleDefault;
         } else {
             cell.textLabel.text = @"Arm Kernel Access";
             cell.detailTextLabel.text = @"Tap to restore kernel r/w (no tweaks re-applied).";
@@ -11615,15 +11673,6 @@ static NSString *pm_chip_name(NSString *machine) {
 
     if (!self.krwReady) {
         if (self.arming) return;
-        if (self.exploitNeeded) {
-            __weak typeof(self) weakSelf = self;
-            settings_run_exploit_with_log(self, ^(BOOL ready) {
-                if (!ready) return;
-                weakSelf.exploitNeeded = NO;
-                [weakSelf reloadProcs];
-            });
-            return;
-        }
         [self armKRW];
         return;
     }

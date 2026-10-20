@@ -428,15 +428,7 @@ static void daemons_note_change(NSArray<NSString *> *labels)
     if ([message isEqualToString:kSettingsFullExploitRequiredMessage]) {
         if (!self.disabled) self.status = @"No kernel access yet";
         [self refreshUI];
-        __weak typeof(self) weakSelf = self;
-        void (^again)(void) = [retry copy];
-        settings_set_kernel_access_banner(self.tableView,
-            @"Reading and changing daemons needs kernel access, and there is no saved session. "
-            @"Run the exploit once; no tweaks are applied.", ^{
-                typeof(self) me = weakSelf;
-                if (!me) return;
-                settings_run_exploit_with_log(me, ^(BOOL ready) { if (ready && again) again(); });
-            });
+        settings_tool_needs_exploit(self, self.tableView, @"Daemons", retry);
         return;
     }
     if (!presenter.view.window || presenter.presentedViewController) return;

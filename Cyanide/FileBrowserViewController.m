@@ -2067,9 +2067,8 @@ static NSString *fb_related_title(FBAppContainer *c)
     [self unlockThenReloadAllowingFullExploit:NO];
 }
 
-// Live or parked kernel access only. When just a full exploit run would do,
-// a banner offers it (with the log shown) -- it is never started or offered
-// by itself on open, since it can reboot A18/M4 devices.
+// Live or parked kernel access, or (except on A18/M4) a fresh run. When only
+// a run the user starts would do, the shared Run Exploit popup and banner.
 - (void)unlockThenReloadAllowingFullExploit:(BOOL)allowFullExploit
 {
     (void)allowFullExploit;
@@ -2092,15 +2091,9 @@ static NSString *fb_related_title(FBAppContainer *c)
         s.status = needsRun ? @"No kernel access yet." : (message ?: @"Filesystem access is not available.");
         [s applyFilter];
         if (needsRun) {
-            settings_set_kernel_access_banner(s.tableView,
-                @"Browsing outside Cyanide's own folder needs kernel access, and there is no saved session. "
-                @"Run the exploit once; no tweaks are applied.", ^{
-                    typeof(self) me = weakSelf;
-                    if (!me) return;
-                    settings_run_exploit_with_log(me, ^(BOOL ready) {
-                        if (ready) [weakSelf unlockThenReloadAllowingFullExploit:NO];
-                    });
-                });
+            settings_tool_needs_exploit(s, s.tableView, @"The File Browser", ^{
+                [weakSelf unlockThenReloadAllowingFullExploit:NO];
+            });
         }
     });
 }
