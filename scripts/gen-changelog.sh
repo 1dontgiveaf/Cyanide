@@ -45,6 +45,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+. "$PWD/scripts/release-notes.sh"
+
 OUT="Cyanide/Changelog.plist"
 COUNT="${CHANGELOG_COUNT:-5}"
 PENDING_VERSION="${CHANGELOG_PENDING_VERSION:-}"
@@ -52,7 +54,7 @@ PENDING_BASE="${CHANGELOG_PENDING_BASE:-}"
 PENDING_MSG="${CHANGELOG_PENDING_MSG:-}"
 PENDING_EXTRA="${CHANGELOG_PENDING_EXTRA:-}"
 PENDING_SKIP_LOG="${CHANGELOG_PENDING_SKIP_LOG:-0}"
-RELEASE_NOTES_FILE="${CHANGELOG_RELEASE_NOTES_FILE:-RELEASE_NOTES.md}"
+CHANGELOG_NOTES_OVERRIDE="${CHANGELOG_RELEASE_NOTES_FILE:-}"
 
 xml_escape() {
     # &  <  >  only — strings inside <string> tags don't need quote escaping.
@@ -76,20 +78,9 @@ emit_change_line() {
 
 released_notes_for_version() {
     local version="$1"
-    [ -f "$RELEASE_NOTES_FILE" ] || return 0
-    awk -v wanted="v${version}" '
-        /^###[[:space:]]+/ {
-            if (in_version) exit
-            heading = $0
-            sub(/^###[[:space:]]+/, "", heading)
-            split(heading, parts, /[[:space:]]+/)
-            if (parts[1] == wanted) in_version = 1
-            next
-        }
-        in_version && /^##[[:space:]]+/ { exit }
-        in_version { print }
-    ' "$RELEASE_NOTES_FILE" \
-        | sed -nE 's/^-+[[:space:]]+\[[xX]\][[:space:]]+(.+[^[:space:]])[[:space:]]*$/\1/p'
+    local notes_file
+    notes_file="$(release_notes_file_for_version "$version" "$CHANGELOG_NOTES_OVERRIDE")"
+    release_notes_bullets_for_version "$version" "$notes_file"
 }
 
 # Pull the most-recent N release tags. If git isn't usable here (e.g. a
@@ -146,6 +137,10 @@ trap 'rm -f "$TMP"' EXIT
     # is today — the real tag isn't created until later in release.sh.
     if [ "$HAVE_PENDING" = "1" ]; then
         TODAY="$(date '+%Y-%m-%d')"
+        if [ -z "$PENDING_EXTRA" ]; then
+            PENDING_NOTES_FILE="$(release_notes_file_for_version "$PENDING_VERSION" "$CHANGELOG_NOTES_OVERRIDE")"
+            PENDING_EXTRA="$(release_notes_bullets_for_version "$PENDING_VERSION" "$PENDING_NOTES_FILE")"
+        fi
         echo "  <dict>"
         echo "    <key>version</key><string>$(printf '%s' "$PENDING_VERSION" | xml_escape)</string>"
         echo "    <key>date</key><string>${TODAY}</string>"

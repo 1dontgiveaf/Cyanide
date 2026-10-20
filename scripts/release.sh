@@ -29,6 +29,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Keep versioned drafts and the historical Pending file on one selection path.
+# The helper is also used by gen-changelog.sh so a release cannot advertise one
+# set of notes while the bundled What's New entry uses another.
+. "$PWD/scripts/release-notes.sh"
+
 if ! command -v gh >/dev/null; then
     echo "error: gh CLI not installed (brew install gh)" >&2
     exit 1
@@ -42,6 +47,7 @@ MSG="${1:-}"
 NOTES_ARG="${2:-}"
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
 PBXPROJ="Cyanide.xcodeproj/project.pbxproj"
+RELEASE_NOTES_FILE_OVERRIDE="${RELEASE_NOTES_FILE:-}"
 RELEASE_NOTES_FILE="RELEASE_NOTES.md"
 
 # --- versioning -------------------------------------------------------------
@@ -147,13 +153,7 @@ dirty_submodule_paths() {
 }
 
 pending_release_note_bullets() {
-    [ -f "$RELEASE_NOTES_FILE" ] || return 0
-    awk '
-        /^##[[:space:]]+Pending[[:space:]]*$/ { pending = 1; next }
-        pending && /^##[[:space:]]+/ { exit }
-        pending { print }
-    ' "$RELEASE_NOTES_FILE" \
-        | sed -nE 's/^-+[[:space:]]+\[[[:space:]]\][[:space:]]+(.+[^[:space:]])[[:space:]]*$/\1/p'
+    release_notes_bullets_for_version "$NEW_VERSION" "$RELEASE_NOTES_FILE"
 }
 
 combine_release_bullets() {
@@ -277,6 +277,8 @@ if [ -z "$CURRENT_VERSION" ]; then
     exit 1
 fi
 NEW_VERSION=$(compute_new_version "$CURRENT_VERSION")
+RELEASE_NOTES_FILE="$(release_notes_file_for_version "$NEW_VERSION" "$RELEASE_NOTES_FILE_OVERRIDE")"
+echo "==> release notes: $RELEASE_NOTES_FILE"
 CURRENT_BUILD_VERSION=$(current_build_version)
 if [ -z "$CURRENT_BUILD_VERSION" ]; then
     echo "error: could not parse CURRENT_PROJECT_VERSION from $PBXPROJ" >&2
@@ -388,6 +390,13 @@ EXTRA_BULLETS="$(combine_release_bullets "$MANUAL_RELEASE_BULLETS" "$AUTO_RELEAS
 if [ -n "$EXTRA_BULLETS" ]; then
     echo "==> release-note bullets:"
     printf '%s' "$EXTRA_BULLETS" | sed 's/^/      - /'
+fi
+
+# An explicit release-notes path is an override for both outputs. Automatic
+# versioned selection remains per-version in gen-changelog.sh, preserving old
+# historical entries while making an explicit override deterministic.
+if [ -n "$RELEASE_NOTES_FILE_OVERRIDE" ] && [ -z "${CHANGELOG_RELEASE_NOTES_FILE:-}" ]; then
+    export CHANGELOG_RELEASE_NOTES_FILE="$RELEASE_NOTES_FILE"
 fi
 
 # 1b. Regenerate Cyanide/Changelog.plist with the new version as the top entry,
@@ -543,7 +552,12 @@ if [ -n "${NOTES_FILE:-}" ] && [ -f "${NOTES_FILE}" ]; then
     NOTES_FROM_FILE=$(cat "${NOTES_FILE}")
 fi
 NOTES_DEFAULT="$SUBJECT"
-if [ -n "$EXTRA_BULLETS" ]; then
+if [ "$(basename "$RELEASE_NOTES_FILE")" = "RELEASE_NOTES_${NEW_VERSION}.md" ] &&
+   [ -f "$RELEASE_NOTES_FILE" ]; then
+    # Versioned drafts are complete, user-facing release bodies rather than
+    # Pending checkbox lists. Keep headings and explanatory text intact.
+    NOTES_DEFAULT="$(cat "$RELEASE_NOTES_FILE")"
+elif [ -n "$EXTRA_BULLETS" ]; then
     NOTES_DEFAULT="$(printf '%s' "$EXTRA_BULLETS" \
         | sed -e '/^[[:space:]]*$/d' -e 's/^/- /')"
 fi
