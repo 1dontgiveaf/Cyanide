@@ -165,7 +165,6 @@ extern NSString * const kSettingsRepoTweaksEnabled;
 
 extern NSString * const kSettingsExperimentalTweaksEnabled;
 
-extern NSString * const kSettingsLogUploadEnabled;
 
 extern NSString * const kSettingsActionsDidCompleteNotification;
 // Live status text for the progress screen during a long apply step;

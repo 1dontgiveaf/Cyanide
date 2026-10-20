@@ -1194,12 +1194,7 @@ NSString * const kSettingsNanoMinPairing       = @"NanoRegistryMinPairing";
 NSString * const kSettingsNanoMinPairingChipID = @"NanoRegistryMinPairingChipID";
 NSString * const kSettingsNanoMinQuickSwitch   = @"NanoRegistryMinQuickSwitch";
 
-NSString * const kSettingsLogUploadEnabled = @"LogUploadEnabled";
 
-static void cyanide_upload_log_if_enabled(void);
-static void cyanide_upload_log_milestone(NSString *event);
-static void cyanide_start_session_uploads(void);
-static void cyanide_stop_session_uploads(void);
 static NSObject *settings_rc_lock(void);
 static BOOL settings_cleanup_in_progress(void);
 static BOOL settings_screen_awake_cached(void);
@@ -3402,11 +3397,6 @@ static NSString *settings_app_version_string(void)
     return settings_bundle_string(@"CFBundleShortVersionString", @"unknown");
 }
 
-static NSString *settings_app_build_string(void)
-{
-    return settings_bundle_string(@"CFBundleVersion", @"unknown");
-}
-
 static void settings_log_run_context(void)
 {
 }
@@ -5053,10 +5043,8 @@ static void settings_apply_armed_gravitylite_once_async(const char *reason)
                 settings_start_gravity_motion(appliedConfig.magnitude,
                                               appliedConfig.explosionForce);
                 log_user("[OK] Gravity Lite active.\n");
-                cyanide_upload_log_milestone(@"gravity-lite-applied");
             } else {
                 log_user("[WARN] Gravity Lite did not start cleanly.\n");
-                cyanide_upload_log_milestone(@"gravity-lite-warning");
             }
 
             printf("[SETTINGS] Gravity Lite start%s%s result=%d\n",
@@ -5788,7 +5776,6 @@ static void settings_start_statbar_live_loop(void)
                kStatBarLiveIntervalUS,
                settings_statbar_refresh_rate_us(),
                (unsigned long)kStatBarLiveMaxTicks);
-        cyanide_upload_log_milestone(@"statbar-live-started");
 
         @try {
             while ([d boolForKey:kSettingsStatBarEnabled] &&
@@ -5831,7 +5818,6 @@ static void settings_start_statbar_live_loop(void)
 
                 if (tick == 0) {
                     printf("[SETTINGS] StatBar result=%d\n", ok);
-                    cyanide_upload_log_milestone(ok ? @"statbar-live-first-ok" : @"statbar-live-first-failed");
                 }
                 if (ok) {
                     failures = 0;
@@ -5890,8 +5876,6 @@ static void settings_start_statbar_live_loop(void)
             if (![d boolForKey:kSettingsStatBarEnabled] || g_statbar_live_stop_requested || failures > 0) {
                 settings_end_statbar_background_task_async("live loop exited");
             }
-            if (failures > 0)
-                cyanide_upload_log_milestone(@"statbar-live-exited-failed");
             __sync_lock_release(&g_statbar_live_running);
         }
     });
@@ -6389,7 +6373,6 @@ static void settings_start_axonlite_live_loop(void)
                kAxonLiteLiveIntervalUS,
                kAxonLiteLiveBackgroundIntervalUS,
                (unsigned long)kAxonLiteLiveMaxTicks);
-        cyanide_upload_log_milestone(@"axon-lite-live-started");
 
         @try {
             settings_live_loop_sleep_interruptible(0,
@@ -6450,7 +6433,6 @@ static void settings_start_axonlite_live_loop(void)
 
                 if (tick == 0) {
                     printf("[SETTINGS] Axon Lite result=%d\n", ok);
-                    cyanide_upload_log_milestone(ok ? @"axon-lite-live-first-ok" : @"axon-lite-live-first-failed");
                 }
                 if (ok) {
                     failures = 0;
@@ -6496,8 +6478,6 @@ static void settings_start_axonlite_live_loop(void)
                    [d boolForKey:kSettingsAxonLiteEnabled],
                    (unsigned long)failures,
                    g_axonlite_live_stop_requested);
-            if (failures > 0)
-                cyanide_upload_log_milestone(@"axon-lite-live-exited-failed");
             __sync_lock_release(&g_axonlite_live_running);
         }
     });
@@ -9254,7 +9234,6 @@ static void settings_run_actions_internal(BOOL pendingOnly)
             settings_wait_live_loops_stopped_for_switch("Apply Tweaks");
         }
         log_session_begin();
-        cyanide_start_session_uploads();
         BOOL runSucceeded = NO;
         BOOL runHadBlockingFailure = NO;
         NSString *runCompletionMessage = @"Run failed. Check the log for details.";
@@ -9375,7 +9354,6 @@ static void settings_run_actions_internal(BOOL pendingOnly)
             if (runFastLockXLite && runStageStrip) {
                 log_user("[COMPAT] FastLockX Lite will arm before Dynamic Stage Lite starts its control loop.\n");
             }
-            cyanide_upload_log_milestone(@"run-plan");
 
             if (!hasRunWork) {
                 if (!statBarEnabled) g_statbar_live_stop_requested = 1;
@@ -9389,7 +9367,6 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                 log_user("[DONE] No pending runtime changes to apply.\n");
                 runSucceeded = YES;
                 runCompletionMessage = @"Done. No pending runtime changes to apply.";
-                cyanide_upload_log_milestone(@"run-noop");
                 return;
             }
 
@@ -9398,21 +9375,17 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                 if (!settings_ensure_kexploit()) {
                     log_user("[RUN] Failed: kernel primitives were not acquired. Please try running chain again.\n");
                     runCompletionMessage = kSettingsRunKRWFailedMessage;
-                    cyanide_upload_log_milestone(@"krw-failed");
                     return;
                 }
                 log_user("[OK] Kernel r/w armed — injection staged.\n");
-                cyanide_upload_log_milestone(@"krw-ready");
             } else if (skipKernelForVPhoneSpringBoardOnly) {
                 log_user("[VPHONE] SpringBoard-only run — using the vphone bridge without app-side kernel primitives.\n");
-                cyanide_upload_log_milestone(@"vphone-bridge-no-krw");
             }
 
             if (patchSandboxExt) {
                 settings_progress(&step, total, "Patching sandbox-extension issue path");
                 escape_sbx_demo3();
                 log_user("[OK] Sandbox extension issue path patched.\n");
-                cyanide_upload_log_milestone(@"sandbox-ext-patched");
             }
             if (runPowercuff) {
                 settings_progress(&step, total, "Applying Powercuff via thermalmonitord");
@@ -9432,7 +9405,6 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                     log_user("%s Powercuff %s through thermalmonitord.\n",
                              ok ? "[OK]" : "[WARN]",
                              ok ? "applied" : "did not apply cleanly");
-                    cyanide_upload_log_milestone(ok ? @"powercuff-applied" : @"powercuff-failed");
                     if (!ok) [runWarnings addObject:@"Powercuff"];
                 }
             }
@@ -9455,11 +9427,9 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                     if (!settings_ensure_springboard_remote_call_locked()) {
                         log_user("[RUN] Failed: could not open the SpringBoard control session. Please try installing tweaks again.\n");
                         runCompletionMessage = @"Failed: could not open the SpringBoard control session. Please try installing tweaks again.";
-                        cyanide_upload_log_milestone(@"springboard-remote-call-failed");
                         return;
                     }
                     log_user("[OK] SpringBoard channel open.\n");
-                    cyanide_upload_log_milestone(@"springboard-remote-call-ready");
 
                     if (runSandboxEscape && !g_springboard_sandbox_escaped) {
                         settings_progress(&step, total, "Lifting SpringBoard filesystem sandbox");
@@ -9468,17 +9438,14 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                         log_user("%s Filesystem sandbox %s.\n",
                                  sbx == 0 ? "[OK]" : "[WARN]",
                                  sbx == 0 ? "lifted — access granted" : "lift returned a warning");
-                        cyanide_upload_log_milestone(sbx == 0 ? @"springboard-sandbox-token-ready" : @"springboard-sandbox-token-warning");
                     } else if (runSandboxEscape) {
                         settings_progress(&step, total, "Reusing sandbox token from prior run");
                         log_user("[OK] Sandbox already lifted — reusing token.\n");
-                        cyanide_upload_log_milestone(@"springboard-sandbox-token-reused");
                     }
 
                     if (cleanupDisabledSpringBoardTweaks) {
                         settings_progress(&step, total, "Stopping disabled SpringBoard tweaks");
                         settings_stop_disabled_applied_springboard_tweaks_locked(d);
-                        cyanide_upload_log_milestone(@"disabled-springboard-tweaks-stopped");
                     }
 
 
@@ -9509,7 +9476,6 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                         log_user("%s DarkSword tweaks %s. Continuing with remaining changes…\n",
                                  ok ? "[OK]" : "[WARN]",
                                  ok ? "applied" : "may need a refresh");
-                        cyanide_upload_log_milestone(ok ? @"darksword-tweaks-applied" : @"darksword-tweaks-warning");
                         if (!ok) [runWarnings addObject:@"DarkSword tweaks"];
                     }
 
@@ -9521,7 +9487,6 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                         log_user("%s Icon Theme Engine %s.\n",
                                  ok ? "[OK]" : "[WARN]",
                                  ok ? "applied" : "did not apply cleanly");
-                        cyanide_upload_log_milestone(ok ? @"themer-applied" : @"themer-warning");
                         if (!ok) [runWarnings addObject:@"Icon Theme Engine"];
                         if (ok) {
                             settings_start_themer_live_loop();
@@ -9537,7 +9502,6 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                         log_user("%s SnowBoard Lite %s.\n",
                                  ok ? "[OK]" : "[WARN]",
                                  ok ? "theme applied" : "did not apply cleanly");
-                        cyanide_upload_log_milestone(ok ? @"snowboard-lite-applied" : @"snowboard-lite-warning");
                         if (!ok) [runWarnings addObject:@"SnowBoard Lite"];
                         if (ok && !settings_themer_live_repair_enabled(d)) {
                             log_user("[SBL] Live repair is enabled; Cyanide will keep the SpringBoard channel open so repair ticks reuse it.\n");
@@ -9562,10 +9526,8 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                         }
                         if (ok) {
                             log_user("[OK] Gravity Lite active.\n");
-                            cyanide_upload_log_milestone(@"gravity-lite-applied");
                         } else {
                             log_user("[WARN] Gravity Lite did not start cleanly.\n");
-                            cyanide_upload_log_milestone(@"gravity-lite-warning");
                             runHadBlockingFailure = YES;
                             runCompletionMessage = @"Gravity Lite did not start cleanly.";
                         }
@@ -9587,7 +9549,6 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                         log_user("%s StatBar %s.\n",
                                  ok ? "[OK]" : "[WARN]",
                                  ok ? "showing thermal + memory overlay" : "did not start cleanly");
-                        cyanide_upload_log_milestone(ok ? @"statbar-initial-applied" : @"statbar-initial-failed");
                         if (!ok) [runWarnings addObject:@"StatBar"];
                     }
 
@@ -9600,7 +9561,6 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                         log_user("%s NSBar %s.\n",
                                  ok ? "[OK]" : "[WARN]",
                                  ok ? "showing network speed" : "did not start cleanly");
-                        cyanide_upload_log_milestone(ok ? @"nsbar-initial-applied" : @"nsbar-initial-failed");
                         if (!ok) [runWarnings addObject:@"NSBar"];
                     }
 
@@ -9614,7 +9574,6 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                         log_user("%s NiceBar Lite %s.\n",
                                  ok ? "[OK]" : "[WARN]",
                                  ok ? "labels active" : "did not start cleanly");
-                        cyanide_upload_log_milestone(ok ? @"nicebar-lite-initial-applied" : @"nicebar-lite-initial-failed");
                         if (!ok) [runWarnings addObject:@"NiceBar Lite"];
                     }
 
@@ -9628,7 +9587,6 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                         log_user("%s LiveWP %s.\n",
                                  ok ? "[OK]" : "[WARN]",
                                  ok ? "video wallpaper active" : "did not start cleanly");
-                        cyanide_upload_log_milestone(ok ? @"livewp-initial-applied" : @"livewp-initial-failed");
                         if (!ok) [runWarnings addObject:@"LiveWP"];
                     }
 
@@ -9666,8 +9624,6 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                                  (ok || deferred) ? "[OK]" : "[WARN]",
                                  ok ? "hub active — watching for notifications" :
                                  (deferred ? "standing by — fires when notifications appear" : "did not start cleanly"));
-                        cyanide_upload_log_milestone(ok ? @"axon-lite-initial-applied" :
-                                                     (deferred ? @"axon-lite-initial-deferred" : @"axon-lite-initial-failed"));
                         if (!ok && !deferred) [runWarnings addObject:@"Axon Lite"];
                     }
 
@@ -9681,7 +9637,6 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                         log_user("%s App Switcher Grid %s.\n",
                                  ok ? "[OK]" : "[WARN]",
                                  ok ? "enabled" : "did not apply cleanly");
-                        cyanide_upload_log_milestone(ok ? @"app-switcher-grid-applied" : @"app-switcher-grid-failed");
                         if (!ok) [runWarnings addObject:@"App Switcher Grid"];
                     } else if (!appSwitcherGridEnabled) {
                         appswitchergrid_stop_in_session();
@@ -9712,8 +9667,6 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                         log_user("%s FastLockX Lite Always On %s.\n",
                                  ok ? "[OK]" : "[WARN]",
                                  ok ? "enabled" : "did not install cleanly");
-                        cyanide_upload_log_milestone(ok ? @"fastlockx-lite-applied" :
-                                                         @"fastlockx-lite-failed");
                         if (!ok) [runWarnings addObject:@"FastLockX Lite"];
                     }
 
@@ -9734,7 +9687,6 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                         log_user("%s Dynamic Stage Lite %s.\n",
                                  ok ? "[OK]" : "[WARN]",
                                  ok ? "overlay active" : "did not install cleanly");
-                        cyanide_upload_log_milestone(ok ? @"stagestrip-initial-applied" : @"stagestrip-initial-failed");
                         if (!ok) [runWarnings addObject:@"Dynamic Stage Lite"];
                     } else if (!stageStripEnabled) {
                         // Uninstall path: tear down the overlay if one survived
@@ -9757,7 +9709,6 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                                  (long)[d integerForKey:kSettingsSBCDockIcons],
                                  (long)[d integerForKey:kSettingsSBCCols],
                                  (long)[d integerForKey:kSettingsSBCRows]);
-                        cyanide_upload_log_milestone(ok ? @"sbc-applied" : @"sbc-warning");
                         if (!ok) [runWarnings addObject:@"Home screen layout"];
                     }
 
@@ -9789,7 +9740,6 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                         log_user("%s Home Layout Extras %s.\n",
                                  ok ? "[OK]" : "[WARN]",
                                  ok ? "applied to final layout" : "did not apply cleanly");
-                        cyanide_upload_log_milestone(ok ? @"layout-extras-applied" : @"layout-extras-warning");
                         if (!ok) [runWarnings addObject:@"Home Layout Extras"];
                     }
 
@@ -9889,8 +9839,6 @@ static void settings_run_actions_internal(BOOL pendingOnly)
             if (startStageStripControlLoopAfterInstall) {
                 stagestrip_start_control_loop();
             }
-            if (runStatBar || runNSBar || runNiceBarLite || runAxonLite || runLiveWP || startStageStripControlLoopAfterInstall)
-                cyanide_upload_log_milestone(@"live-tweaks-started");
 
             if (!settings_has_persistent_springboard_remote_call_user()) {
                 BOOL closedNonLiveRemoteCall = NO;
@@ -9913,13 +9861,11 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                 if (closedNonLiveRemoteCall) {
                     kadjust32_report("SpringBoard session");
                     log_user("[OK] SpringBoard channel released — no persistent hooks.\n");
-                    cyanide_upload_log_milestone(@"springboard-remote-call-closed");
                 }
             }
 
             if (runHadBlockingFailure) {
                 log_user("[RUN] Incomplete: a requested live tweak did not become active.\n");
-                cyanide_upload_log_milestone(@"run-incomplete");
                 return;
             }
 
@@ -9941,16 +9887,12 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                 runPartial = YES;
                 runCompletionMessage = [NSString stringWithFormat:@"Finished with warnings. Did not apply: %@.",
                                         [runWarnings componentsJoinedByString:@", "]];
-                cyanide_upload_log_milestone(@"run-complete-warnings");
             } else {
                 runCompletionMessage = @"Done. All requested changes finished.";
-                cyanide_upload_log_milestone(@"run-complete");
             }
         } @finally {
             settings_stage_close();
             settings_log_perf_delta("Whole run", runStartNs, &runPerf0);
-            // Close any legacy uploader state before the final snapshot.
-            cyanide_stop_session_uploads();
             // Flush, but keep the file open so post-[DONE] background output
             // (idle parking, live-tweak loops) still lands in the shareable log.
             // The next run's log_session_begin() rotates the file.
@@ -9975,7 +9917,6 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                 int attempt = __sync_add_and_fetch(&g_settings_actions_auto_retry_attempt, 1);
                 log_user("[RUN] Auto-retrying chain (attempt %d of %ld)…\n",
                          attempt, (long)maxRetryAttempts);
-                cyanide_upload_log_milestone(@"krw-auto-retry");
                 settings_run_actions_internal(pendingOnly);
                 return;
             }
@@ -10013,7 +9954,6 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                 [[NSNotificationCenter defaultCenter] postNotificationName:kSettingsActionsDidCompleteNotification
                                                                     object:nil
                                                                   userInfo:completionInfo];
-                cyanide_upload_log_if_enabled();
             });
         }
     });
@@ -14785,7 +14725,7 @@ UIViewController *settings_make_daemons_viewer(void)
         case RootSectionTweakBundles:   return (NSInteger)self.tweakBundleRows.count;
         case RootSectionInDev:         return (NSInteger)self.inDevBundleRows.count;
         case RootSectionSystemBundles:  return (NSInteger)self.systemBundleRows.count;
-        case RootSectionAbout:          return 6;
+        case RootSectionAbout:          return 5;
         case RootSectionWarning:        return 0;
         case RootSectionCount:          return 0;
     }
@@ -15202,27 +15142,14 @@ UIViewController *settings_make_daemons_viewer(void)
             cell.imageView.image = [SettingsViewController iconBadgeWithSymbol:@"doc.text.magnifyingglass" color:UIColor.systemGrayColor size:29.0];
             cell.textLabel.text = @"View Log";
             break;
-        case 4:
+        default:
             cell.imageView.image = [SettingsViewController iconBadgeWithSymbol:@"square.and.arrow.up" color:UIColor.systemGreenColor size:29.0];
             cell.textLabel.text = @"Share Log";
-            break;
-        default:
-            cell.imageView.image = [SettingsViewController iconBadgeWithSymbol:@"icloud.and.arrow.up" color:UIColor.systemIndigoColor size:29.0];
-            cell.textLabel.text = @"Auto-Upload Logs";
-            cell.accessoryType = UITableViewCellAccessoryNone;
-            cell.selectionStyle = UITableViewCellSelectionStyleNone;
-            UISwitch *sw = [[UISwitch alloc] init];
-            sw.on = [[NSUserDefaults standardUserDefaults] boolForKey:kSettingsLogUploadEnabled];
-            [sw addTarget:self action:@selector(logUploadSwitchChanged:) forControlEvents:UIControlEventValueChanged];
-            cell.accessoryView = sw;
             break;
     }
     return cell;
 }
 
-- (void)logUploadSwitchChanged:(UISwitch *)sw {
-    [[NSUserDefaults standardUserDefaults] setBool:sw.isOn forKey:kSettingsLogUploadEnabled];
-}
 
 
 - (void)reloadThemerSectionAndQueue
@@ -17092,219 +17019,6 @@ didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls
     [self presentViewController:vc animated:YES completion:nil];
 }
 
-static NSString *cyanide_sanitize_diagnostic_payload(NSString *rawLog)
-{
-    if (![rawLog isKindOfClass:NSString.class]) return @"";
-
-    // Privacy: only what identifies the user's own data is redacted before the
-    // log leaves the device -- paths into the user's data and app containers,
-    // file URLs, and every path in a [FILES] line (what was browsed, including
-    // as root). System paths, ratios like "3/8" and the rest of the log stay:
-    // they are what makes a report diagnosable. The local log keeps everything.
-    static NSRegularExpression *userPathRe;
-    static NSRegularExpression *fileURLRe;
-    static NSRegularExpression *anyPathRe;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        userPathRe = [NSRegularExpression regularExpressionWithPattern:
-                      @"(?:/private)?/var/(?:mobile|containers|root)\\b(?:/[^\\s\"'<>]*)?"
-                                                               options:0 error:nil];
-        fileURLRe = [NSRegularExpression regularExpressionWithPattern:@"(?i)file://[^\\s\"'<>]+"
-                                                              options:0 error:nil];
-        anyPathRe = [NSRegularExpression regularExpressionWithPattern:@"/[^\\s]*"
-                                                              options:0 error:nil];
-    });
-
-    NSMutableArray<NSString *> *safeLines = [NSMutableArray array];
-    for (NSString *rawLine in [rawLog componentsSeparatedByString:@"\n"]) {
-        NSString *line = [fileURLRe stringByReplacingMatchesInString:rawLine
-                                                                options:0
-                                                                  range:NSMakeRange(0, rawLine.length)
-                                                           withTemplate:@"<file-url>"];
-        NSRegularExpression *pathRe = [line containsString:@"[FILES]"] ? anyPathRe : userPathRe;
-        line = [pathRe stringByReplacingMatchesInString:line
-                                                options:0
-                                                  range:NSMakeRange(0, line.length)
-                                           withTemplate:@"<path>"];
-
-        // Some importers intentionally log a basename without a slash. Keep
-        // the operation and outcome, but never send a user-selected filename.
-        if ([line containsString:@"[LIVEWP]"] && [line containsString:@"Selected video:"]) {
-            NSRange marker = [line rangeOfString:@"Selected video:"];
-            line = [[line substringToIndex:marker.location + marker.length]
-                    stringByAppendingString:@" <video>"];
-        }
-        [safeLines addObject:line];
-    }
-    return [safeLines componentsJoinedByString:@"\n"];
-}
-
-// Session-scoped state so uploaded snapshots from one chain run get grouped on
-// the server side (same sessionId, monotonically increasing seq). A fresh
-// session begins at every settings_run_actions() entry.
-static dispatch_source_t g_cyanide_upload_timer = NULL;
-static NSString         *g_cyanide_upload_session_id = nil;
-static NSMutableSet<NSString *> *g_cyanide_upload_milestones = nil;
-static volatile int      g_cyanide_upload_seq = 0;
-
-// kind = "milestone" (important chain transition) or "final"
-// (post-completion). Milestones are explicit so uploads line up with exploit,
-// RemoteCall, tweak, and live-loop boundaries instead of timer noise.
-static void cyanide_upload_log_with_kind_event(NSString *kind, NSString *event) {
-    if (![[NSUserDefaults standardUserDefaults] boolForKey:kSettingsLogUploadEnabled]) return;
-    NSString *path = log_current_session_path() ?: log_most_recent_session_path();
-    if (!path) return;
-    // Only the last 512 KiB: the end of a session is what matters, and this
-    // runs at every milestone.
-    static const unsigned long long kUploadMaxBytes = 512 * 1024;
-    NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:path];
-    if (!fh) return;
-    // The error-returning variants: the old seekToEndOfFile /
-    // readDataToEndOfFile throw an Objective-C exception on an I/O error,
-    // which nothing here catches -- a log upload must never crash the app.
-    unsigned long long size = 0;
-    NSError *ioError = nil;
-    BOOL clipped = NO;
-    NSData *tail = nil;
-    if ([fh seekToEndReturningOffset:&size error:&ioError]) {
-        clipped = size > kUploadMaxBytes;
-        if ([fh seekToOffset:clipped ? size - kUploadMaxBytes : 0 error:&ioError])
-            tail = [fh readDataToEndOfFileAndReturnError:&ioError];
-    }
-    [fh closeAndReturnError:nil];
-    if (!tail) {
-        printf("[UPLOAD] log read failed (%s); skipping this upload\n",
-               ioError.localizedDescription.UTF8String ?: "unknown");
-        return;
-    }
-    // A cut through a multi-byte character: skip ahead to a valid start.
-    NSString *rawLog = nil;
-    for (NSUInteger skip = 0; skip < 4 && skip < tail.length && !rawLog; skip++)
-        rawLog = [[NSString alloc] initWithData:[tail subdataWithRange:NSMakeRange(skip, tail.length - skip)]
-                                       encoding:NSUTF8StringEncoding];
-    if (!rawLog.length) return;
-    if (clipped) rawLog = [@"[… earlier part of the log omitted …]\n" stringByAppendingString:rawLog];
-    rawLog = cyanide_sanitize_diagnostic_payload(rawLog);
-
-    int seq = __sync_add_and_fetch(&g_cyanide_upload_seq, 1);
-    NSString *sessionId = g_cyanide_upload_session_id ?: @"adhoc";
-    NSString *safeKind = cyanide_sanitize_diagnostic_payload(kind ?: @"");
-    NSString *safeEvent = cyanide_sanitize_diagnostic_payload(event ?: @"");
-
-    NSString *appVersion = settings_app_version_string();
-    NSString *appBuild = settings_app_build_string();
-    NSString *iosVersion = [UIDevice currentDevice].systemVersion;
-
-    struct utsname sysInfo;
-    uname(&sysInfo);
-    NSString *machine = [NSString stringWithUTF8String:sysInfo.machine];
-
-    // Prepend a diagnostic header so each uploaded log is self-contained.
-    NSString *header = [NSString stringWithFormat:
-        @"=== Cyanide Diagnostic Log ===\n"
-        @"app_version : %@\n"
-        @"app_build   : %@\n"
-        @"ios_version : %@\n"
-        @"device      : %@\n"
-        @"log_file    : %@\n"
-        @"session_id  : %@\n"
-        @"kind        : %@\n"
-        @"event       : %@\n"
-        @"seq         : %d\n"
-        @"==============================\n\n",
-        appVersion, appBuild, iosVersion, machine, path.lastPathComponent,
-        sessionId, safeKind, safeEvent, seq];
-
-    NSDictionary *body = @{
-        @"log": [header stringByAppendingString:rawLog],
-        @"meta": @{
-            @"build":      [NSString stringWithFormat:@"cyanide-%@-%@", appVersion, appBuild],
-            @"appVersion": appVersion,
-            @"appBuild":   appBuild,
-            @"source":     @"cyanide",
-            @"ios":        iosVersion,
-            @"device":     machine,
-            @"sessionId":  sessionId,
-            @"kind":       safeKind,
-            @"event":      safeEvent,
-            @"seq":        @(seq),
-        }
-    };
-    NSData *data = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
-    if (!data) return;
-    NSURL *url = [NSURL URLWithString:@"https://brokenblade-weblogs.hackerboii.workers.dev/log"];
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
-    req.HTTPMethod = @"POST";
-    req.timeoutInterval = 30;
-    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    req.HTTPBody = data;
-    printf("[LOG] uploading diagnostic (%s%s%s seq=%d, %zu bytes)...\n",
-           kind.UTF8String,
-           event.length ? ":" : "",
-           event.length ? event.UTF8String : "",
-           seq,
-           (size_t)data.length);
-    [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
-        if (e) {
-            printf("[LOG] upload %s%s%s failed: %s\n",
-                   kind.UTF8String,
-                   event.length ? ":" : "",
-                   event.length ? event.UTF8String : "",
-                   e.localizedDescription.UTF8String);
-        } else {
-            NSHTTPURLResponse *http = (NSHTTPURLResponse *)r;
-            BOOL httpOK = [http isKindOfClass:NSHTTPURLResponse.class] && http.statusCode / 100 == 2;
-            printf("[LOG] upload %s%s%s %s: HTTP %ld\n",
-                   kind.UTF8String,
-                   event.length ? ":" : "",
-                   event.length ? event.UTF8String : "",
-                   httpOK ? "ok" : "rejected",
-                   (long)http.statusCode);
-        }
-    }] resume];
-}
-
-static void cyanide_upload_log_with_kind(NSString *kind) {
-    cyanide_upload_log_with_kind_event(kind, nil);
-}
-
-static void cyanide_upload_log_milestone(NSString *event) {
-    if (!event.length) return;
-
-    @synchronized ([NSUserDefaults standardUserDefaults]) {
-        if (!g_cyanide_upload_milestones)
-            g_cyanide_upload_milestones = [NSMutableSet set];
-        if ([g_cyanide_upload_milestones containsObject:event])
-            return;
-        [g_cyanide_upload_milestones addObject:event];
-    }
-
-    cyanide_upload_log_with_kind_event(@"milestone", event);
-}
-
-static void cyanide_upload_log_if_enabled(void) {
-    cyanide_upload_log_with_kind(@"final");
-}
-
-// Begin a diagnostic upload session. Uploads are milestone-driven; this no
-// longer starts the old 3s/8s periodic checkpoint timer.
-static void cyanide_start_session_uploads(void) {
-    if (![[NSUserDefaults standardUserDefaults] boolForKey:kSettingsLogUploadEnabled]) return;
-    if (g_cyanide_upload_timer) return;
-
-    g_cyanide_upload_session_id = [[NSUUID UUID] UUIDString];
-    @synchronized ([NSUserDefaults standardUserDefaults]) {
-        g_cyanide_upload_milestones = [NSMutableSet set];
-    }
-    g_cyanide_upload_seq = 0;
-}
-
-static void cyanide_stop_session_uploads(void) {
-    if (g_cyanide_upload_timer) {
-        dispatch_source_cancel(g_cyanide_upload_timer);
-        g_cyanide_upload_timer = NULL;
-    }
-}
 
 // Contact owner (zeroxjf) with the diagnostic log inline in the body. Build
 // info sits between the user's typing area at the top and the log dump
@@ -19004,7 +18718,6 @@ void cyanide_present_contact(UIViewController *host)
                     case 2: [self showAppIconPicker]; break;
                     case 3: [self openViewLog]; break;
                     case 4: [self openShareLog]; break;
-                    // Row 5: Auto-Upload — UISwitch handles it
                 }
                 return;
             }
