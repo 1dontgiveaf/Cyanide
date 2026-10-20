@@ -7135,7 +7135,7 @@ void settings_location_services_set_async(int desired, BOOL allowFullExploit,
             // the caller ask (in-app) or tell the user to open Cyanide.
             step(0.1f, @"Getting kernel ready", 0);
             BOOL kernelReady = settings_ensure_kexploit_for_read();
-            if (!kernelReady && !allowFullExploit) {
+            if (!kernelReady && !settings_tool_may_run_exploit(allowFullExploit)) {
                 message = kSettingsFullExploitRequiredMessage;
                 return;
             }
@@ -7436,7 +7436,10 @@ static void settings_run_exploit_with_log_confirmed(UIViewController *presenter,
 
 void settings_run_exploit_with_log(UIViewController *presenter, void (^completion)(BOOL ready))
 {
-    if (!presenter.view.window || presenter.presentedViewController) return;
+    // On top of whatever is shown (e.g. the activity log), but never over an alert.
+    while (presenter.presentedViewController && !presenter.presentedViewController.isBeingDismissed)
+        presenter = presenter.presentedViewController;
+    if (!presenter.view.window || [presenter isKindOfClass:UIAlertController.class]) return;
     if (!settings_device_supported()) {
         settings_simple_alert(presenter, @"Not Supported", settings_unsupported_message());
         return;
@@ -18431,18 +18434,11 @@ void cyanide_present_contact(UIViewController *host)
         [me reloadLocationSimUI];
         if (!me || ok || allowFullExploit ||
             ![message isEqualToString:kSettingsFullExploitRequiredMessage]) return;
-        // Only a full exploit run would do: ask first, like the Process Viewer.
-        UIAlertController *ac = [UIAlertController
-            alertControllerWithTitle:@"No parked kernel state"
-                             message:@"Changing Location Services needs kernel access, and there is no saved session to reuse. Running the full exploit can reboot the device on A18/M4. Continue?"
-                      preferredStyle:UIAlertControllerStyleAlert];
-        [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-        [ac addAction:[UIAlertAction actionWithTitle:@"Run Full Exploit"
-                                               style:UIAlertActionStyleDefault
-                                             handler:^(UIAlertAction *a) {
-            [weakSelf runLocationServicesToggleAllowingFullExploit:YES];
-        }]];
-        settings_present_controller(ac, me);
+        // A18/M4 only (elsewhere the exploit already ran by itself): run it
+        // on request with its log, then toggle again.
+        settings_run_exploit_with_log(me, ^(BOOL ready) {
+            if (ready) [weakSelf runLocationServicesToggleAllowingFullExploit:NO];
+        });
     });
 }
 

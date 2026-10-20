@@ -779,9 +779,9 @@ static const double kQuietMinPhase = 0.35;   // a phase stays readable at least 
             if (me && generation == me.actionGeneration)
                 [me quietPhase:fraction step:step over:over target:target];
         };
-        // Never a fresh exploit run from outside the app (Control Center,
-        // Shortcuts, links): it can reboot A18/M4 devices, and nobody tapped
-        // "Run Full Exploit". Live or parked kernel access only.
+        // Live or parked kernel access; a fresh exploit run only where it
+        // can't reboot the device. On A18/M4 the user starts it below, with
+        // the log shown.
         // removeCard: only a run that cold-launched Cyanide (and did not ask
         // to keep the card) may have the switcher card removed afterwards.
         settings_location_services_set_async(desired, NO, removeCard, broughtToFront,
@@ -796,6 +796,17 @@ static const double kQuietMinPhase = 0.35;   // a phase stays readable at least 
             typeof(self) me = weakSelf;
             if (!me || generation != me.actionGeneration) return;
             me.actionInProgress = NO;
+            if (!ok && [rawMessage isEqualToString:kSettingsFullExploitRequiredMessage]) {
+                // A18/M4 without saved kernel access (other devices run the
+                // exploit by themselves): offer Run Exploit with its log, then
+                // repeat this request.
+                [me hideQuietCover];
+                settings_run_exploit_with_log([me topViewController], ^(BOOL ready) {
+                    if (ready) [weakSelf handleActionURL:url completion:nil coldLaunched:cold
+                                          broughtToFront:broughtToFront];
+                });
+                return;
+            }
             if (!ok) {
                 if (!showLog) {
                     [me hideQuietCover];
