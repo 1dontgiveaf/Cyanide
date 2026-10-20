@@ -20,6 +20,22 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Settings → What's New and the Home card read Cyanide/Changelog.plist. It is
+# ignored because release.sh regenerates it for each release, so every build
+# entry point generates it only when absent. Keeping this in the low-level
+# script also covers CI, which may invoke scripts/build.sh directly.
+if [ ! -f "$PWD/Cyanide/Changelog.plist" ]; then
+    "$PWD/scripts/gen-changelog.sh" \
+        || echo "==> changelog generation failed (continuing without it)"
+fi
+
+# Let the focused shell regression suite exercise resource handling without
+# requiring Xcode; normal builds never set this variable.
+if [ "${BUILD_DRY_RUN:-0}" = "1" ]; then
+    echo "==> dry-run: changelog preparation complete; skipping xcodebuild"
+    exit 0
+fi
+
 SCHEME="${SCHEME:-Cyanide}"
 if [ "$SCHEME" = "CyanideVPhone" ]; then
     CONFIG="${CONFIG:-VPhone Debug}"

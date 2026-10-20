@@ -11,6 +11,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Download Public Submodules
         run: |
@@ -23,10 +26,10 @@ jobs:
           xcode-version: latest-stable
 
       - name: Make build script executable
-        run: chmod +x ./scripts/build.sh
+        run: chmod +x ./build.sh ./scripts/build.sh ./scripts/gen-changelog.sh
 
       - name: Compile Cyanide (Unsigned)
-        run: ./scripts/build.sh
+        run: ./build.sh
 
       - name: Upload IPA Artifact
         uses: actions/upload-artifact@v4

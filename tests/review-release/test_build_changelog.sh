@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Synthetic build-entry-point coverage; never invokes xcodebuild or publishing.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+SCRATCH_ROOT="${RELEASE_TEST_SCRATCH_ROOT:-$ROOT/.work/fix-reports/release-scratch}"
+mkdir -p "$SCRATCH_ROOT"
+CASE="$(mktemp -d "$SCRATCH_ROOT/build.XXXXXX")"
+trap 'rm -rf "$CASE"' EXIT
+
+bash -n "$ROOT/build.sh" "$ROOT/scripts/build.sh" "$ROOT/scripts/gen-changelog.sh"
+mkdir -p "$CASE/Cyanide" "$CASE/scripts"
+cp "$ROOT/build.sh" "$CASE/build.sh"
+cp "$ROOT/scripts/build.sh" "$CASE/scripts/build.sh"
+cp "$ROOT/scripts/gen-changelog.sh" "$CASE/scripts/gen-changelog.sh"
+cp "$ROOT/scripts/release-notes.sh" "$CASE/scripts/release-notes.sh"
+chmod +x "$CASE/build.sh" "$CASE/scripts/build.sh" "$CASE/scripts/gen-changelog.sh"
+
+cat > "$CASE/RELEASE_NOTES.md" <<'EOF'
+# Release Notes
+
+## Released
+
+### v1.9.0 - 2026-10-19
+
+- [x] Historical changelog fixture.
+EOF
+
+(
+    cd "$CASE"
+    git init -q
+    git config user.email test@example.invalid
+    git config user.name Test
+    touch Cyanide/placeholder
+    git add .
+    git commit -qm base
+    git tag v1.9.0
+
+    # The canonical wrapper and the direct CI-facing script both prepare the
+    # ignored resource without reaching xcodebuild in dry-run mode.
+    BUILD_DRY_RUN=1 ./build.sh > wrapper.log
+    test -f Cyanide/Changelog.plist
+    grep -Fq '<string>Historical changelog fixture.</string>' Cyanide/Changelog.plist
+    grep -Fq 'dry-run: changelog preparation complete' wrapper.log
+
+    # A release-generated/custom resource must not be overwritten by a build.
+    printf '%s\n' 'custom resource' > Cyanide/Changelog.plist
+    BUILD_DRY_RUN=1 ./build.sh > custom.log
+    test "$(cat Cyanide/Changelog.plist)" = 'custom resource'
+
+    rm Cyanide/Changelog.plist
+    BUILD_DRY_RUN=1 ./scripts/build.sh > direct.log
+    test -f Cyanide/Changelog.plist
+    grep -Fq '<string>Historical changelog fixture.</string>' Cyanide/Changelog.plist
+    grep -Fq 'dry-run: changelog preparation complete' direct.log
+)
+
+# Guard the workflow wiring that makes the same behavior reproducible on CI.
+grep -Fq 'fetch-depth: 0' "$ROOT/.github/workflows/build.yaml"
+grep -Fq 'fetch-tags: true' "$ROOT/.github/workflows/build.yaml"
+grep -Fq 'run: ./build.sh' "$ROOT/.github/workflows/build.yaml"
+! grep -Fq 'run: ./scripts/build.sh' "$ROOT/.github/workflows/build.yaml"
+! grep -Fq 'scripts/gen-changelog.sh' "$ROOT/build.sh"
+printf '%s\n' 'PASS: build wrapper/direct dry-run and CI changelog wiring'

@@ -26,12 +26,7 @@ export SDK="${SDK:-iphoneos}"
 export ARCHS="${ARCHS:-arm64e}"
 export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-17.0}"
 
-# Settings → What's New and the Home card read Cyanide/Changelog.plist. It is
-# not in git (release.sh regenerates it for each release), so a local build
-# without it shipped no What's New at all. Generate it from the release tags
-# when missing; an existing one (release.sh's pending entry) is kept.
-if [ ! -f "$ROOT/Cyanide/Changelog.plist" ]; then
-    (cd "$ROOT" && ./scripts/gen-changelog.sh) || echo "==> changelog generation failed (continuing without it)"
-fi
-
+# scripts/build.sh owns the one missing-resource check so direct CI builds and
+# this Release wrapper cannot recurse or generate twice. An existing resource
+# (including release.sh's pending entry or a local custom file) is preserved.
 exec "$ROOT/scripts/build.sh"
