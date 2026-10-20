@@ -82,7 +82,9 @@ emit_change_line() {
 released_notes_for_version() {
     local version="$1"
     local notes_file
-    notes_file="$(release_notes_file_for_version "$version" "$CHANGELOG_NOTES_OVERRIDE")"
+    # The override names the PENDING release's notes; released versions keep
+    # their own curated files (or RELEASE_NOTES.md history).
+    notes_file="$(release_notes_file_for_version "$version" "")"
     release_notes_bullets_for_version "$version" "$notes_file"
 }
 

@@ -93,6 +93,13 @@ compute_new_version() {
         return
     fi
     local bump="${BUMP:-patch}"
+    # The version was already bumped for a release that is drafted but not
+    # out yet (RELEASE_NOTES_<current>.md, no v<current> tag): release that
+    # version instead of skipping to the next patch without its notes.
+    if [ -z "${BUMP:-}" ] && [ -f "RELEASE_NOTES_${current}.md" ] &&
+       ! git rev-parse -q --verify "refs/tags/v${current}" >/dev/null; then
+        bump="none"
+    fi
     if [ "$bump" = "none" ]; then
         echo "$current"
         return
@@ -251,6 +258,17 @@ commit_dirty_submodules() {
         git -C "$path" push origin "$branch"
     done <<< "$paths"
 }
+
+# Untracked files would be committed by "git add -A" below and pushed to the
+# public repository (review notes, scratch folders, logs). Refuse unless they
+# are committed, ignored (.gitignore or .git/info/exclude) or explicitly allowed.
+UNTRACKED_FILES="$(git ls-files --others --exclude-standard)"
+if [ -n "$UNTRACKED_FILES" ] && [ -z "${RELEASE_ALLOW_UNTRACKED:-}" ]; then
+    echo "error: untracked files would be committed and pushed:" >&2
+    printf '%s\n' "$UNTRACKED_FILES" | sed 's/^/       /' | head -20 >&2
+    echo "       commit them, add them to .git/info/exclude, or set RELEASE_ALLOW_UNTRACKED=1." >&2
+    exit 1
+fi
 
 # Snapshot dirty state *before* the bump so we can tell apart bump-only commits
 # (auto-message OK) vs. mixed commits (user-supplied message required).

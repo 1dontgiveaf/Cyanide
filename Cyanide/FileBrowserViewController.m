@@ -1514,7 +1514,9 @@ static BOOL fb_share_prepare(FBShareOperation *op, NSString **failure)
         return NO;
     }
     op.dir = dir;
-    op.stagedPath = [dir stringByAppendingPathComponent:op.stagedPath.lastPathComponent ?: @"shared-file"];
+    NSString *name = op.stagedPath.lastPathComponent ?: @"shared-file";
+    if ([name isEqualToString:@".active"]) name = @"active";   // the marker's name
+    op.stagedPath = [dir stringByAppendingPathComponent:name];
     op.markerFD = fd;
     return YES;
 }
@@ -1612,18 +1614,35 @@ static void fb_share_complete(FBShareOperation *op, NSString *failure)
     avc.completionWithItemsHandler = ^(UIActivityType type, BOOL completed, NSArray *items, NSError *err) {
         fb_share_cleanup(op);
     };
+    // Present on top of whatever is up (e.g. an active search controller),
+    // never over a controller that is going away.
+    UIViewController *host = presenter;
+    while (host.presentedViewController && !host.presentedViewController.isBeingDismissed)
+        host = host.presentedViewController;
     UIPopoverPresentationController *pop = avc.popoverPresentationController;
     id source = op.source;
-    if ([source isKindOfClass:UIBarButtonItem.class]) pop.barButtonItem = source;
+    // A bar item replaced while the copy was prepared (bar buttons rebuilt
+    // after a load) has no view any more: anchor to the screen instead.
+    BOOL itemLive = [source isKindOfClass:UIBarButtonItem.class] && host == presenter &&
+                    ([presenter.navigationItem.rightBarButtonItems containsObject:source] ||
+                     [presenter.navigationItem.leftBarButtonItems containsObject:source]);
+    if (itemLive) pop.barButtonItem = source;
     else if ([source isKindOfClass:UIView.class] && ((UIView *)source).window == presenter.view.window &&
              ((UIView *)source).superview != nil) {
         pop.sourceView = source;
         pop.sourceRect = [(UIView *)source bounds];
     } else {
-        pop.sourceView = presenter.view;
-        pop.sourceRect = CGRectMake(CGRectGetMidX(presenter.view.bounds), CGRectGetMidY(presenter.view.bounds), 1, 1);
+        pop.sourceView = host.view;
+        pop.sourceRect = CGRectMake(CGRectGetMidX(host.view.bounds), CGRectGetMidY(host.view.bounds), 1, 1);
     }
-    [presenter presentViewController:avc animated:YES completion:nil];
+    __weak UIActivityViewController *weakAvc = avc;
+    [host presentViewController:avc animated:YES completion:nil];
+    // If UIKit refused the presentation, neither the present completion nor
+    // the sheet's handler ever runs: release the staged copy then. (A sheet
+    // already closed has cleaned up; the cleanup is idempotent.)
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (!weakAvc.presentingViewController) fb_share_cleanup(op);
+    });
 }
 
 void filebrowser_cancel_shares_for_presenter(UIViewController *presenter)

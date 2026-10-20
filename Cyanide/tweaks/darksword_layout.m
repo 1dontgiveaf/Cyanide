@@ -232,15 +232,31 @@ static RC_SBIconImageInfo rc_scaled_icon_info(uint64_t cfg, double scale, NSStri
 {
     NSString *nativeKey = [@"LayoutIconInfoNative" stringByAppendingString:where];
     NSString *appliedKey = [@"LayoutIconInfoApplied" stringByAppendingString:where];
-    RC_SBIconImageInfo cur = {0}, native = {0}, applied = {0};
+    // The value before that too: a run whose setter never reached SpringBoard
+    // still recorded its value, so the config may hold the previous one.
+    NSString *prevKey = [@"LayoutIconInfoAppliedPrev" stringByAppendingString:where];
+    RC_SBIconImageInfo cur = {0}, native = {0}, applied = {0}, prev = {0};
     bool curOK = cfg && r_responds(cfg, "iconImageInfo") &&
                  r_msg2_main_struct_ret(cfg, "iconImageInfo", &cur, sizeof(cur),
                                         NULL, 0, NULL, 0, NULL, 0, NULL, 0) &&
                  rc_info_plausible(&cur);
+    bool haveApplied = rc_info_from_defaults(appliedKey, &applied);
+    bool havePrev = rc_info_from_defaults(prevKey, &prev);
+    // Cyanide 1.9.0 and earlier applied 60 pt @2x x slider (radius 13.5 x
+    // slider) and recorded nothing. Such a value still in the config (updated
+    // without a respring) is not this device's native size.
+    bool legacyApplied = curOK && !haveApplied && fabs(cur.scale - 2.0) < 0.01 &&
+                         fabs(cur.width - 60.0) > 0.01 &&
+                         fabs(cur.cornerRadius - cur.width * (13.5 / 60.0)) < 0.05;
     const char *source;
-    if (curOK && rc_info_from_defaults(appliedKey, &applied) && rc_info_equal(&cur, &applied) &&
+    if (curOK && ((haveApplied && rc_info_equal(&cur, &applied)) || (havePrev && rc_info_equal(&cur, &prev))) &&
         rc_info_from_defaults(nativeKey, &native)) {
-        source = "remembered";               // the config still holds our last value
+        source = "remembered";               // the config still holds one of our values
+    } else if (legacyApplied) {
+        // Same base 1.9.0 used, kept until a respring shows the real one.
+        if (!rc_info_from_defaults(nativeKey, &native)) native = (RC_SBIconImageInfo){ 60.0, 60.0, 2.0, 13.5 };
+        rc_info_to_defaults(nativeKey, &native);
+        source = "remembered (config holds an older Cyanide size; respring to re-read)";
     } else if (curOK) {
         native = cur;
         rc_info_to_defaults(nativeKey, &native);
@@ -257,6 +273,7 @@ static RC_SBIconImageInfo rc_scaled_icon_info(uint64_t cfg, double scale, NSStri
         .scale        = native.scale,
         .cornerRadius = native.cornerRadius * scale,
     };
+    if (haveApplied && !rc_info_equal(&applied, &info)) rc_info_to_defaults(prevKey, &applied);
     rc_info_to_defaults(appliedKey, &info);
     printf("[%s] native icon %.1fx%.1f@%.0fx r=%.1f (%s) -> %.1fx%.1f r=%.1f\n", tag,
            native.width, native.height, native.scale, native.cornerRadius, source,

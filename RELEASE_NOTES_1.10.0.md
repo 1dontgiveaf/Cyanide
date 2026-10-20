@@ -39,7 +39,7 @@ A Cache Cleaner, a Run Exploit button and one consistent way for the tools to ge
 
 ## Removed
 
-- **Auto-Upload Logs** in Settings. Logs stay on your device; use **Share Log** to send one.
+- **Auto-Upload Logs** was removed from Settings. Logs stay on your device; use **Share Log** to send one.
 
 ## Good to know
 
