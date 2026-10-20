@@ -72,6 +72,9 @@ emit_change_line() {
     [ -z "$subj" ] && return
     if is_noisy_bump "$subj"; then return; fi
     local escaped
+    # What's New shows plain text: drop Markdown bold/code markers that the
+    # versioned release-notes drafts use.
+    subj="$(printf '%s' "$subj" | sed -E 's/\*\*//g; s/`//g')"
     escaped="$(printf '%s' "$subj" | xml_escape)"
     echo "      <string>${escaped}</string>"
 }
