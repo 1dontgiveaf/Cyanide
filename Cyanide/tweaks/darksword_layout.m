@@ -19,6 +19,7 @@
 #import <stdlib.h>
 #import <string.h>
 #import <unistd.h>
+#import <math.h>
 
 // Two SpringBoard shapes ship in this binary:
 //   iOS 18  — the upstream kolbicz path: SBIconController.iconManager
@@ -189,6 +190,78 @@ static bool rc_set_icon_info_on(uint64_t cfg, uint64_t clsInv,
                     NULL, 0, NULL, 0, NULL, 0);
     // false = the dispatch didn't complete; the setter may or may not have run.
     return r_last_main_ok();
+}
+
+// The icon size SpringBoard uses natively on this device: 60 pt @2x on some
+// iPhones, 64 pt @3x on others. Scaling a fixed 60 pt @2x made "98 %" really
+// ~92 % on 64 pt devices, and rendered the icons at 2x on a 3x screen.
+// The layout config only reports the native value until we change it, so it
+// is remembered (per home/dock) next to the value we last set: when the config
+// still holds our value (another run in the same SpringBoard session), the
+// remembered native one is used instead of compounding the scale.
+static bool rc_info_plausible(const RC_SBIconImageInfo *i)
+{
+    return i->width >= 30.0 && i->width <= 140.0 && i->height >= 30.0 && i->height <= 140.0 &&
+           i->scale >= 1.0 && i->scale <= 4.0 && i->cornerRadius >= 0.0 && i->cornerRadius <= 50.0;
+}
+
+static bool rc_info_equal(const RC_SBIconImageInfo *a, const RC_SBIconImageInfo *b)
+{
+    return fabs(a->width - b->width) < 0.01 && fabs(a->height - b->height) < 0.01 &&
+           fabs(a->scale - b->scale) < 0.01 && fabs(a->cornerRadius - b->cornerRadius) < 0.01;
+}
+
+static bool rc_info_from_defaults(NSString *key, RC_SBIconImageInfo *out)
+{
+    NSArray *a = [[NSUserDefaults standardUserDefaults] arrayForKey:key];
+    if (a.count != 4) return false;
+    for (id v in a) if (![v isKindOfClass:[NSNumber class]]) return false;
+    *out = (RC_SBIconImageInfo){ [a[0] doubleValue], [a[1] doubleValue],
+                                 [a[2] doubleValue], [a[3] doubleValue] };
+    return rc_info_plausible(out);
+}
+
+static void rc_info_to_defaults(NSString *key, const RC_SBIconImageInfo *i)
+{
+    [[NSUserDefaults standardUserDefaults] setObject:@[ @(i->width), @(i->height), @(i->scale), @(i->cornerRadius) ]
+                                              forKey:key];
+}
+
+// The scaled icon info for `cfg` (where = "Home" or "Dock").
+static RC_SBIconImageInfo rc_scaled_icon_info(uint64_t cfg, double scale, NSString *where, const char *tag)
+{
+    NSString *nativeKey = [@"LayoutIconInfoNative" stringByAppendingString:where];
+    NSString *appliedKey = [@"LayoutIconInfoApplied" stringByAppendingString:where];
+    RC_SBIconImageInfo cur = {0}, native = {0}, applied = {0};
+    bool curOK = cfg && r_responds(cfg, "iconImageInfo") &&
+                 r_msg2_main_struct_ret(cfg, "iconImageInfo", &cur, sizeof(cur),
+                                        NULL, 0, NULL, 0, NULL, 0, NULL, 0) &&
+                 rc_info_plausible(&cur);
+    const char *source;
+    if (curOK && rc_info_from_defaults(appliedKey, &applied) && rc_info_equal(&cur, &applied) &&
+        rc_info_from_defaults(nativeKey, &native)) {
+        source = "remembered";               // the config still holds our last value
+    } else if (curOK) {
+        native = cur;
+        rc_info_to_defaults(nativeKey, &native);
+        source = "layout config";
+    } else if (rc_info_from_defaults(nativeKey, &native)) {
+        source = "remembered (config unreadable)";
+    } else {
+        native = (RC_SBIconImageInfo){ 60.0, 60.0, 2.0, 13.5 };
+        source = "fallback";
+    }
+    RC_SBIconImageInfo info = {
+        .width        = native.width * scale,
+        .height       = native.height * scale,
+        .scale        = native.scale,
+        .cornerRadius = native.cornerRadius * scale,
+    };
+    rc_info_to_defaults(appliedKey, &info);
+    printf("[%s] native icon %.1fx%.1f@%.0fx r=%.1f (%s) -> %.1fx%.1f r=%.1f\n", tag,
+           native.width, native.height, native.scale, native.cornerRadius, source,
+           info.width, info.height, info.cornerRadius);
+    return info;
 }
 
 // True for the icon classes we resize: real app icons, PLUS the special dynamic
@@ -568,12 +641,7 @@ bool darksword_layout_home_scale_in_session(double scale)
     uint64_t clsInv = r_class("NSInvocation");
     if (!clsInv) return false;
 
-    RC_SBIconImageInfo info = {
-        .width        = 60.0 * scale,
-        .height       = 60.0 * scale,
-        .scale        = 2.0,
-        .cornerRadius = 13.5 * scale,
-    };
+    RC_SBIconImageInfo info = rc_scaled_icon_info(cfg, scale, @"Home", "HSSCALE");
 
     // Set the size on the root layout config (async, for persistence + future
     // relayouts), then eagerly resize the live icon views so the change shows
@@ -662,12 +730,7 @@ bool darksword_layout_dock_scale_in_session(double scale)
     uint64_t clsInv = r_class("NSInvocation");
     if (!clsInv) return false;
 
-    RC_SBIconImageInfo info = {
-        .width        = 60.0 * scale,
-        .height       = 60.0 * scale,
-        .scale        = 2.0,
-        .cornerRadius = 13.5 * scale,
-    };
+    RC_SBIconImageInfo info = rc_scaled_icon_info(dockCfg, scale, @"Dock", "DOCKSCALE");
 
     // Set the dock's icon size on its layout config (async), then eagerly resize
     // the live dock icon views so it shows during the run.
