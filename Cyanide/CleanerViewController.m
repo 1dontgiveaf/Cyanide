@@ -525,6 +525,16 @@ static unsigned long long cleaner_clear_directory_at(int containerFD, NSString *
 }
 @end
 
+// A nil result means Crash Logs was not part of this clean pass. Keep the
+// displayed row in that case; a submitted row may disappear only when its
+// complete rescan proves that no bytes remain.
+static CYCleanerItem *cleaner_published_crash_logs(CYCleanerItem *existing,
+                                                   CYCleanerItem *result)
+{
+    if (!result) return existing;
+    return (result.totalBytes > 0 || result.incomplete) ? result : nil;
+}
+
 @interface CYCleanerFoldersViewController : UITableViewController
 @property (nonatomic, copy) NSArray<CYCleanerItem *> *items;
 @end
@@ -1621,8 +1631,7 @@ static BOOL cleaner_intro_accepted(void)
                 // Replace the model and reload together. Offscreen folder-review
                 // controllers keep their original stable item snapshots.
                 self.items = published;
-                self.crashLogs = (logsResult && (logsResult.totalBytes > 0 || logsResult.incomplete))
-                    ? logsResult : nil;
+                self.crashLogs = cleaner_published_crash_logs(self.crashLogs, logsResult);
                 [self.tableView reloadData];
                 [self updateControls];
                 UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, self.resultText);
