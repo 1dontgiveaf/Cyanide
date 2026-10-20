@@ -1520,13 +1520,18 @@ static BOOL cleaner_intro_accepted(void)
                             trustedContainerDevice = currentStat.st_dev;
                         }
                     }
-                    NSSet<NSString *> *activeNames = settings_active_process_names();
-                    if (!activeNames || item.container.executableName.length == 0) {
-                        processUnavailable = YES;
-                    } else if (cleaner_process_is_active(item.container.executableName, activeNames)) {
-                        item.active = YES;
-                        skippedActive++;
-                        skipApp = YES;
+                    // The kernel round trip is only worthwhile while the app
+                    // is still a deletion candidate; an app already skipped
+                    // (identity changed) never needs the active check.
+                    if (!skipApp) {
+                        NSSet<NSString *> *activeNames = settings_active_process_names();
+                        if (!activeNames || item.container.executableName.length == 0) {
+                            processUnavailable = YES;
+                        } else if (cleaner_process_is_active(item.container.executableName, activeNames)) {
+                            item.active = YES;
+                            skippedActive++;
+                            skipApp = YES;
+                        }
                     }
                 }
 
