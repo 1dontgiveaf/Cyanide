@@ -796,8 +796,68 @@ static NSArray<NSDictionary *> *settings_repotweaks_tweaks_for_url(NSString *rep
 // overlay waits for it).
 static NSString * const kSettingsSpringBoardRestartedNotification = @"CYSpringBoardRestarted";
 
+// A direct restart can finish while the cleanup worker is still closing the
+// SpringBoard channel. The overlay is necessarily created after that worker
+// returns, so it cannot rely on subscribing only from -loadRespringPayload.
+// Arm a generation before cleanup and latch the restart notification globally;
+// the overlay checks the latch before it installs its own late observer and
+// before it invokes the WebKit fallback.
+static volatile uint64_t g_respring_generation_counter = 0;
+static volatile uint64_t g_respring_pending_generation = 0;
+static volatile uint64_t g_respring_scheduled_generation = 0;
+static volatile uint64_t g_respring_restarted_generation = 0;
+static volatile int g_respring_scheduled = 0;
+
+static uint64_t settings_arm_respring_generation(void)
+{
+    uint64_t generation = __sync_add_and_fetch(&g_respring_generation_counter, 1);
+    __sync_lock_test_and_set(&g_respring_pending_generation, generation);
+    __sync_lock_test_and_set(&g_respring_scheduled_generation, 0);
+    __sync_lock_test_and_set(&g_respring_restarted_generation, 0);
+
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        [NSNotificationCenter.defaultCenter
+            addObserverForName:kSettingsSpringBoardRestartedNotification
+                        object:nil
+                         queue:NSOperationQueue.mainQueue
+                    usingBlock:^(NSNotification *note) {
+            (void)note;
+            uint64_t pending = g_respring_pending_generation;
+            if (pending != 0) {
+                __sync_lock_test_and_set(&g_respring_restarted_generation, pending);
+                printf("[RESPRING] latched restart generation %llu\n",
+                       (unsigned long long)pending);
+            }
+        }];
+    });
+    return generation;
+}
+
+static void settings_note_respring_restart(void)
+{
+    uint64_t pending = g_respring_pending_generation;
+    if (pending != 0)
+        __sync_lock_test_and_set(&g_respring_restarted_generation, pending);
+}
+
+static BOOL settings_respring_restart_seen(uint64_t generation)
+{
+    return generation != 0 && g_respring_restarted_generation == generation;
+}
+
+static void settings_disarm_respring_generation(uint64_t generation)
+{
+    if (generation == 0) return;
+    if (g_respring_pending_generation == generation)
+        __sync_lock_test_and_set(&g_respring_pending_generation, 0);
+    if (g_respring_scheduled_generation == generation)
+        __sync_lock_test_and_set(&g_respring_scheduled_generation, 0);
+}
+
 @interface DSRespringOverlayView : UIView
 @property (nonatomic, assign) BOOL direct;   // SpringBoard relaunch scheduled: no WebKit payload
+@property (nonatomic, assign) uint64_t restartGeneration;
 @property (nonatomic, strong) id restartObserver;
 @property (nonatomic, strong) WKWebView *webView;
 @property (nonatomic, assign) BOOL didLoadPayload;
@@ -864,6 +924,7 @@ static const NSInteger kDSRespringBadgeTag = 0x5245;   // the logo + label shown
 - (void)removeFromSuperview {
     if (self.restartObserver) [NSNotificationCenter.defaultCenter removeObserver:self.restartObserver];
     self.restartObserver = nil;
+    settings_disarm_respring_generation(self.restartGeneration);
     [super removeFromSuperview];
 }
 
@@ -911,6 +972,13 @@ static const NSInteger kDSRespringBadgeTag = 0x5245;   // the logo + label shown
     self.didLoadPayload = YES;
     if (self.direct) {
         printf("[RESPRING] waiting for SpringBoard to restart\n");
+        uint64_t generation = self.restartGeneration;
+        if (settings_respring_restart_seen(generation)) {
+            printf("[RESPRING] restart generation %llu already observed; removing cover\n",
+                   (unsigned long long)generation);
+            [self removeFromSuperview];
+            return;
+        }
         // The direct request may have been scheduled, may be late, or its reply
         // may have been lost (ASRemovalUnknown is treated as scheduled because
         // the timer may exist). Keep a real fallback: if SpringBoard has not
@@ -921,6 +989,7 @@ static const NSInteger kDSRespringBadgeTag = 0x5245;   // the logo + label shown
         id observer = [NSNotificationCenter.defaultCenter
             addObserverForName:kSettingsSpringBoardRestartedNotification object:nil
                          queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+            if (!weakSelf || weakSelf.restartGeneration != generation) return;
             printf("[RESPRING] SpringBoard is back; removing the respring cover\n");
             [weakSelf removeFromSuperview];
         }];
@@ -930,6 +999,12 @@ static const NSInteger kDSRespringBadgeTag = 0x5245;   // the logo + label shown
         // force a second respring on top of it.
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             if (!weakSelf.superview || weakSelf.webView) return;
+            if (settings_respring_restart_seen(generation)) {
+                printf("[RESPRING] restart generation %llu arrived before fallback; removing cover\n",
+                       (unsigned long long)generation);
+                [weakSelf removeFromSuperview];
+                return;
+            }
             printf("[RESPRING] no SpringBoard restart seen 10 s after the request; "
                    "using the WebKit fallback\n");
             [[weakSelf viewWithTag:kDSRespringBadgeTag] removeFromSuperview];
@@ -2527,6 +2602,9 @@ static void settings_stop_disabled_applied_springboard_tweaks_locked(NSUserDefau
 
 static void settings_handle_springboard_restart(void)
 {
+    // The overlay may not exist yet because the respring cleanup worker can
+    // still be draining. Record the event before dispatching that cleanup.
+    settings_note_respring_restart();
     // SpringBoard just (re)started. Every pointer we cached from the previous
     // SB incarnation — class addresses, selector slots, retained objects,
     // ivar offsets, the trojan thread, our shmem map — is stale. Calling
@@ -3123,10 +3201,6 @@ static void settings_present_controller(UIViewController *controller, UIViewCont
     });
 }
 
-// Set by settings_prepare_for_respring_sync when SpringBoard itself will
-// relaunch (scheduled through the RemoteCall session); otherwise the WebKit
-// overlay has to force the respring.
-static volatile int g_respring_scheduled = 0;
 static void settings_show_respring_overlay(UIViewController *fallback)
 {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -3137,7 +3211,8 @@ static void settings_show_respring_overlay(UIViewController *fallback)
         }
         DSRespringOverlayView *overlay = [[DSRespringOverlayView alloc] initWithFrame:window.bounds];
         // SpringBoard restarts on its own: just cover the screen meanwhile.
-        overlay.direct = g_respring_scheduled != 0;
+        overlay.restartGeneration = g_respring_scheduled_generation;
+        overlay.direct = overlay.restartGeneration != 0;
         [window addSubview:overlay];
         [overlay loadRespringPayload];
     });
@@ -3734,6 +3809,7 @@ static const double kRebootDelay = 2.5;
 static BOOL settings_prepare_for_restart_sync(BOOL reboot)
 {
     const char *tag = reboot ? "[REBOOT]" : "[RESPRING]";
+    uint64_t respringGeneration = reboot ? 0 : settings_arm_respring_generation();
     log_user("%s Stopping live sessions before %s.\n", tag, reboot ? "reboot" : "respring");
     printf("[SETTINGS] preparing for %s cleanup rcReady=%d\n", reboot ? "reboot" : "respring", g_springboard_rc_ready);
     settings_request_all_live_loops_stop("pre-respring cleanup");
@@ -3777,6 +3853,7 @@ static BOOL settings_prepare_for_restart_sync(BOOL reboot)
                 ASRemovalResult sched = respring_schedule_in_session(kRespringDelay);
                 if (sched != ASRemovalNotScheduled) {
                     g_respring_scheduled = 1;
+                    __sync_lock_test_and_set(&g_respring_scheduled_generation, respringGeneration);
                     scheduledNs = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
                     if (sched == ASRemovalUnknown) {
                         // The timer may exist, so do not force a second respring
@@ -3821,6 +3898,7 @@ static BOOL settings_prepare_for_restart_sync(BOOL reboot)
             log_user("[RESPRING] WARNING: cleanup took %.2fs, close to the %.1fs restart.\n", elapsed, kRespringDelay);
         return YES;
     }
+    settings_disarm_respring_generation(respringGeneration);
     log_user("[RESPRING] Cleanup complete. Opening respring flow.\n");
     usleep(300000);
     return YES;
