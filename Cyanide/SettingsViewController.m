@@ -2949,6 +2949,12 @@ static void settings_notify_remote_call_state_changed_preserving_applied(BOOL pr
     });
 }
 
+// Set on the thread running the respring/reboot preparation while it opens
+// the SpringBoard session it needs for the direct relaunch. Its own cleanup
+// flag must not cancel that session's launch settle wait: a respring tapped
+// right after opening Cyanide otherwise always fell back to WebKit.
+static __thread BOOL t_settings_restart_prep_opening;
+
 static BOOL settings_cleanup_in_progress(void)
 {
     return g_settings_cleanup_running != 0 ||
@@ -3633,8 +3639,9 @@ static BOOL settings_ensure_springboard_remote_call_locked(void)
         objc_sync_exit(rcLock);
         BOOL aborted = NO;
         while ((nowNs = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)) < settleUntil) {
-            if (g_app_in_background || settings_cleanup_in_progress() ||
-                excport_gate_blocked()) {
+            BOOL cleanup = t_settings_restart_prep_opening ? g_settings_cleanup_running != 0
+                                                           : settings_cleanup_in_progress();
+            if (g_app_in_background || cleanup || excport_gate_blocked()) {
                 printf("[SETTINGS] SpringBoard hijack settle-wait aborted — app "
                        "backgrounding/cleanup; not arming now\n");
                 aborted = YES;
@@ -3741,7 +3748,9 @@ static BOOL settings_prepare_for_restart_sync(BOOL reboot)
     @synchronized (settings_rc_lock()) {
         if (!g_springboard_rc_ready && kernelReady) {
             log_user("%s Opening SpringBoard to ask it to %s…\n", tag, reboot ? "reboot" : "restart");
+            t_settings_restart_prep_opening = YES;
             settings_ensure_springboard_remote_call_locked();
+            t_settings_restart_prep_opening = NO;
         }
         if (g_springboard_rc_ready) {
             // SB is about to restart, so cleanup uses the fast variant for
