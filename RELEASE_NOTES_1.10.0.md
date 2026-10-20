@@ -18,7 +18,7 @@ A Cache Cleaner, accurate icon resizing, a cleaner respring screen, plus steadie
 
 ## Improvements
 
-- **Cleaner safety.** Cleaning never follows links out of an app's folders, scans are bounded and stop if Cyanide goes to the background, and the result reports the space actually freed. Whether an app is in use is re-checked right before it is cleaned, and the progress bar moves as each app finishes.
+- **Cleaner safety.** Cleaning never follows links out of an app's folders, scans are bounded and stop if Cyanide goes to the background, and the result reports the space actually freed. The progress bar now moves as each app finishes.
 - **Respring screen.** While SpringBoard restarts, Cyanide shows its logo and "Preparing respring…" instead of a second spinner next to the one from iOS.
 - **Process Viewer.** Incomplete or inconsistent process lists are discarded instead of shown, apps are only marked as suspended when their identity is confirmed, and calibration can no longer be disturbed by a refresh running at the same time.
 
