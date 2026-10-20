@@ -41,11 +41,20 @@ class CalibrationOwnershipTests(unittest.TestCase):
                 self.assertEqual(body.count('return '), 1)
                 self.assertNotIn('krw_batch_begin', body)
         calibration = function(source, 'static int procmgr_calibrate_locked(void)')
+        identity = function(source, 'static int pm_calibrate_identity_locked(void)')
         getter = function(source, 'static int procmgr_task_thread_count_offset_locked(void)')
-        self.assertIn('pm_calibrate_suspcount_locked();', calibration)
+        self.assertIn('pm_calibrate_identity_locked();', calibration)
+        self.assertIn('pm_calibrate_suspcount_locked();', identity)
+        self.assertIn('pm_calibrate_bsdinfo();', identity)
         self.assertIn('pm_calibrate_suspcount_locked();', getter)
         self.assertNotIn('pm_calibration_lock_enter()', calibration)
+        self.assertNotIn('pm_calibration_lock_enter()', identity)
         self.assertNotIn('pm_calibration_lock_enter()', getter)
+
+        bsdinfo = function(source, 'static void pm_calibrate_bsdinfo(void)')
+        self.assertLess(bsdinfo.index('if (!kexploit_krw_ready()) return;'),
+                        bsdinfo.index('g_pm_bsdinfo_attempts++'))
+        self.assertIn('transient outage cannot consume', bsdinfo)
 
     def test_native_concurrent_publication(self):
         source = SOURCE.read_text()

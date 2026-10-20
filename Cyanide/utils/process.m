@@ -256,8 +256,11 @@ static bool pm_find_entry_task(int pid, uint64_t *procOut, uint64_t *taskOut);
 static void pm_calibrate_bsdinfo(void) {
     if (g_pm_off_task_bsdinfo || g_pm_task_proc_delta) return;
     if (g_pm_bsdinfo_attempts >= PM_BSDINFO_MAX_ATTEMPTS) return;
-    g_pm_bsdinfo_attempts++;
     if (!kexploit_krw_ready()) return;
+    // A detached/not-yet-armed pass is not a calibration attempt. Count only
+    // after the readiness gate so a transient outage cannot consume the
+    // session's retry budget and prevent recovery on a later ready pass.
+    g_pm_bsdinfo_attempts++;
 
     krw_set_nonfatal(true);
     uint64_t selfProc = proc_self(), task = 0;
