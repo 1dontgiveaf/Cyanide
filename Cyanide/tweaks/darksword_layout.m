@@ -736,7 +736,58 @@ bool darksword_layout_dock_scale_in_session(double scale)
 // user-set "extra padding" as a scale-down ratio. Effective padding:
 // w/h_new = w/h - (left+right) / -(top+bottom). The whole grid shrinks
 // inside its bounds, creating visible empty space at the edges. The
+// translation is the half-difference of each edge pair, so asymmetric
+// requests remain asymmetric instead of being silently recentered. The
 // dock gets its own transform driven by dockExL/dockExR.
+typedef struct {
+    double scaleX;
+    double scaleY;
+    double tx;
+    double ty;
+} DSLayout26Transform;
+
+static DSLayout26Transform ds_layout26_transform_for_edges(double width,
+                                                           double height,
+                                                           double extraLeft,
+                                                           double extraRight,
+                                                           double extraTop,
+                                                           double extraBottom,
+                                                           double iconScale)
+{
+    DSLayout26Transform result = {
+        .scaleX = 1.0,
+        .scaleY = 1.0,
+        .tx = 0.0,
+        .ty = 0.0,
+    };
+    bool widthPaddingValid = false;
+    bool heightPaddingValid = false;
+    if (extraLeft + extraRight != 0.0 && width > 0.0) {
+        double availableWidth = width - (extraLeft + extraRight);
+        if (availableWidth > 0.0) {
+            result.scaleX = availableWidth / width;
+            widthPaddingValid = true;
+        }
+    }
+    if (extraTop + extraBottom != 0.0 && height > 0.0) {
+        double availableHeight = height - (extraTop + extraBottom);
+        if (availableHeight > 0.0) {
+            result.scaleY = availableHeight / height;
+            heightPaddingValid = true;
+        }
+    }
+    if (iconScale > 0.0 && iconScale != 1.0) {
+        result.scaleX *= iconScale;
+        result.scaleY *= iconScale;
+    }
+    // UIView transforms are centered on the view's anchor point. Scaling
+    // therefore contributes equal space on both sides; only the half-
+    // difference translation can preserve an asymmetric request.
+    if (widthPaddingValid) result.tx = (extraLeft - extraRight) / 2.0;
+    if (heightPaddingValid) result.ty = (extraTop - extraBottom) / 2.0;
+    return result;
+}
+
 static bool darksword_layout_apply_in_session_ios26(double exL, double exR, double exT, double exB,
                                                     double dockExL, double dockExR,
                                                     double homeScale, double dockScale)
@@ -846,56 +897,71 @@ static bool darksword_layout_apply_in_session_ios26(double exL, double exR, doub
                                                 NULL, 0, NULL, 0, NULL, 0, NULL, 0);
         if (haveFrame) {
             double w = frame[2], h = frame[3];
-            double scaleX = 1.0, scaleY = 1.0;
-            double tx = 0.0;
             if (isDock) {
-                double totH = dockExL + dockExR;
-                if (totH != 0.0 && w > 0.0) {
-                    double avail = w - totH;
-                    if (avail > 0.0) scaleX = avail / w;
-                    scaleY = scaleX;
-                    // Center-scaling removes totH/2 from each side; shift by
-                    // (L-R)/2 so the left gap ends up dockExL and the right
-                    // gap dockExR (a pure scale can only pad symmetrically).
-                    tx = (dockExL - dockExR) / 2.0;
+                // Dock keeps its historical uniform scaleY=scaleX behavior:
+                // feed the horizontal total into two equal vertical edges so
+                // the shared helper does not turn a horizontal pad into a
+                // vertical stretch. Equal synthetic edges also keep ty at 0.
+                double dockTotal = dockExL + dockExR;
+                DSLayout26Transform transform = ds_layout26_transform_for_edges(
+                    w, w, dockExL, dockExR,
+                    dockTotal / 2.0, dockTotal / 2.0,
+                    dockScale);
+                double scaleX = transform.scaleX;
+                double scaleY = transform.scaleY;
+                double tx = transform.tx;
+                double ty = transform.ty;
+                if (scaleX != 1.0 || scaleY != 1.0 || tx != 0.0 || ty != 0.0) {
+                    // CGAffineTransform: { a, b, c, d, tx, ty } — 6 doubles, 48 bytes.
+                    double xf[6] = { scaleX, 0.0, 0.0, scaleY, tx, ty };
+                    r_msg2_main_raw(lv, "setTransform:",
+                                    xf, sizeof(xf),
+                                    NULL, 0, NULL, 0, NULL, 0);
+                    bool setOk = r_last_main_ok();
+                    printf("[LAYOUT26]   dock transform scale=(%.3f,%.3f) tx=%.1f ty=%.1f frameWxH=%.1fx%.1f%s\n",
+                           scaleX, scaleY, tx, ty, w, h,
+                           setOk ? "" : " (setTransform: failed)");
+                    if (setOk) anyOk = true;
+                } else {
+                    // Reset to identity in case a prior Run left a transform.
+                    double identity[6] = { 1.0, 0.0, 0.0, 1.0, 0.0, 0.0 };
+                    r_msg2_main_raw(lv, "setTransform:",
+                                    identity, sizeof(identity),
+                                    NULL, 0, NULL, 0, NULL, 0);
+                    if (r_last_main_ok()) anyOk = true;
                 }
-                if (dockScale > 0.0 && dockScale != 1.0) {
-                    scaleX *= dockScale;
-                    scaleY *= dockScale;
-                }
+                continue;
             } else {
-                if (exL + exR != 0.0 && w > 0.0) {
-                    double availW = w - (exL + exR);
-                    if (availW > 0.0) scaleX = availW / w;
+                DSLayout26Transform transform = ds_layout26_transform_for_edges(w, h,
+                                                                                  exL, exR,
+                                                                                  exT, exB,
+                                                                                  homeScale);
+                double scaleX = transform.scaleX;
+                double scaleY = transform.scaleY;
+                double tx = transform.tx;
+                double ty = transform.ty;
+                if (scaleX != 1.0 || scaleY != 1.0 || tx != 0.0 || ty != 0.0) {
+                    // CGAffineTransform: { a, b, c, d, tx, ty } — 6 doubles, 48 bytes.
+                    // Scale plus the edge-difference translation for asymmetric
+                    // Home padding. Both axes are composed in one transform so
+                    // icon scaling cannot discard the requested offset.
+                    double xf[6] = { scaleX, 0.0, 0.0, scaleY, tx, ty };
+                    r_msg2_main_raw(lv, "setTransform:",
+                                    xf, sizeof(xf),
+                                    NULL, 0, NULL, 0, NULL, 0);
+                    bool setOk = r_last_main_ok();
+                    printf("[LAYOUT26]   home transform scale=(%.3f,%.3f) tx=%.1f ty=%.1f frameWxH=%.1fx%.1f%s\n",
+                           scaleX, scaleY, tx, ty, w, h,
+                           setOk ? "" : " (setTransform: failed)");
+                    if (setOk) anyOk = true;
+                } else {
+                    // Reset to identity in case a prior Run left a transform.
+                    double identity[6] = { 1.0, 0.0, 0.0, 1.0, 0.0, 0.0 };
+                    r_msg2_main_raw(lv, "setTransform:",
+                                    identity, sizeof(identity),
+                                    NULL, 0, NULL, 0, NULL, 0);
+                    if (r_last_main_ok()) anyOk = true;
                 }
-                if (exT + exB != 0.0 && h > 0.0) {
-                    double availH = h - (exT + exB);
-                    if (availH > 0.0) scaleY = availH / h;
-                }
-                if (homeScale > 0.0 && homeScale != 1.0) {
-                    scaleX *= homeScale;
-                    scaleY *= homeScale;
-                }
-            }
-            if (scaleX != 1.0 || scaleY != 1.0 || tx != 0.0) {
-                // CGAffineTransform: { a, b, c, d, tx, ty } — 6 doubles, 48 bytes.
-                // Scale (+ optional horizontal shift for asymmetric dock pad).
-                double xf[6] = { scaleX, 0.0, 0.0, scaleY, tx, 0.0 };
-                r_msg2_main_raw(lv, "setTransform:",
-                                xf, sizeof(xf),
-                                NULL, 0, NULL, 0, NULL, 0);
-                bool setOk = r_last_main_ok();
-                printf("[LAYOUT26]   %s transform scale=(%.3f,%.3f) tx=%.1f frameWxH=%.1fx%.1f%s\n",
-                       isDock ? "dock" : "home", scaleX, scaleY, tx, w, h,
-                       setOk ? "" : " (setTransform: failed)");
-                if (setOk) anyOk = true;
-            } else {
-                // Reset to identity in case a prior Run left a transform.
-                double identity[6] = { 1.0, 0.0, 0.0, 1.0, 0.0, 0.0 };
-                r_msg2_main_raw(lv, "setTransform:",
-                                identity, sizeof(identity),
-                                NULL, 0, NULL, 0, NULL, 0);
-                if (r_last_main_ok()) anyOk = true;
             }
         }
     }
