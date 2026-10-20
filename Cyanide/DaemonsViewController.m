@@ -284,6 +284,8 @@ static void daemons_note_change(NSArray<NSString *> *labels)
     NSDictionary *info = self.running[label];
     NSString *name = info[@"name"] ?: daemon_catalog_executable_guess(label);
     if (!self.running) return [name stringByAppendingString:@" · status unknown"];
+    if (daemon_catalog_is_legacy_label(label))
+        return [name stringByAppendingString:@" · legacy disabled entry; job presence not checked"];
     if ([info[@"missing"] boolValue]) return [name stringByAppendingString:@" · not a job on this iOS version"];
     NSNumber *pid = info[@"pid"];
     NSNumber *shared = info[@"shared"];
@@ -465,6 +467,11 @@ static void daemons_note_change(NSArray<NSString *> *labels)
             if (self.showAdvanced || anyOff) [out addObject:g];
         }
     }
+    // Never put removed labels back into a normal catalog group. They are
+    // shown only when a persisted disabled entry exists, and only offer the
+    // enable path that removes that entry.
+    CYDaemonGroup *legacy = daemon_catalog_legacy_recovery_group(self.disabled);
+    if (section == 1 && legacy) [out addObject:legacy];
     return out;
 }
 
@@ -575,12 +582,18 @@ static void daemons_note_change(NSArray<NSString *> *labels)
     NSMutableArray *facts = [NSMutableArray array];
     if (off > 0 && off < g.labels.count)
         [facts addObject:[NSString stringWithFormat:@"%lu of %lu disabled", (unsigned long)off, (unsigned long)g.labels.count]];
-    BOOL allMissing = self.running != nil;
-    for (NSString *label in g.labels) allMissing &= [self isLabelMissing:label];
-    if (allMissing)
-        [facts addObject:@"not a job on this iOS version"];
-    else if (self.running)
-        [facts addObject:running ? [NSString stringWithFormat:@"%lu running", (unsigned long)running] : @"not running"];
+    BOOL hasLegacy = NO;
+    for (NSString *label in g.labels) hasLegacy |= daemon_catalog_is_legacy_label(label);
+    if (hasLegacy) {
+        [facts addObject:@"legacy disabled entries; job presence not checked"];
+    } else {
+        BOOL allMissing = self.running != nil;
+        for (NSString *label in g.labels) allMissing &= [self isLabelMissing:label];
+        if (allMissing)
+            [facts addObject:@"not a job on this iOS version"];
+        else if (self.running)
+            [facts addObject:running ? [NSString stringWithFormat:@"%lu running", (unsigned long)running] : @"not running"];
+    }
     if (anyWarning) [facts addObject:@"still running although disabled"];
     if (unsaved) [facts insertObject:@"unsaved" atIndex:0];
     [facts addObject:g.summary];

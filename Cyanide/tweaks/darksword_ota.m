@@ -857,11 +857,13 @@ bool launchd_disabled_apply(NSDictionary<NSString *, NSNumber *> *changes)
     }
     BOOL enablesOTA = NO;
     for (NSString *label in changes) {
-        if (!daemon_catalog_contains_label(label) || ![changes[label] isKindOfClass:NSNumber.class]) {
-            printf("[DAEMONS] refusing plist edit: %s is not in the catalog\n", label.description.UTF8String);
+        NSNumber *value = changes[label];
+        if (![value isKindOfClass:NSNumber.class] ||
+            !daemon_catalog_change_is_allowed(label, value.boolValue)) {
+            printf("[DAEMONS] refusing plist edit: %s is not an allowed catalog change\n", label.description.UTF8String);
             return false;
         }
-        if (!changes[label].boolValue && [ota_daemon_labels() containsObject:label]) enablesOTA = YES;
+        if (!value.boolValue && [ota_daemon_labels() containsObject:label]) enablesOTA = YES;
     }
     int (^mutate)(NSMutableDictionary *) = ^int(NSMutableDictionary *plist) {
         int changed = 0;

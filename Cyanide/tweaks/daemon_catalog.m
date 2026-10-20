@@ -131,6 +131,32 @@ NSArray<CYDaemonGroup *> *daemon_catalog_groups(void)
     return groups;
 }
 
+// These labels were in Cyanide's older catalog, but were removed after the
+// iOS 17/18 launchd job audit. Keep this list explicit and finite: persisted
+// entries for these labels can be recovered, while arbitrary plist keys never
+// become an in-app write route.
+static NSArray<NSString *> *daemon_catalog_legacy_labels(void)
+{
+    static NSArray<NSString *> *labels;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        labels = @[
+            @"com.apple.atc.atwakeup",
+            @"com.apple.wapic",
+            @"com.apple.printd",
+            @"com.apple.sysdiagnose.darwinos",
+            @"com.apple.ReportCrash.Jetsam",
+            @"com.apple.logd.admin",
+            @"com.apple.logd.events",
+            @"com.apple.logd.watchdog",
+            @"com.apple.logd_reporter.report_statistics",
+            @"com.apple.system.logger",
+            @"com.apple.ProxiedCrashCopier",
+        ];
+    });
+    return labels;
+}
+
 BOOL daemon_catalog_contains_label(NSString *label)
 {
     static NSSet<NSString *> *all;
@@ -141,6 +167,36 @@ BOOL daemon_catalog_contains_label(NSString *label)
         all = s;
     });
     return [label isKindOfClass:NSString.class] && [all containsObject:label];
+}
+
+BOOL daemon_catalog_is_legacy_label(NSString *label)
+{
+    static NSSet<NSString *> *legacy;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ legacy = [NSSet setWithArray:daemon_catalog_legacy_labels()]; });
+    return [label isKindOfClass:NSString.class] && [legacy containsObject:label];
+}
+
+BOOL daemon_catalog_change_is_allowed(NSString *label, BOOL disable)
+{
+    if (daemon_catalog_contains_label(label)) return YES;
+    // Legacy rows are recovery-only. In particular, do not let an arbitrary
+    // persisted key or a fabricated UI request become a new disabled entry.
+    return !disable && daemon_catalog_is_legacy_label(label);
+}
+
+CYDaemonGroup *daemon_catalog_legacy_recovery_group(NSDictionary *disabled)
+{
+    if (![disabled isKindOfClass:NSDictionary.class]) return nil;
+    NSMutableArray<NSString *> *present = [NSMutableArray array];
+    for (NSString *label in daemon_catalog_legacy_labels()) {
+        id value = disabled[label];
+        if ([value isKindOfClass:NSNumber.class] && [value boolValue]) [present addObject:label];
+    }
+    if (!present.count) return nil;
+    return advanced(@"legacy-recovery", @"Legacy Disabled Services", @"arrow.uturn.backward.circle",
+                    @"Older Cyanide versions could disable these labels. Their job presence is not checked on this OS; switch them on to remove the persisted entry.",
+                    nil, present);
 }
 
 NSString *daemon_catalog_executable_guess(NSString *label)

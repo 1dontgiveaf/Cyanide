@@ -27,7 +27,8 @@ void darksword_ota_retry_pending_dir_restore(void);
 // Returns the plist's contents, or nil if it couldn't be read.
 NSDictionary<NSString *, id> *launchd_disabled_read(void);
 // changes: label -> @YES (disable) / @NO (enable, i.e. remove the entry).
-// Labels outside the catalog are refused.
+// Current catalog labels support both directions. A fixed set of labels from
+// older catalogs supports only @NO recovery; all other labels are refused.
 bool launchd_disabled_apply(NSDictionary<NSString *, NSNumber *> *changes);
 #endif
 

@@ -26,6 +26,12 @@
 
 NSArray<CYDaemonGroup *> *daemon_catalog_groups(void);
 BOOL daemon_catalog_contains_label(NSString *label);
+// Labels that were offered by older Cyanide catalogs but are intentionally not
+// part of the current disable catalog. They are recovery-only: an existing
+// disabled entry may be removed, but a new disable may never be written.
+BOOL daemon_catalog_is_legacy_label(NSString *label);
+BOOL daemon_catalog_change_is_allowed(NSString *label, BOOL disable);
+CYDaemonGroup *daemon_catalog_legacy_recovery_group(NSDictionary *disabled);
 // The executable name a label most likely runs, when launchd's job cache
 // can't be read: the label's last component, with known exceptions.
 NSString *daemon_catalog_executable_guess(NSString *label);
