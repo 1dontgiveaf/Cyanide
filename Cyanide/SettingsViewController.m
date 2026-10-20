@@ -11385,7 +11385,7 @@ static NSString *pm_chip_name(NSString *machine) {
                 // libproc p_stat only for this capped diagnostic — it used to
                 // be fetched for every row of every pass and then dropped.
                 printf("[PROCMGR] suspend: pid %d (%s) dimmed — krw_pstat=%d libproc=%d suspcount=%d\n",
-                       pid, buf[i].name, kst, procmgr_pstat(pid), sc);
+                       pid, buf[i].name, kst, sc);
             }
             [rows addObject:row];
         }

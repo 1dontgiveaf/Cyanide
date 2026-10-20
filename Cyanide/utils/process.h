@@ -63,8 +63,9 @@ bool procmgr_pid_alive(int pid);
 #define PM_SSTOP 4   /* Process debugging or suspension. */
 #define PM_SZOMB 5   /* Awaiting collection by parent. */
 
-// Returns the proc's p_stat (PM_SRUN, PM_SSTOP, PM_SZOMB, ...) via libproc,
-// or -1 when proc_pidinfo can't inspect the pid. Read-only, never crashes.
+// Returns our own proc's p_stat (PM_SRUN, PM_SSTOP, PM_SZOMB, ...) via KRW.
+// Other pids return -1: the libproc proc_pidinfo path is avoided on iOS
+// 18.5/T8140 after the 2026-10-20 per-CPU copy panic. Read-only.
 int procmgr_pstat(int pid);
 
 // Same p_stat but read directly from struct proc via KRW — kernel ground
