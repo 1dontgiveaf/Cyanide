@@ -926,6 +926,10 @@ typedef NS_ENUM(NSInteger, FBViewMode) { FBViewText, FBViewImage, FBViewHex, FBV
 - (instancetype)initWithEntry:(FBEntry *)entry;
 @end
 
+@interface FBFileViewController (Share)
+- (void)shareCopy:(UIBarButtonItem *)sender;
+@end
+
 @interface FBFileViewController ()
 @property (nonatomic, strong) FBEntry *entry;
 @property (nonatomic, strong) UITextView *textView;
@@ -1636,13 +1640,20 @@ static void fb_share_complete(FBShareOperation *op, NSString *failure)
         pop.sourceRect = CGRectMake(CGRectGetMidX(host.view.bounds), CGRectGetMidY(host.view.bounds), 1, 1);
     }
     __weak UIActivityViewController *weakAvc = avc;
-    [host presentViewController:avc animated:YES completion:nil];
+    __block BOOL presented = NO;
+    [host presentViewController:avc animated:YES completion:^{
+        presented = YES;
+    }];
     // If UIKit refused the presentation, neither the present completion nor
-    // the sheet's handler ever runs: release the staged copy then. (A sheet
-    // already closed has cleaned up; the cleanup is idempotent.)
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (!weakAvc.presentingViewController) fb_share_cleanup(op);
-    });
+    // the sheet's handler ever runs: release the staged copy then. Do not
+    // mistake an in-flight presentation for a refusal (that would delete the
+    // file while the sheet is appearing); retry once after it has settled.
+    void (^cleanupIfRefused)(void) = ^{
+        if (presented || weakAvc.presentingViewController || weakAvc.isBeingPresented) return;
+        fb_share_cleanup(op);
+    };
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(NSEC_PER_SEC)), dispatch_get_main_queue(), cleanupIfRefused);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), cleanupIfRefused);
 }
 
 void filebrowser_cancel_shares_for_presenter(UIViewController *presenter)
