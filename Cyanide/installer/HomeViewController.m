@@ -20,6 +20,7 @@ static const CGFloat kMargin = 20.0;
 @property (nonatomic, strong) UIStackView *stack;
 @property (nonatomic, weak) UIView *heroView;
 @property (nonatomic, weak) CAGradientLayer *heroGrad;
+@property (nonatomic, weak) UIView *kernelAccessRow;
 @end
 
 @implementation HomeViewController
@@ -63,6 +64,20 @@ static const CGFloat kMargin = 20.0;
                                              selector:@selector(repoSourcesEnabledDidChange:)
                                                  name:RepoSourcesEnabledDidChangeNotification
                                                object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(kernelStateDidChange:)
+                                                 name:kSettingsRemoteCallStateDidChangeNotification
+                                               object:nil];
+}
+
+- (void)updateKernelAccessRow
+{
+    self.kernelAccessRow.hidden = settings_kernel_access_available();
+}
+
+- (void)kernelStateDidChange:(NSNotification *)note
+{
+    dispatch_async(dispatch_get_main_queue(), ^{ [self updateKernelAccessRow]; });
 }
 
 - (void)dealloc { [[NSNotificationCenter defaultCenter] removeObserver:self]; }
@@ -88,6 +103,7 @@ static const CGFloat kMargin = 20.0;
 - (void)viewWillAppear:(BOOL)animated
 {
     [super viewWillAppear:animated];
+    [self updateKernelAccessRow];
     // Force the pending layout so the hero card already has its final bounds
     // when this appearance's first frame is composited. The gradient layer is
     // not resized here: layoutIfNeeded runs viewDidLayoutSubviews:, which owns
@@ -396,12 +412,15 @@ static const CGFloat kMargin = 20.0;
     UIStackView *s = [self vstackInCard:card spacing:12.0];
 
     [s addArrangedSubview:[self sectionHeader:@"Tools"]];
-    // Kernel access without applying tweaks; the tools never run it themselves.
-    [s addArrangedSubview:[self bigActionButton:@"Run Exploit"
-                                          sub:@"Kernel access for the tools, no tweaks applied"
-                                         icon:@"lock.open.fill"
-                                        color:UIColor.systemPurpleColor
-                                          sel:@selector(runExploit)]];
+    // Only while there is no live or saved kernel access: then the tools can't
+    // get it by themselves on A18/M4. Runs the exploit alone, with the log.
+    self.kernelAccessRow = [self bigActionButton:@"Kernel Access"
+                                             sub:@"Not ready. Tap to run the exploit (no tweaks applied)"
+                                            icon:@"lock.open.fill"
+                                           color:UIColor.systemPurpleColor
+                                             sel:@selector(runExploit)];
+    self.kernelAccessRow.hidden = settings_kernel_access_available();
+    [s addArrangedSubview:self.kernelAccessRow];
     [s addArrangedSubview:[self bigActionButton:@"Process Viewer"
                                           sub:@"See and quit running processes"
                                          icon:@"list.bullet.rectangle.fill"
@@ -759,6 +778,7 @@ static const CGFloat kMargin = 20.0;
     __weak typeof(self) weakSelf = self;
     settings_run_exploit_with_log(self, ^(BOOL ready) {
         typeof(self) me = weakSelf;
+        [me updateKernelAccessRow];
         if (!ready || !me || me.presentedViewController) return;
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Kernel Access Ready"
             message:@"Process Viewer, File Browser, Daemons, Cleaner and System Info can use it now."

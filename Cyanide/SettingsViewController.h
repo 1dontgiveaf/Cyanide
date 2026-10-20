@@ -172,6 +172,8 @@ extern NSString * const kSettingsActionsDidCompleteNotification;
 // userInfo[kSettingsApplyStatusTextKey] is the text, or absent to restore the
 // default status line.
 extern NSString * const kSettingsApplyStatusDidChangeNotification;
+// Kernel access or the SpringBoard session changed (posted on any thread).
+extern NSString * const kSettingsRemoteCallStateDidChangeNotification;
 extern NSString * const kSettingsApplyStatusTextKey;
 extern NSString * const kSettingsActionsDidCompleteSuccessKey;
 // YES when the run succeeded but some requested stages did not apply.

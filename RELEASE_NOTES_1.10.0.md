@@ -16,7 +16,7 @@ A Cache Cleaner, accurate icon resizing, a cleaner respring screen, plus steadie
   - **Crash Logs** is a separate, opt-in row. It removes only the contents of the CrashReporter folders, never app data. The same folder review and confirmation apply.
   - The first time you open it, Cyanide explains what cleaning can cause before anything can be removed.
   - While it loads, it shows what it's doing (getting access, finding apps, checking running apps, scanning).
-- **Run Exploit** (Home → Tools). Gets kernel access for the tools without applying any tweaks, with the log shown while it runs.
+- **Kernel Access** (Home → Tools, shown only while Cyanide has no kernel access). Runs the exploit for the tools without applying any tweaks, with the log shown while it runs.
 
 ## Improvements
 

@@ -1758,7 +1758,7 @@ static const NSUInteger kThemerLegacyPageMaxTicks = 200000;
 static const useconds_t kThemerLegacyPagePollUS   = 300000;   // 300ms cheap probe
 static const useconds_t kThemerRepairInitialDelayUS = 900000;
 static const useconds_t kThemerRepairIntervalUS = 450000;
-static NSString * const kSettingsRemoteCallStateDidChangeNotification = @"SettingsRemoteCallStateDidChangeNotification";
+NSString * const kSettingsRemoteCallStateDidChangeNotification = @"SettingsRemoteCallStateDidChangeNotification";
 NSString * const kSettingsActionsDidCompleteNotification = @"SettingsActionsDidCompleteNotification";
 NSString * const kSettingsActionsDidCompleteSuccessKey = @"success";
 NSString * const kSettingsActionsDidCompletePartialKey = @"partial";
@@ -7449,12 +7449,14 @@ void settings_run_exploit_with_log(UIViewController *presenter, void (^completio
                               @"Another run is in progress. Try again when it has finished.");
         return;
     }
-    if (g_kexploit_done && kexploit_krw_session_active()) {
+    // Live or parked kernel access needs no run: the caller just retries,
+    // and a parked session is restored then, silently, as usual.
+    if (settings_krw_available_without_exploit()) {
         if (completion) completion(YES);
         return;
     }
-    if (krw_persistence_has_saved_recovery() || !settings_device_is_a18_above()) {
-        // Restoring a parked session, or a run that can't reboot this device.
+    if (!settings_device_is_a18_above()) {
+        // A run that can't reboot this device: no need to ask.
         settings_run_exploit_with_log_confirmed(presenter, completion);
         return;
     }
