@@ -7428,14 +7428,26 @@ static void settings_run_exploit_with_log_reason(UIViewController *presenter, NS
     // On top of whatever is shown (e.g. the activity log), but never over an alert.
     while (presenter.presentedViewController && !presenter.presentedViewController.isBeingDismissed)
         presenter = presenter.presentedViewController;
-    if (!presenter.view.window || [presenter isKindOfClass:UIAlertController.class]) return;
+    // A request from SceneDelegate is already accepted at this point. If the
+    // scene is between presentations, failing explicitly is safer than
+    // silently dropping the completion (and safer than presenting a second
+    // prompt over an alert or a disappearing controller).
+    if (!presenter || !presenter.view.window ||
+        presenter.presentedViewController || presenter.isBeingDismissed || presenter.isBeingPresented ||
+        [presenter isKindOfClass:UIAlertController.class]) {
+        NSLog(@"[KRW] Run Exploit prompt was not presented: no stable presenter");
+        if (completion) completion(NO);
+        return;
+    }
     if (!settings_device_supported()) {
         settings_simple_alert(presenter, @"Not Supported", settings_unsupported_message());
+        if (completion) completion(NO);
         return;
     }
     if (g_settings_manual_exploit_running || settings_run_in_flight()) {
         settings_simple_alert(presenter, @"Already Running",
                               @"Another run is in progress. Try again when it has finished.");
+        if (completion) completion(NO);
         return;
     }
     // Live or parked kernel access needs no run: the caller just retries,
@@ -7462,7 +7474,14 @@ static void settings_run_exploit_with_log_reason(UIViewController *presenter, NS
     __weak UIViewController *weakPresenter = presenter;
     [ac addAction:[UIAlertAction actionWithTitle:@"Run Exploit" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         UIViewController *p = weakPresenter;
-        if (p) settings_run_exploit_with_log_confirmed(p, completion);
+        if (p) {
+            settings_run_exploit_with_log_confirmed(p, completion);
+        } else if (completion) {
+            // The user accepted, but the presenting scene disappeared before
+            // UIKit could start the log. Never leave an external requester
+            // waiting for a completion that can no longer be delivered.
+            completion(NO);
+        }
     }]];
     [presenter presentViewController:ac animated:YES completion:nil];
 }

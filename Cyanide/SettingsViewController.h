@@ -267,7 +267,9 @@ extern NSString * const kSettingsLocationServicesLinksEnabled;
 void settings_unlock_filesystem_async(BOOL allowFullExploit,
                                       void (^completion)(BOOL ok, NSString *message));
 // Runs the exploit on its own (no tweaks applied) with the log window shown;
-// a fresh run is confirmed first (it can reboot A18/M4). completion on main.
+// a fresh run is confirmed first (it can reboot A18/M4). Completion is on the
+// main queue and is called with NO for cancellation, failure, or an unavailable
+// presentation opportunity; it is never silently dropped.
 void settings_run_exploit_with_log(UIViewController *presenter, void (^completion)(BOOL ready));
 // Live kernel access, or a parked session that can be restored without a run.
 BOOL settings_kernel_access_available(void);
