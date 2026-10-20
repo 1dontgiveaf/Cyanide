@@ -43,6 +43,7 @@ static NSMutableDictionary<NSString *, FBAppContainer *> *g_containers;   // can
 static NSDictionary<NSString *, FBAppRecord *> *g_apps;                   // bundle id -> app
 static NSMutableDictionary<NSString *, NSString *> *g_dataByBundleID;      // bundle id -> data container
 static BOOL g_dataIndexed;
+static NSUInteger g_cacheGeneration;
 
 static NSObject *fb_containers_lock(void)
 {
@@ -150,27 +151,33 @@ static NSString *fb_app_in_container(NSString *container)
 // behind fb_containers_lock. Self-locking; callers hold nothing.
 static NSDictionary<NSString *, FBAppRecord *> *fb_apps_index(void)
 {
-    @synchronized (fb_containers_lock()) {
-        if (g_apps) return g_apps;
-    }
-    NSMutableDictionary *apps = [NSMutableDictionary dictionary];
-    NSFileManager *fm = NSFileManager.defaultManager;
-    for (NSString *item in [fm contentsOfDirectoryAtPath:@"/Applications" error:nil]) {
-        if (![item.pathExtension isEqualToString:@"app"]) continue;
-        NSString *bid = nil;
-        FBAppRecord *app = fb_app_record_for_app([@"/Applications" stringByAppendingPathComponent:item], nil, &bid);
-        if (app) apps[bid] = app;
-    }
-    for (NSString *uuid in [fm contentsOfDirectoryAtPath:kBundleParent error:nil]) {
-        NSString *container = [kBundleParent stringByAppendingPathComponent:uuid];
-        NSString *appPath = fb_app_in_container(container);
-        NSString *bid = nil;
-        FBAppRecord *app = appPath ? fb_app_record_for_app(appPath, container, &bid) : nil;
-        if (app) apps[bid] = app;   // an installed copy wins over /Applications
-    }
-    @synchronized (fb_containers_lock()) {
-        if (!g_apps) g_apps = apps;   // a concurrent build lost; both are valid
-        return g_apps;
+    for (;;) {
+        NSUInteger generation;
+        @synchronized (fb_containers_lock()) {
+            if (g_apps) return g_apps;
+            generation = g_cacheGeneration;
+        }
+
+        NSMutableDictionary *apps = [NSMutableDictionary dictionary];
+        NSFileManager *fm = NSFileManager.defaultManager;
+        for (NSString *item in [fm contentsOfDirectoryAtPath:@"/Applications" error:nil]) {
+            if (![item.pathExtension isEqualToString:@".app"]) continue;
+            NSString *bid = nil;
+            FBAppRecord *app = fb_app_record_for_app([@"/Applications" stringByAppendingPathComponent:item], nil, &bid);
+            if (app) apps[bid] = app;
+        }
+        for (NSString *uuid in [fm contentsOfDirectoryAtPath:kBundleParent error:nil]) {
+            NSString *container = [kBundleParent stringByAppendingPathComponent:uuid];
+            NSString *appPath = fb_app_in_container(container);
+            NSString *bid = nil;
+            FBAppRecord *app = appPath ? fb_app_record_for_app(appPath, container, &bid) : nil;
+            if (app) apps[bid] = app;   // an installed copy wins over /Applications
+        }
+        @synchronized (fb_containers_lock()) {
+            if (generation != g_cacheGeneration) continue;
+            if (!g_apps) g_apps = apps;   // a concurrent build for this generation won; both are valid
+            return g_apps;
+        }
     }
 }
 
@@ -257,30 +264,37 @@ FBAppContainer *fb_container_for_path(NSString *path, BOOL viaRoot)
         NSString *uuid = [p substringFromIndex:parent.length].pathComponents.firstObject;
         if (!uuid.length) return nil;
         NSString *dir = [parents[i] stringByAppendingPathComponent:uuid];
-        @synchronized (fb_containers_lock()) {
-            FBAppContainer *c = g_containers[dir];
-            if (c) {
-                // Cached from a mobile-readable earlier lookup; related lookups
-                // may still need the root path.
-                if (viaRoot) c.viaRoot = YES;
+        for (;;) {
+            NSUInteger generation;
+            @synchronized (fb_containers_lock()) {
+                FBAppContainer *c = g_containers[dir];
+                if (c) {
+                    // Cached from a mobile-readable earlier lookup; related lookups
+                    // may still need the root path.
+                    if (viaRoot) c.viaRoot = YES;
+                    return c;
+                }
+                generation = g_cacheGeneration;
+            }
+
+            // Round 53: build OUTSIDE the lock — plist reads, directory listings
+            // and icon decode no longer stall the File Browser behind
+            // fb_containers_lock — then publish only for the generation that
+            // was observed before the build began.
+            FBAppContainer *c = fb_make_container(dir, (FBContainerKind)i, viaRoot);
+            if (!c) return nil;
+            @synchronized (fb_containers_lock()) {
+                if (generation != g_cacheGeneration) continue;
+                if (!g_containers) g_containers = [NSMutableDictionary dictionary];
+                FBAppContainer *existing = g_containers[dir];
+                if (existing) {
+                    if (viaRoot) existing.viaRoot = YES;
+                    return existing;   // concurrent build won; both are valid
+                }
+                g_containers[dir] = c;
                 return c;
             }
         }
-        // Round 53: build OUTSIDE the lock — plist reads, directory listings
-        // and icon decode no longer stall the File Browser behind
-        // fb_containers_lock — then publish with a double-checked insert.
-        FBAppContainer *c = fb_make_container(dir, (FBContainerKind)i, viaRoot);
-        if (!c) return nil;
-        @synchronized (fb_containers_lock()) {
-            if (!g_containers) g_containers = [NSMutableDictionary dictionary];
-            FBAppContainer *existing = g_containers[dir];
-            if (existing) {
-                if (viaRoot) existing.viaRoot = YES;
-                return existing;   // concurrent build won; both are valid
-            }
-            g_containers[dir] = c;
-        }
-        return c;
     }
     return nil;
 }
@@ -290,13 +304,19 @@ FBAppContainer *fb_container_for_path(NSString *path, BOOL viaRoot)
 // be permanently missing from the index. The index is marked complete only
 // when the listing and every metadata read succeeded; an incomplete build is
 // retried on the next lookup instead of caching the hole.
-static NSString *fb_data_container_for_id_locked(NSString *bundleID, BOOL viaRoot)
+static NSString *fb_data_container_for_id(NSString *bundleID, BOOL viaRoot)
 {
-    if (!g_dataIndexed) {
+    for (;;) {
+        NSUInteger generation;
+        @synchronized (fb_containers_lock()) {
+            if (g_dataIndexed) return g_dataByBundleID[bundleID];
+            generation = g_cacheGeneration;
+        }
+
         NSArray<NSString *> *uuids =
             [NSFileManager.defaultManager contentsOfDirectoryAtPath:kDataParent error:nil];
         if (!uuids) return nil;   // unavailable right now; do not cache an empty index
-        g_dataByBundleID = [NSMutableDictionary dictionary];
+        NSMutableDictionary<NSString *, NSString *> *index = [NSMutableDictionary dictionary];
         BOOL complete = YES;
         for (NSString *uuid in uuids) {
             NSString *dir = [kDataParent stringByAppendingPathComponent:uuid];
@@ -306,32 +326,37 @@ static NSString *fb_data_container_for_id_locked(NSString *bundleID, BOOL viaRoo
                 continue;
             }
             NSString *bid = meta[@"MCMMetadataIdentifier"];
-            if ([bid isKindOfClass:NSString.class]) g_dataByBundleID[bid] = dir;
+            if ([bid isKindOfClass:NSString.class]) index[bid] = dir;
         }
-        g_dataIndexed = complete;
+        @synchronized (fb_containers_lock()) {
+            if (generation != g_cacheGeneration) continue;
+            if (!g_dataIndexed) {
+                g_dataByBundleID = index;
+                g_dataIndexed = complete;
+            }
+            return g_dataByBundleID[bundleID];
+        }
     }
-    return g_dataByBundleID[bundleID];
 }
 
 FBAppContainer *fb_related_container(FBAppContainer *container)
 {
+    if (![container isKindOfClass:FBAppContainer.class]) return nil;
     NSString *target = nil;
-    @synchronized (fb_containers_lock()) {
-        switch (container.kind) {
-            case FBContainerKindBundle:
-                target = fb_data_container_for_id_locked(container.identifier, container.viaRoot);
-                break;
-            case FBContainerKindData:
-                target = fb_apps_index()[container.identifier].bundleContainer;
-                break;
-            case FBContainerKindPlugin: {
-                NSString *owner = fb_owner_app_id(container.identifier);
-                target = owner ? fb_data_container_for_id_locked(owner, container.viaRoot) : nil;
-                break;
-            }
-            default:
-                break;
+    switch (container.kind) {
+        case FBContainerKindBundle:
+            target = fb_data_container_for_id(container.identifier, container.viaRoot);
+            break;
+        case FBContainerKindData:
+            target = fb_apps_index()[container.identifier].bundleContainer;
+            break;
+        case FBContainerKindPlugin: {
+            NSString *owner = fb_owner_app_id(container.identifier);
+            target = owner ? fb_data_container_for_id(owner, container.viaRoot) : nil;
+            break;
         }
+        default:
+            break;
     }
     return target ? fb_container_for_path(target, container.viaRoot) : nil;
 }
@@ -350,6 +375,8 @@ NSArray<FBAppContainer *> *fb_app_data_containers(void)
 void fb_containers_reset(void)
 {
     @synchronized (fb_containers_lock()) {
+        g_cacheGeneration++;
+        if (g_cacheGeneration == 0) g_cacheGeneration = 1;
         g_containers = nil;
         g_apps = nil;
         g_dataByBundleID = nil;
