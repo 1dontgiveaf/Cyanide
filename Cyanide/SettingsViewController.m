@@ -15095,6 +15095,19 @@ UIViewController *settings_make_daemons_viewer(void)
     return cell;
 }
 
+- (void)showWhatsNew
+{
+    if (self.detailMode || settings_changelog_entries().count == 0) return;
+    [self loadViewIfNeeded];
+    if (!self.changelogExpanded) {
+        self.changelogExpanded = YES;
+        [self.tableView reloadData];
+    }
+    // What's New is the first section: back to the top, large title intact.
+    [self.tableView layoutIfNeeded];
+    [self.tableView setContentOffset:CGPointMake(0, -self.tableView.adjustedContentInset.top) animated:NO];
+}
+
 - (UITableViewCell *)buildChangelogCollapsedCellInTableView:(UITableView *)tableView
 {
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"changelog-collapsed"];

@@ -396,10 +396,24 @@ static const CGFloat kMargin = 20.0;
         [s addArrangedSubview:[self compactRow:change icon:icons[shown] color:colors[shown]]];
         if (++shown == icons.count) break;
     }
-    if (shown == 0) {
-        [s addArrangedSubview:[self compactRow:@"See Settings → What's New for this version's changes"
-                                         icon:@"sparkles" color:UIColor.systemBlueColor]];
-    }
+
+    // The whole card opens Settings → What's New; this row says so.
+    UIButton *all = [UIButton buttonWithType:UIButtonTypeSystem];
+    UIButtonConfiguration *cfg = [UIButtonConfiguration plainButtonConfiguration];
+    cfg.title = shown ? @"See All Changes" : @"See This Version's Changes";
+    cfg.image = [UIImage systemImageNamed:@"chevron.right"
+                        withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:12.0 weight:UIImageSymbolWeightSemibold]];
+    cfg.imagePlacement = NSDirectionalRectEdgeTrailing;
+    cfg.imagePadding = 4.0;
+    cfg.contentInsets = NSDirectionalEdgeInsetsZero;
+    all.configuration = cfg;
+    all.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeading;
+    [all addTarget:self action:@selector(openWhatsNew) forControlEvents:UIControlEventTouchUpInside];
+    [s addArrangedSubview:all];
+
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(openWhatsNew)];
+    [card addGestureRecognizer:tap];
+    card.accessibilityTraits |= UIAccessibilityTraitButton;
 
     return card;
 }
@@ -811,6 +825,22 @@ static const CGFloat kMargin = 20.0;
 - (void)openFileBrowser
 {
     [self.navigationController pushViewController:settings_make_file_browser() animated:YES];
+}
+
+- (void)openWhatsNew
+{
+    UITabBarController *tab = self.tabBarController;
+    if (!tab) return;
+    for (NSUInteger i = 0; i < tab.viewControllers.count; i++) {
+        UIViewController *vc = tab.viewControllers[i];
+        if (![vc.tabBarItem.title isEqualToString:@"Settings"]) continue;
+        UINavigationController *nav = [vc isKindOfClass:UINavigationController.class] ? (UINavigationController *)vc : nil;
+        [nav popToRootViewControllerAnimated:NO];
+        tab.selectedIndex = i;
+        UIViewController *root = nav.viewControllers.firstObject;
+        if ([root isKindOfClass:SettingsViewController.class]) [(SettingsViewController *)root showWhatsNew];
+        return;
+    }
 }
 
 - (void)openSourcesTab

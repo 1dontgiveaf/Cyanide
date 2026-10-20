@@ -341,6 +341,9 @@ NSInteger settings_location_services_take_origin(NSString **bundleID);
 
 @interface SettingsViewController : UITableViewController
 
+// Root mode: expands the What's New section and scrolls to it.
+- (void)showWhatsNew;
+
 // Detail-mode init: renders a single underlying section (one tweak bundle).
 // Pass underlyingSection == NSIntegerMax for root-mode (default storyboard path).
 - (instancetype)initWithUnderlyingSection:(NSInteger)underlyingSection
