@@ -14,6 +14,19 @@ static void require_condition(BOOL condition, NSString *message)
     exit(1);
 }
 
+@interface PollCancellationProgress : NSProgress
+@property(nonatomic) NSUInteger cancelAtPoll;
+@property(nonatomic) NSUInteger pollCount;
+@end
+
+@implementation PollCancellationProgress
+- (BOOL)isCancelled
+{
+    self.pollCount += 1;
+    return self.cancelAtPoll != 0 && self.pollCount >= self.cancelAtPoll;
+}
+@end
+
 static void append16(NSMutableData *data, uint16_t value)
 {
     uint8_t bytes[] = {(uint8_t)value, (uint8_t)(value >> 8)};
@@ -39,6 +52,28 @@ static NSData *raw_deflate_stored_block(NSData *input)
     return output;
 }
 
+static NSData *empty_fixed_deflate(void)
+{
+    const uint8_t bytes[] = {0x03, 0x00}; // final fixed block, no output
+    return [NSData dataWithBytes:bytes length:sizeof(bytes)];
+}
+
+static NSData *zero_output_deflate_stream(NSUInteger nonFinalBlocks)
+{
+    NSMutableData *output = [NSMutableData data];
+    for (NSUInteger i = 0; i < nonFinalBlocks; i++) {
+        uint8_t block = 0x00; // non-final stored block, zero bytes
+        [output appendBytes:&block length:1];
+        append16(output, 0);
+        append16(output, UINT16_MAX);
+    }
+    uint8_t finalBlock = 0x01; // final stored block, zero bytes
+    [output appendBytes:&finalBlock length:1];
+    append16(output, 0);
+    append16(output, UINT16_MAX);
+    return output;
+}
+
 static NSDictionary *entry(NSString *name, NSData *data, uint16_t method,
                             uint16_t flags, BOOL descriptorSignature,
                             BOOL corruptPayload)
@@ -49,6 +84,17 @@ static NSDictionary *entry(NSString *name, NSData *data, uint16_t method,
              @"flags": @(flags),
              @"descriptorSignature": @(descriptorSignature),
              @"corruptPayload": @(corruptPayload)};
+}
+
+static NSDictionary *entry_with_compressed(NSString *name, NSData *data,
+                                            uint16_t method, uint16_t flags,
+                                            BOOL descriptorSignature,
+                                            BOOL corruptPayload, NSData *compressed)
+{
+    NSMutableDictionary *spec = [entry(name, data, method, flags,
+                                        descriptorSignature, corruptPayload) mutableCopy];
+    spec[@"compressed"] = compressed;
+    return spec;
 }
 
 static NSData *make_zip(NSArray<NSDictionary *> *entries)
@@ -62,7 +108,7 @@ static NSData *make_zip(NSArray<NSDictionary *> *entries)
         uint16_t flags = [spec[@"flags"] unsignedShortValue];
         BOOL hasDescriptor = (flags & (1u << 3)) != 0;
         NSData *nameData = [name dataUsingEncoding:NSUTF8StringEncoding];
-        NSData *compressed = method == 8 ? raw_deflate_stored_block(data) : data;
+        NSData *compressed = spec[@"compressed"] ?: (method == 8 ? raw_deflate_stored_block(data) : data);
         uint32_t crc = (uint32_t)crc32(crc32(0L, Z_NULL, 0), data.bytes, (uInt)data.length);
         NSUInteger localOffset = zip.length;
         uint32_t localCRC = hasDescriptor ? 0 : crc;
@@ -147,6 +193,22 @@ static NSString *make_temp_root(void)
     return [NSString stringWithUTF8String:path];
 }
 
+static BOOL filesystem_treats_paths_as_equivalent(NSString *root,
+                                                    NSString *first,
+                                                    NSString *alias)
+{
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *firstPath = [root stringByAppendingPathComponent:first];
+    NSString *aliasPath = [root stringByAppendingPathComponent:alias];
+    NSData *probe = [NSData dataWithBytes:"x" length:1];
+    require_condition([probe writeToFile:firstPath atomically:YES],
+                      @"could not create filesystem alias probe");
+    BOOL equivalent = [fm fileExistsAtPath:aliasPath];
+    require_condition([fm removeItemAtPath:firstPath error:nil],
+                      @"could not remove filesystem alias probe");
+    return equivalent;
+}
+
 static void write_archive(NSData *archive, NSString *root, NSString *name)
 {
     NSString *path = [root stringByAppendingPathComponent:name];
@@ -199,6 +261,44 @@ static void expect_failure(NSData *archive, NSString *root, NSString *caseName,
                                  @"failure exposed a partial extraction");
 }
 
+static void expect_cancellation(NSData *archive, NSString *root, NSString *caseName,
+                                NSUInteger cancelAtPoll, BOOL seedEmptyDestination)
+{
+    NSString *archiveName = [caseName stringByAppendingString:@".zip"];
+    NSString *destination = [root stringByAppendingPathComponent:
+                              [caseName stringByAppendingString:@"-output"]];
+    write_archive(archive, root, archiveName);
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (seedEmptyDestination) {
+        require_condition([fm createDirectoryAtPath:destination
+                         withIntermediateDirectories:YES
+                                          attributes:nil
+                                               error:nil],
+                          @"could not seed cancellation destination");
+    }
+    PollCancellationProgress *progress = [[PollCancellationProgress alloc]
+                                           initWithParent:nil userInfo:nil];
+    progress.cancelAtPoll = cancelAtPoll;
+    NSError *error = nil;
+    BOOL ok = SBLExtractArchiveToDirectoryWithProgress(
+        [NSURL fileURLWithPath:[root stringByAppendingPathComponent:archiveName]],
+        destination, progress, &error);
+    require_condition(!ok, [NSString stringWithFormat:@"%@ should cancel", caseName]);
+    require_condition(progress.pollCount >= cancelAtPoll,
+                      [NSString stringWithFormat:@"%@ did not reach its cancellation poll", caseName]);
+    BOOL exists = [fm fileExistsAtPath:destination];
+    require_condition(exists == seedEmptyDestination,
+                      [NSString stringWithFormat:@"%@ changed the destination", caseName]);
+    if (exists) {
+        require_condition([fm contentsOfDirectoryAtPath:destination error:nil].count == 0,
+                          @"cancellation exposed a partial extraction");
+    }
+    for (NSString *name in [fm contentsOfDirectoryAtPath:root error:nil]) {
+        require_condition(![name hasPrefix:[NSString stringWithFormat:@".%@.extract-", destination.lastPathComponent]],
+                          @"cancellation left a private staging directory behind");
+    }
+}
+
 int main(void)
 {
     @autoreleasepool {
@@ -216,9 +316,44 @@ int main(void)
                        root, @"deflate-level-options", @"levels.txt", deflatedData);
         expect_success(make_zip(@[entry(@"empty.txt", [NSData data], 8, 0, NO, NO)]),
                        root, @"empty-deflated", @"empty.txt", [NSData data]);
+        expect_success(make_zip(@[
+                           entry_with_compressed(@"empty-directory/", [NSData data], 8,
+                                                 0, NO, NO, empty_fixed_deflate()),
+                           entry(@"valid.txt", storedData, 0, 0, NO, NO),
+                       ]), root, @"empty-deflated-directory", @"valid.txt", storedData);
+        expect_failure(make_zip(@[
+                           entry_with_compressed(@"huge-directory/", [NSData data], 8,
+                                                 0, NO, NO, zero_output_deflate_stream(20000)),
+                           entry(@"valid.txt", storedData, 0, 0, NO, NO),
+                       ]), root, @"huge-zero-output-directory", NO);
         expect_failure(make_zip(@[entry(@"not-a-file/", storedData, 0, 0, NO, NO),
                                  entry(@"valid.txt", storedData, 0, 0, NO, NO)]),
                        root, @"directory-payload", NO);
+        expect_failure(make_zip(@[
+                           entry(@"alias/", [NSData data], 0, 0, NO, NO),
+                           entry(@"alias", storedData, 0, 0, NO, NO),
+                       ]), root, @"file-directory-alias", NO);
+
+        if (filesystem_treats_paths_as_equivalent(root, @"same.txt", @"SAME.TXT")) {
+            expect_failure(make_zip(@[
+                               entry(@"same.txt", storedData, 0, 0, NO, NO),
+                               entry(@"SAME.TXT", deflatedData, 0, 0, NO, NO),
+                           ]), root, @"case-folded-alias", NO);
+        }
+        NSString *composed = @"café.txt";
+        NSString *decomposed = @"cafe\u0301.txt";
+        if (filesystem_treats_paths_as_equivalent(root, composed, decomposed)) {
+            expect_failure(make_zip(@[
+                               entry(composed, storedData, 0, 0, NO, NO),
+                               entry(decomposed, deflatedData, 0, 0, NO, NO),
+                           ]), root, @"canonical-normalization-alias", NO);
+        }
+
+        NSData *cancellationArchive = make_zip(@[
+            entry(@"cancel.txt", storedData, 0, 0, NO, NO),
+        ]);
+        expect_cancellation(cancellationArchive, root, @"cancel-after-final-entry", 4, YES);
+        expect_cancellation(cancellationArchive, root, @"cancel-before-commit", 5, NO);
 
         expect_failure(make_zip(@[entry(@"stored.txt", storedData, 0, 0, NO, YES)]),
                        root, @"corrupt-stored", NO);

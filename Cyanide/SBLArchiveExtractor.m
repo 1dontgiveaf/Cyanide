@@ -929,9 +929,17 @@ BOOL SBLExtractArchiveToDirectoryWithProgress(NSURL *url, NSString *destination,
         [fm removeItemAtPath:staging error:nil];
         return NO;
     }
+    if (sbl_cancelled(progress, error)) {
+        [fm removeItemAtPath:staging error:nil];
+        return NO;
+    }
     if (rmdir(destination.fileSystemRepresentation) != 0 && errno != ENOENT) {
         [fm removeItemAtPath:staging error:nil];
         sbl_set_error(error, 53, @"The extraction destination is no longer empty; refusing to clear it.");
+        return NO;
+    }
+    if (sbl_cancelled(progress, error)) {
+        [fm removeItemAtPath:staging error:nil];
         return NO;
     }
     if (renamex_np(staging.fileSystemRepresentation, destination.fileSystemRepresentation, RENAME_EXCL) != 0) {
