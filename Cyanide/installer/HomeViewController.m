@@ -430,8 +430,8 @@ static const CGFloat kMargin = 20.0;
     // get it by themselves on A18/M4. Runs the exploit alone, with the log.
     // A local strong reference: the property is weak, so assigning the new
     // view to it directly released it before it was added (no row at all).
-    UIView *kernelRow = [self bigActionButton:@"Kernel Access"
-                                          sub:@"Not ready. Tap to run the exploit (no tweaks applied)"
+    UIView *kernelRow = [self bigActionButton:@"Run Exploit"
+                                          sub:@"Kernel access for the tools"
                                          icon:@"lock.open.fill"
                                         color:UIColor.systemPurpleColor
                                           sel:@selector(runExploit)];
