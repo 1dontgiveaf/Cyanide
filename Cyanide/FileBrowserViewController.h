@@ -19,6 +19,13 @@ BOOL filebrowser_write_enabled(void);
 // `finished` runs on main once the copy is ready or failed.
 void filebrowser_share_file(UIViewController *presenter, NSString *path, BOOL viaRoot, NSData *preloaded,
                             id source, void (^finished)(void));
+// Cancel staging owned by a presenter that has left the screen.  This only
+// marks pre-presentation work cancelled; an already presented activity sheet
+// keeps its staged copy until its completion handler runs.
+void filebrowser_cancel_shares_for_presenter(UIViewController *presenter);
+// Remove only old, app-owned UUID staging folders.  Active folders are held by
+// an advisory marker lock and are never removed by this sweep.
+void filebrowser_sweep_stale_share_staging(void);
 // Call after any accepted change on disk, so open folders refresh.
 void filebrowser_note_filesystem_changed(void);
 // Serial queue for every file change (saves included), in request order.

@@ -1047,6 +1047,12 @@ static const NSUInteger kFBMaxHexBytes = 64 * 1024;
     fb_suppress_popup_bar(self, NO);
 }
 
+- (void)viewDidDisappear:(BOOL)animated
+{
+    [super viewDidDisappear:animated];
+    filebrowser_cancel_shares_for_presenter(self);
+}
+
 // Text and plists can be edited when the whole file was loaded.
 - (BOOL)canEdit
 {
@@ -1378,109 +1384,317 @@ static NSUInteger fb_hex_line_chars(NSUInteger digits, NSUInteger per)
     [self.textView setContentOffset:CGPointZero animated:NO];
 }
 
+@end
+
 // Hands a copy (from the app's temp folder) to the share sheet, so the
 // receiving app never needs access to the original location.
-// Shares the file's CONTENTS (a symlink's target, never the link itself) as
-// a regular file in a per-share temp folder, so the receiving app never needs
+// Shares the file's CONTENTS (a symlink's target, never the link itself) as a
+// regular file in a per-share temp folder, so the receiving app never needs
 // access to the original location. Runs off-main: a root read can wait for
 // the launchd warm-up and transfer up to 64 MB.
 static const NSUInteger kFBMaxShareBytes = 64 * 1024 * 1024;
 
+// A marker is held open and flocked for the whole operation, including while
+// the activity sheet owns the staged file.  A sweep can therefore distinguish
+// a crashed operation (no lock) from a live one without touching RemoteCall or
+// any other shared resource.
+@interface FBShareOperation : NSObject {
+    _Atomic(bool) _cancelled;
+    _Atomic(bool) _stagingReady;
+}
+@property (nonatomic, weak) UIViewController *presenter;
+@property (nonatomic, weak) id source;
+@property (nonatomic, copy) NSString *dir;
+@property (nonatomic, copy) NSString *stagedPath;
+@property (nonatomic, copy) void (^finished)(void);
+@property (nonatomic, assign) int markerFD;
+@end
+
+@implementation FBShareOperation
+- (instancetype)init
+{
+    if ((self = [super init])) {
+        atomic_init(&_cancelled, false);
+        atomic_init(&_stagingReady, false);
+        _markerFD = -1;
+    }
+    return self;
+}
+- (void)cancelBeforePresentation
+{
+    if (!atomic_load_explicit(&_stagingReady, memory_order_acquire))
+        atomic_store_explicit(&_cancelled, true, memory_order_release);
+}
+- (BOOL)isCancelled
+{
+    return atomic_load_explicit(&_cancelled, memory_order_acquire);
+}
+- (void)markStagingReady
+{
+    atomic_store_explicit(&_stagingReady, true, memory_order_release);
+}
+- (BOOL)isStagingReady
+{
+    return atomic_load_explicit(&_stagingReady, memory_order_acquire);
+}
+@end
+
+static NSMutableSet<FBShareOperation *> *fb_share_operations(void)
+{
+    static NSMutableSet<FBShareOperation *> *set;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ set = [NSMutableSet set]; });
+    return set;
+}
+
+static NSString *fb_share_root(void)
+{
+    return [NSTemporaryDirectory() stringByAppendingPathComponent:@"FileBrowserShare"];
+}
+
+static void fb_share_cleanup(FBShareOperation *op)
+{
+    if (op.dir.length) [NSFileManager.defaultManager removeItemAtPath:op.dir error:nil];
+    if (op.markerFD >= 0) {
+        close(op.markerFD);
+        op.markerFD = -1;
+    }
+    [fb_share_operations() removeObject:op];
+}
+
+// Called on the main thread before the worker is queued.  This closes the
+// small window in which a foreground sweep could see a new directory without
+// its active marker.
+static BOOL fb_share_prepare(FBShareOperation *op, NSString **failure)
+{
+    NSString *root = fb_share_root();
+    struct stat rootSt;
+    BOOL rootExists = lstat(root.fileSystemRepresentation, &rootSt) == 0;
+    if (rootExists) {
+        if (!S_ISDIR(rootSt.st_mode)) {
+            if (failure) *failure = @"The share staging folder is not a directory.";
+            return NO;
+        }
+    } else if (errno != ENOENT) {
+        if (failure) *failure = @"The share staging folder could not be inspected.";
+        return NO;
+    }
+    NSError *error = nil;
+    if (!rootExists &&
+        ![NSFileManager.defaultManager createDirectoryAtPath:root withIntermediateDirectories:YES
+                                                    attributes:nil error:&error]) {
+        if (failure) *failure = error.localizedDescription ?: @"The share staging folder could not be created.";
+        return NO;
+    }
+    if (lstat(root.fileSystemRepresentation, &rootSt) != 0 || !S_ISDIR(rootSt.st_mode)) {
+        if (failure) *failure = @"The share staging folder is not a safe directory.";
+        return NO;
+    }
+
+    NSString *dir = [root stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
+    if (![NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:NO
+                                                    attributes:nil error:&error]) {
+        if (failure) *failure = error.localizedDescription ?: @"The share staging folder could not be created.";
+        return NO;
+    }
+    NSString *marker = [dir stringByAppendingPathComponent:@".active"];
+    int fd = open(marker.fileSystemRepresentation,
+                  O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0 || flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        if (fd >= 0) close(fd);
+        [NSFileManager.defaultManager removeItemAtPath:dir error:nil];
+        if (failure) *failure = @"The share staging operation could not be reserved.";
+        return NO;
+    }
+    const char markerText[] = "cyanide-share-active\n";
+    if (write(fd, markerText, sizeof(markerText) - 1) != (ssize_t)(sizeof(markerText) - 1)) {
+        close(fd);
+        [NSFileManager.defaultManager removeItemAtPath:dir error:nil];
+        if (failure) *failure = @"The share staging marker could not be written.";
+        return NO;
+    }
+    op.dir = dir;
+    op.stagedPath = [dir stringByAppendingPathComponent:op.stagedPath.lastPathComponent ?: @"shared-file"];
+    op.markerFD = fd;
+    return YES;
+}
+
+static BOOL fb_share_write_data(FBShareOperation *op, NSData *data, NSString **failure)
+{
+    int fd = open(op.stagedPath.fileSystemRepresentation,
+                  O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0644);
+    if (fd < 0) {
+        if (failure) *failure = @"The copy could not be created.";
+        return NO;
+    }
+    const uint8_t *bytes = data.bytes;
+    size_t offset = 0;
+    BOOL ok = YES;
+    while (offset < data.length) {
+        if ([op isCancelled]) { if (failure) *failure = @"Sharing was cancelled."; ok = NO; break; }
+        size_t want = MIN((size_t)64 * 1024, data.length - offset);
+        ssize_t n = write(fd, bytes + offset, want);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { if (failure) *failure = @"The copy could not be written."; ok = NO; break; }
+        offset += (size_t)n;
+    }
+    if (close(fd) != 0) ok = NO;
+    if (!ok) [NSFileManager.defaultManager removeItemAtPath:op.stagedPath error:nil];
+    return ok;
+}
+
+static BOOL fb_share_copy_regular(FBShareOperation *op, NSString *path, NSString **failure)
+{
+    if ([op isCancelled]) { if (failure) *failure = @"Sharing was cancelled."; return NO; }
+    int in = filebrowser_open_regular(path);
+    struct stat inSt;
+    BOOL tooLarge = in >= 0 && fstat(in, &inSt) == 0 && inSt.st_size > (off_t)kFBMaxShareBytes;
+    int out = (in < 0 || tooLarge) ? -1
+            : open(op.stagedPath.fileSystemRepresentation, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0644);
+    if (in < 0) {
+        if (failure) *failure = @"Only regular files can be shared.";
+    } else if (tooLarge) {
+        if (failure) *failure = @"The file is larger than 64 MB. Sharing files that large is not supported.";
+    } else if (out < 0) {
+        if (failure) *failure = @"The copy could not be created.";
+    } else {
+        char buf[64 * 1024];
+        unsigned long long copied = 0;
+        ssize_t n;
+        while (!*failure) {
+            if ([op isCancelled]) { *failure = @"Sharing was cancelled."; break; }
+            if (copied >= kFBMaxShareBytes) {
+                n = read(in, buf, 1); // distinguish exactly-at-limit EOF from growth
+                if (n > 0) *failure = @"The file grew beyond the 64 MB sharing limit.";
+                else if (n < 0 && errno != EINTR) *failure = @"The file could not be read.";
+                if (!*failure && n == 0) break;
+                if (n < 0 && errno == EINTR) continue;
+                break;
+            }
+            size_t want = (size_t)MIN((unsigned long long)sizeof(buf), kFBMaxShareBytes - copied);
+            n = read(in, buf, want);
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0) { *failure = @"The file could not be read."; break; }
+            if (n == 0) break;
+            size_t done = 0;
+            while (done < (size_t)n) {
+                if ([op isCancelled]) { *failure = @"Sharing was cancelled."; break; }
+                ssize_t w = write(out, buf + done, (size_t)n - done);
+                if (w < 0 && errno == EINTR) continue;
+                if (w <= 0) { *failure = @"The copy could not be written."; break; }
+                done += (size_t)w;
+            }
+            copied += (unsigned long long)n;
+        }
+    }
+    if (in >= 0) close(in);
+    if (out >= 0) close(out);
+    if (*failure) [NSFileManager.defaultManager removeItemAtPath:op.stagedPath error:nil];
+    return !*failure;
+}
+
+static void fb_share_complete(FBShareOperation *op, NSString *failure)
+{
+    if (!NSThread.isMainThread) return;
+    void (^end)(void) = op.finished;
+    op.finished = nil;
+    if (end) end();
+    UIViewController *presenter = op.presenter;
+    if (failure.length || !presenter.view.window) {
+        fb_share_cleanup(op);
+        if (!failure.length || !presenter.view.window) return;
+        fb_alert(presenter, @"Couldn't Share", failure);
+        return;
+    }
+    UIActivityViewController *avc =
+        [[UIActivityViewController alloc] initWithActivityItems:@[ [NSURL fileURLWithPath:op.stagedPath] ]
+                                          applicationActivities:nil];
+    avc.completionWithItemsHandler = ^(UIActivityType type, BOOL completed, NSArray *items, NSError *err) {
+        fb_share_cleanup(op);
+    };
+    UIPopoverPresentationController *pop = avc.popoverPresentationController;
+    id source = op.source;
+    if ([source isKindOfClass:UIBarButtonItem.class]) pop.barButtonItem = source;
+    else if ([source isKindOfClass:UIView.class]) {
+        pop.sourceView = source;
+        pop.sourceRect = [(UIView *)source bounds];
+    } else {
+        pop.sourceView = presenter.view;
+        pop.sourceRect = CGRectMake(CGRectGetMidX(presenter.view.bounds), CGRectGetMidY(presenter.view.bounds), 1, 1);
+    }
+    [presenter presentViewController:avc animated:YES completion:nil];
+}
+
+void filebrowser_cancel_shares_for_presenter(UIViewController *presenter)
+{
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{ filebrowser_cancel_shares_for_presenter(presenter); });
+        return;
+    }
+    for (FBShareOperation *op in [fb_share_operations() allObjects])
+        if (op.presenter == presenter) [op cancelBeforePresentation];
+}
+
 void filebrowser_share_file(UIViewController *presenter, NSString *path, BOOL viaRoot, NSData *preloaded,
                             id source, void (^finished)(void))
 {
-    NSString *dir = [[NSTemporaryDirectory() stringByAppendingPathComponent:@"FileBrowserShare"]
-                     stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
-    NSString *copy = [dir stringByAppendingPathComponent:path.lastPathComponent];
-    void (^end)(void) = [finished copy];
+    if (!NSThread.isMainThread) {
+        NSData *snapshot = [preloaded copy];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            filebrowser_share_file(presenter, path, viaRoot, snapshot, source, finished);
+        });
+        return;
+    }
+    FBShareOperation *op = [FBShareOperation new];
+    op.presenter = presenter;
+    op.source = source;
+    op.stagedPath = path.lastPathComponent;
+    op.finished = [finished copy];
+    NSString *prepareFailure = nil;
+    if (!fb_share_prepare(op, &prepareFailure)) {
+        void (^end)(void) = op.finished;
+        op.finished = nil;
+        if (end) end();
+        if (presenter.view.window) fb_alert(presenter, @"Couldn't Share", prepareFailure ?: @"The copy could not be prepared.");
+        return;
+    }
+    [fb_share_operations() addObject:op];
+    NSString *sourcePath = [path copy];
+    NSData *snapshot = [preloaded copy];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSString *failure = nil;
-        [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-        if (preloaded) {
-            if (preloaded.length > kFBMaxShareBytes) failure = @"The file is larger than 64 MB. Sharing files that large is not supported.";
-            else if (![preloaded writeToFile:copy atomically:YES]) failure = @"The copy could not be written.";
-        } else if (viaRoot) {
-            NSString *rootErr = nil;
-            BOOL truncated = NO;
-            NSData *full = settings_root_read_file(path, kFBMaxShareBytes, &truncated, &rootErr);
-            if (!full) failure = rootErr ?: @"The file could not be read as root.";
-            else if (truncated) failure = @"The file is larger than 64 MB. Sharing only part of it is not supported.";
-            else if (![full writeToFile:copy atomically:YES]) failure = @"The copy could not be written.";
-        } else {
-            int in = filebrowser_open_regular(path);
-            // Same 64 MB limit as the root path: the copy goes to the data
-            // partition's temp folder, and a multi-GB file could fill it.
-            struct stat inSt;
-            BOOL tooLarge = in >= 0 && fstat(in, &inSt) == 0 && inSt.st_size > (off_t)kFBMaxShareBytes;
-            int out = (in < 0 || tooLarge) ? -1
-                    : open(copy.fileSystemRepresentation, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
-            if (in < 0) {
-                failure = @"Only regular files can be shared.";
-            } else if (tooLarge) {
+        if ([op isCancelled]) {
+            failure = @"Sharing was cancelled.";
+        } else if (snapshot) {
+            if (snapshot.length > kFBMaxShareBytes)
                 failure = @"The file is larger than 64 MB. Sharing files that large is not supported.";
-            } else if (out < 0) {
-                failure = @"The copy could not be created.";
+            else
+                fb_share_write_data(op, snapshot, &failure);
+        } else if (viaRoot) {
+            // Do not tear down or otherwise mutate the shared RemoteCall
+            // session here.  The root reader owns that session; cancellation
+            // is checked before and immediately after its bounded read.
+            if ([op isCancelled]) {
+                failure = @"Sharing was cancelled.";
             } else {
-                char buf[64 * 1024];
-                unsigned long long copied = 0;
-                ssize_t n;
-                while (!failure) {
-                    if (copied >= kFBMaxShareBytes) {
-                        n = read(in, buf, 1); // distinguish exactly-at-limit EOF from growth
-                        if (n > 0) failure = @"The file grew beyond the 64 MB sharing limit.";
-                        else if (n < 0 && errno != EINTR) failure = @"The file could not be read.";
-                        if (!failure && n == 0) break;
-                        if (n < 0 && errno == EINTR) continue;
-                        break;
-                    }
-                    size_t want = (size_t)MIN((unsigned long long)sizeof(buf), kFBMaxShareBytes - copied);
-                    n = read(in, buf, want);
-                    if (n < 0 && errno == EINTR) continue;
-                    if (n < 0) { failure = @"The file could not be read."; break; }
-                    if (n == 0) break;
-                    size_t done = 0;
-                    while (done < (size_t)n) {
-                        ssize_t w = write(out, buf + done, (size_t)n - done);
-                        if (w < 0 && errno == EINTR) continue;
-                        if (w <= 0) { failure = @"The copy could not be written."; break; }
-                        done += (size_t)w;
-                    }
-                    copied += (unsigned long long)n;
-                }
+                NSString *rootErr = nil;
+                BOOL truncated = NO;
+                NSData *full = settings_root_read_file(sourcePath, kFBMaxShareBytes, &truncated, &rootErr);
+                if ([op isCancelled]) failure = @"Sharing was cancelled.";
+                else if (!full) failure = rootErr ?: @"The file could not be read as root.";
+                else if (truncated) failure = @"The file is larger than 64 MB. Sharing only part of it is not supported.";
+                else fb_share_write_data(op, full, &failure);
             }
-            if (in >= 0) close(in);
-            if (out >= 0) close(out);
+        } else {
+            fb_share_copy_regular(op, sourcePath, &failure);
         }
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (end) end();
-            if (!presenter.view.window) {   // left the screen meanwhile
-                [NSFileManager.defaultManager removeItemAtPath:dir error:nil];
-                return;
-            }
-            if (failure) {
-                [NSFileManager.defaultManager removeItemAtPath:dir error:nil];
-                fb_alert(presenter, @"Couldn't Share", failure);
-                return;
-            }
-            UIActivityViewController *avc =
-                [[UIActivityViewController alloc] initWithActivityItems:@[ [NSURL fileURLWithPath:copy] ]
-                                                  applicationActivities:nil];
-            avc.completionWithItemsHandler = ^(UIActivityType type, BOOL completed, NSArray *items, NSError *err) {
-                [NSFileManager.defaultManager removeItemAtPath:dir error:nil];
-            };
-            UIPopoverPresentationController *pop = avc.popoverPresentationController;
-            if ([source isKindOfClass:UIBarButtonItem.class]) pop.barButtonItem = source;
-            else if ([source isKindOfClass:UIView.class]) {
-                pop.sourceView = source;
-                pop.sourceRect = [(UIView *)source bounds];
-            } else {
-                pop.sourceView = presenter.view;
-                pop.sourceRect = CGRectMake(CGRectGetMidX(presenter.view.bounds), CGRectGetMidY(presenter.view.bounds), 1, 1);
-            }
-            [presenter presentViewController:avc animated:YES completion:nil];
-        });
+        if (!failure && [op isCancelled]) failure = @"Sharing was cancelled.";
+        if (!failure) [op markStagingReady];
+        dispatch_async(dispatch_get_main_queue(), ^{ fb_share_complete(op, failure); });
     });
 }
+
+@implementation FBFileViewController (Share)
 
 - (void)shareCopy:(UIBarButtonItem *)sender
 {
@@ -1675,6 +1889,12 @@ static NSString *fb_related_title(FBAppContainer *c)
 {
     [super viewWillDisappear:animated];
     fb_suppress_popup_bar(self, NO);
+}
+
+- (void)viewDidDisappear:(BOOL)animated
+{
+    [super viewDidDisappear:animated];
+    filebrowser_cancel_shares_for_presenter(self);
 }
 
 #pragma mark Write mode
