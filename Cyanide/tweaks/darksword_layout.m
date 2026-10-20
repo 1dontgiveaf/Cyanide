@@ -987,3 +987,15 @@ bool darksword_layout_apply_in_session(double exL, double exR, double exT, doubl
     if (dockScale > 0.0) ok &= darksword_layout_dock_scale_in_session(dockScale);
     return ok;
 }
+
+bool darksword_layout_restore_in_session(void)
+{
+    // The pre-iOS-26 path restores the documented native insets (60/27/100/27
+    // and 16/16) and uses the native icon-image records captured before the
+    // first scale apply. The iOS-26 path receives zero extras and unit scales,
+    // which deliberately emits identity transforms without touching icon
+    // image caches. Saved slider values remain in NSUserDefaults for a later
+    // re-enable; only the caller's applied-state marker is cleared.
+    return darksword_layout_apply_in_session(0.0, 0.0, 0.0, 0.0,
+                                             0.0, 0.0, 1.0, 1.0);
+}

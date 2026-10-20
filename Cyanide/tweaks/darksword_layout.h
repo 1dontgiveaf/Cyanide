@@ -46,4 +46,9 @@ bool darksword_layout_apply_in_session(double extraLeft,
                                        double homeScale,
                                        double dockScale);
 
+// Restores the live layout state owned by Layout Extras to SpringBoard's
+// native/default configuration. This does not change the user's saved slider
+// values; the caller clears only the applied-state marker after success.
+bool darksword_layout_restore_in_session(void);
+
 #endif

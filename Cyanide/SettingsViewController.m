@@ -4867,6 +4867,13 @@ static bool settings_apply_layout_extras_from_defaults_locked(NSUserDefaults *d)
     return darksword_layout_apply_in_session(exL, exR, exT, exB, dockExL, dockExR, homeScale, dockScale);
 }
 
+static bool settings_restore_layout_extras_locked(void)
+{
+    // Restore only SpringBoard's live state. The saved Layout Extras values
+    // remain available if the user enables the feature again.
+    return darksword_layout_restore_in_session();
+}
+
 static GravityLiteConfig settings_gravitylite_config_from_defaults(NSUserDefaults *d)
 {
     NSInteger magnitudePct = [d integerForKey:kSettingsGravityLiteMagnitudePct];
@@ -9295,6 +9302,8 @@ static void settings_run_actions_internal(BOOL pendingOnly)
             BOOL runSnowBoardLite = settings_enabled_tweak_should_run(d, kSettingsSnowBoardLiteEnabled, springBoardPendingOnly);
             BOOL runLiveWP = settings_enabled_tweak_should_run(d, kSettingsLiveWPEnabled, springBoardPendingOnly);
             BOOL runLayoutExtras = settings_enabled_tweak_should_run(d, kSettingsLayoutExtrasEnabled, springBoardPendingOnly);
+            BOOL restoreLayoutExtras = !layoutExtrasEnabled &&
+                                       settings_tweak_is_applied(kSettingsLayoutExtrasEnabled);
             // SBCustomizer changes the grid and Dock contents. Re-run enabled
             // Layout Extras even if it was already marked applied so spacing
             // is recalculated from the final SBCustomizer state.
@@ -9313,7 +9322,7 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                 settings_note_themer_stage_conflict(YES);
             }
             BOOL cleanupDisabledSpringBoardTweaks = settings_disabled_applied_springboard_cleanup_needed(d);
-            BOOL needsSpringBoardWork = runSBC || runDarkTweaks || runStatBar || runNSBar || runNiceBarLite || runAxonLite || runGravityLite || runLayoutExtras || runAppSwitcherGrid || runThemer || runSnowBoardLite || runLiveWP || runStageStrip || runFastLockXLite || runQuickLoader || runRepoTweaks || cleanupDisabledSpringBoardTweaks;
+            BOOL needsSpringBoardWork = runSBC || runDarkTweaks || runStatBar || runNSBar || runNiceBarLite || runAxonLite || runGravityLite || runLayoutExtras || restoreLayoutExtras || runAppSwitcherGrid || runThemer || runSnowBoardLite || runLiveWP || runStageStrip || runFastLockXLite || runQuickLoader || runRepoTweaks || cleanupDisabledSpringBoardTweaks;
             BOOL runSandboxEscape = [d boolForKey:kSettingsRunSandboxEscape] && (!pendingOnly || needsSpringBoardWork);
             BOOL needsSpringBoard = runSandboxEscape || needsSpringBoardWork || forceSpringBoardRefresh;
 
@@ -9332,6 +9341,7 @@ static void settings_run_actions_internal(BOOL pendingOnly)
             if (runSBC) total++;
             if (runDarkTweaks) total++;
             if (runLayoutExtras) total++;
+            if (restoreLayoutExtras) total++;
             if (runThemer) total++;
             if (runSnowBoardLite) total++;
             if (runLiveWP) total++;
@@ -9353,6 +9363,7 @@ static void settings_run_actions_internal(BOOL pendingOnly)
             NSMutableArray *enabledTweaks = [NSMutableArray array];
             if (runSBC) [enabledTweaks addObject:@"layout"];
             if (runLayoutExtras) [enabledTweaks addObject:@"extras"];
+            if (restoreLayoutExtras) [enabledTweaks addObject:@"extras-restore"];
             if (runStatBar) [enabledTweaks addObject:@"statbar"];
             if (runNSBar) [enabledTweaks addObject:@"nsbar"];
             if (runNiceBarLite) [enabledTweaks addObject:@"nicebar"];
@@ -9763,6 +9774,20 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                                  ok ? "[OK]" : "[WARN]",
                                  ok ? "applied to final layout" : "did not apply cleanly");
                         if (!ok) [runWarnings addObject:@"Home Layout Extras"];
+                    } else if (restoreLayoutExtras) {
+                        settings_progress(&step, total, "Restoring stock Home Layout Extras");
+                        bool ok = settings_restore_layout_extras_locked();
+                        if (ok) {
+                            // Keep the user's disabled intent and saved slider
+                            // values; clear only the live-applied marker after
+                            // the native/default state is restored.
+                            settings_mark_tweak_applied(kSettingsLayoutExtrasEnabled, NO);
+                        }
+                        printf("[SETTINGS] Layout extras restore result=%d\n", ok);
+                        log_user("%s Home Layout Extras restore %s.\n",
+                                 ok ? "[OK]" : "[WARN]",
+                                 ok ? "returned to stock layout" : "did not complete cleanly");
+                        if (!ok) [runWarnings addObject:@"Home Layout Extras restore"];
                     }
 
                     // Hide labels LAST — after HSSCALE's relayout — so our own
