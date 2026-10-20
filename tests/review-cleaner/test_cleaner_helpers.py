@@ -11,6 +11,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "Cyanide/CleanerViewController.m"
+FB_SOURCE = ROOT / "Cyanide/FBAppContainers.m"
 
 PREAMBLE = r'''
 #import <Foundation/Foundation.h>
@@ -46,6 +47,10 @@ static NSString *app(void) {
     return path;
 }
 static BOOL exists(NSString *path) { return [NSFileManager.defaultManager fileExistsAtPath:path]; }
+static unsigned long long scan_path(NSString *path, BOOL *complete) {
+    CYCleanerTraversal walk = cleaner_traversal(kCleanerMaxScanSeconds, NULL);
+    return cleaner_tree_bytes_walk(path, complete, &walk);
+}
 '''
 SCENARIOS = r'''
 // An intermediate Library symlink must be refused by scan AND clear.
@@ -56,7 +61,7 @@ check(symlink("Documents", [a stringByAppendingPathComponent:@"Library"].fileSys
 NSString *cache = [a stringByAppendingPathComponent:@"Library/Caches"];
 BOOL complete = YES;
 NSUInteger removed = 0, failed = 0;
-check(cleaner_tree_bytes(cache, NULL, &complete) == 0 && !complete, "ancestor scan refused");
+check(scan_path(cache, &complete) == 0 && !complete, "ancestor scan refused");
 check(cleaner_clear_directory(cache, &removed, &failed, NULL) == 0 && failed > 0, "ancestor clear refused");
 check(exists(document), "document survives Library symlink");
 
@@ -87,7 +92,7 @@ check(exists(cache), "cache root preserved");
 
 // Normal nested files remain cleanable using the descriptor walk.
 put([cache stringByAppendingPathComponent:@"nested/file.bin"], 1024);
-check(cleaner_tree_bytes(cache, NULL, &complete) == 1024 && complete, "normal scan");
+check(scan_path(cache, &complete) == 1024 && complete, "normal scan");
 removed = failed = 0;
 check(cleaner_clear_directory(cache, &removed, &failed, NULL) == 1024 && removed == 1 && failed == 0, "normal clear");
 check(exists(cache) && !exists([cache stringByAppendingPathComponent:@"nested"]), "only root contents removed");
@@ -157,7 +162,7 @@ a = app(); cache = [a stringByAppendingPathComponent:@"Library/Caches"];
 NSString *deep = cache;
 for (NSUInteger i = 0; i < kCleanerMaxTraversalDepth + 2; i++) deep = [deep stringByAppendingPathComponent:@"d"];
 NSString *deepFile = [deep stringByAppendingPathComponent:@"keep.bin"]; put(deepFile, 32);
-complete = YES; cleaner_tree_bytes(cache, NULL, &complete);
+complete = YES; scan_path(cache, &complete);
 check(!complete, "depth-limited scan");
 walk = cleaner_traversal(10, NULL);
 cleaner_clear_directory(cache, &removed, &failed, &walk);
@@ -177,25 +182,48 @@ walk = cleaner_traversal(10, NULL); walk.deadline = 0;
 cleaner_clear_directory(cache, &removed, &failed, &walk);
 check(walk.stopped && exists(cancelFile), "expired deadline leaves data intact");
 
-// The second root must observe activation after the first root was cleared.
+// A current Info.plist must match the container identifier and provide an
+// executable before the active-app decision can proceed.
+NSString *currentExecutable = nil;
+check(fb_current_bundle_metadata_matches(@"com.example.app",
+    @{ @"CFBundleIdentifier": @"com.example.app", @"CFBundleExecutable": @"NewExec" },
+    &currentExecutable) && [currentExecutable isEqualToString:@"NewExec"], "current metadata accepted");
+check(!fb_current_bundle_metadata_matches(@"com.example.app",
+    @{ @"CFBundleIdentifier": @"com.other.app", @"CFBundleExecutable": @"NewExec" },
+    &currentExecutable), "mismatched bundle rejected");
+check(!fb_current_bundle_metadata_matches(@"com.example.app",
+    @{ @"CFBundleIdentifier": @"com.example.app" }, &currentExecutable), "missing executable rejected");
+
+// Pin the scanned container descriptor: replacing its pathname must not make
+// the cleaner operate on the replacement directory.
 a = app(); cache = [a stringByAppendingPathComponent:@"Library/Caches"];
-tmp = [a stringByAppendingPathComponent:@"tmp"];
-put([cache stringByAppendingPathComponent:@"first.bin"], 32);
-NSString *tempFile = [tmp stringByAppendingPathComponent:@"keep.bin"]; put(tempFile, 64);
-__block NSUInteger reads = 0;
-NSSet<NSString *> *(^provider)(void) = ^{
-    return ++reads == 1 ? [NSSet set] : [NSSet setWithObject:@"ExampleApp"];
-};
-BOOL available = NO;
-check(!cleaner_should_skip_now(@"ExampleApp", provider, &available) && available, "first root inactive");
-cleaner_clear_directory(cache, &removed, &failed, NULL);
-check(cleaner_should_skip_now(@"ExampleApp", provider, &available) && available && reads == 2,
-    "second root refresh observes activation");
-check(exists(tempFile), "activated app tmp survives");
-check(cleaner_should_skip_now(@"ExampleApp", ^{ return (NSSet<NSString *> *)nil; }, &available) && !available,
-    "unavailable detection fails closed");
-check(cleaner_should_skip_now(@"", ^{ return [NSSet set]; }, &available) && !available,
-    "unknown executable fails closed");
+put([cache stringByAppendingPathComponent:@"original.bin"], 32);
+int trustedFD = cleaner_open_container(a); struct stat pinned = {0};
+check(trustedFD >= 0 && fstat(trustedFD, &pinned) == 0, "pin container identity");
+NSString *originalPath = [a.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"original-container"];
+check(rename(a.fileSystemRepresentation, originalPath.fileSystemRepresentation) == 0, "replace container path");
+mkdirp(cache); put([cache stringByAppendingPathComponent:@"replacement.bin"], 64);
+int replacementFD = cleaner_open_container(a); struct stat replacement = {0};
+check(replacementFD >= 0 && fstat(replacementFD, &replacement) == 0, "open replacement identity");
+check(!cleaner_container_identity_matches(&replacement, pinned.st_dev, pinned.st_ino),
+    "replacement identity rejected");
+close(replacementFD);
+removed = failed = 0;
+CYCleanerTraversal pinnedWalk = cleaner_traversal(10, NULL);
+check(cleaner_clear_directory_at(trustedFD, @"Library/Caches", pinned.st_dev, &removed, &failed, &pinnedWalk) == 32 &&
+      removed == 1 && failed == 0, "descriptor cleans original container");
+close(trustedFD);
+check(exists([cache stringByAppendingPathComponent:@"replacement.bin"]), "replacement survives");
+check(!exists([originalPath stringByAppendingPathComponent:@"Library/Caches/original.bin"]),
+    "original contents were cleaned through the pin");
+
+// Root-level device admission is an explicit trusted-baseline comparison;
+// nested traversal keeps the same check for every child.
+check(cleaner_device_matches((dev_t)7, (dev_t)7), "trusted device accepted");
+check(!cleaner_device_matches((dev_t)7, (dev_t)8), "replacement device rejected");
+
+check(cleaner_process_is_active(@"ExampleApp", [NSSet setWithObject:@"ExampleApp"]), "current executable active");
+check(!cleaner_process_is_active(@"", [NSSet setWithObject:@"ExampleApp"]), "missing executable fails closed");
 
 check(cleaner_process_is_active(@"Foo", [NSSet setWithObject:@"Foo"]), "exact process name");
 check(!cleaner_process_is_active(@"FooBar", [NSSet setWithObject:@"Foo"]), "short prefix is not truncation");
@@ -210,11 +238,9 @@ check(!cleaner_process_is_active([characters31 stringByAppendingString:@"Tail"],
 class CleanerHelperTests(unittest.TestCase):
     def test_storage_labels(self):
         source = SOURCE.read_text()
-        self.assertIn('@"Cache + Temp Size"', source)
-        self.assertIn("(logical size) from", source)
-        self.assertIn("not guaranteed recovered storage", source)
+        self.assertIn('@"Reclaimable"', source)
+        self.assertIn("Logical file sizes, not guaranteed recovered storage.", source)
         self.assertNotIn('@"Freed %@', source)
-        self.assertNotIn('@"Reclaimable"', source)
 
     def test_background_expiration_contract(self):
         source = SOURCE.read_text()
@@ -224,18 +250,26 @@ class CleanerHelperTests(unittest.TestCase):
         self.assertIn("endBackgroundTask:bgTask", expiration)
         self.assertNotIn("expirationHandler:^{}", body)
         self.assertIn("results are partial", body)
-        self.assertIn("cleaner_tree_bytes_cancellable", body)
+        self.assertIn("cleaner_tree_bytes_at", body)
 
     def test_fresh_process_check_contract(self):
         source = SOURCE.read_text()
         body = source[source.index("- (void)performClean"):source.index("#pragma mark Table")]
         roots = body[body.index("for (NSString *relativeRoot"):body.index("freed += appFreed")]
-        self.assertIn("cleaner_should_skip_now", roots)
-        self.assertIn("settings_active_process_names()", roots)
-        self.assertLess(roots.index("cleaner_should_skip_now"), roots.index("cleaner_clear_directory"))
-        self.assertNotIn("NSSet<NSString *> *active", body)
-        self.assertIn("processUnavailable = !available", roots)
+        self.assertIn("fb_current_container_for_path", body)
+        self.assertIn("cleaner_container_identity_matches", body)
+        self.assertIn("settings_active_process_names()", body)
+        self.assertLess(body.index("settings_active_process_names()"), body.index("cleaner_clear_directory_at"))
+        self.assertNotIn("cleaner_should_skip_now", body)
+        self.assertIn("processUnavailable = YES", body)
         self.assertIn("Detection is best-effort", source)
+
+    def test_cache_generation_contract(self):
+        source = FB_SOURCE.read_text()
+        self.assertIn("static NSUInteger g_cacheGeneration", source)
+        self.assertIn("generation != g_cacheGeneration", source)
+        self.assertIn("g_cacheGeneration++", source)
+        self.assertNotIn("fb_data_container_for_id_locked", source)
 
     def test_native_helpers(self):
         source = SOURCE.read_text()
@@ -245,7 +279,10 @@ class CleanerHelperTests(unittest.TestCase):
             constants = source[source.index("static NSString * const kCleanerAppDataPrefix"):source.index("static void cleaner_suppress_popup_bar")]
             constants = constants.replace("/private/var/mobile/Containers/Data/Application/", prefix)
             helpers = source[source.index("static BOOL cleaner_path_is_app_data"):source.index("@interface CYCleanerItem")]
-            code = PREAMBLE + constants + helpers + FIXTURES
+            fb_source = FB_SOURCE.read_text()
+            metadata = fb_source[fb_source.index("static BOOL fb_current_bundle_metadata_matches"):
+                                 fb_source.index("static NSString *fb_app_in_container")]
+            code = PREAMBLE + constants + helpers + metadata + FIXTURES
             code += 'int main(void) { @autoreleasepool { mkdirp(kCleanerAppDataPrefix);\n' + SCENARIOS
             code += '\nputs("cleaner helper regressions: PASS"); } return 0; }\n'
             harness = base / "harness.m"

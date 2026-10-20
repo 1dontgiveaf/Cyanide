@@ -56,6 +56,14 @@ static BOOL cleaner_is_disposable_root(NSString *path)
             [parts[2] isEqualToString:@"Caches"]);
 }
 
+static BOOL cleaner_is_app_container(NSString *path)
+{
+    if (!cleaner_path_is_app_data(path)) return NO;
+    NSString *relative = [fb_canonical_path(path) substringFromIndex:kCleanerAppDataPrefix.length];
+    NSArray<NSString *> *parts = relative.pathComponents;
+    return parts.count == 1 && [[NSUUID alloc] initWithUUIDString:parts[0]] != nil;
+}
+
 // Crash reports are the only non-app roots Cleaner may touch. Keep this list
 // exact: no broad Library/Logs walk and no caller-supplied path.
 static NSArray<NSString *> *cleaner_crash_log_roots(void)
@@ -75,15 +83,22 @@ static BOOL cleaner_is_crash_log_root(NSString *path)
     return NO;
 }
 
+static BOOL cleaner_device_matches(dev_t actual, dev_t trusted)
+{
+    return actual == trusted;
+}
+
+static BOOL cleaner_container_identity_matches(const struct stat *st,
+                                               dev_t device, ino_t inode)
+{
+    return st && cleaner_device_matches(st->st_dev, device) && st->st_ino == inode;
+}
+
 // O_NOFOLLOW on a pathname open protects only its final component. Anchor at
 // / and open EVERY component relative to the descriptor already validated.
 // Scan and delete both consume this descriptor; neither reopens the pathname.
-static int cleaner_open_root(NSString *path)
+static int cleaner_open_path(NSString *path)
 {
-    if (!cleaner_is_disposable_root(path) && !cleaner_is_crash_log_root(path)) {
-        errno = EINVAL;
-        return -1;
-    }
     int fd = open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) return -1;
     NSArray<NSString *> *parts = fb_canonical_path(path).pathComponents;
@@ -96,6 +111,86 @@ static int cleaner_open_root(NSString *path)
         fd = next;
     }
     return fd;
+}
+
+static int cleaner_open_root(NSString *path)
+{
+    if (!cleaner_is_disposable_root(path) && !cleaner_is_crash_log_root(path)) {
+        errno = EINVAL;
+        return -1;
+    }
+    return cleaner_open_path(path);
+}
+
+static int cleaner_open_container(NSString *path)
+{
+    if (!cleaner_is_app_container(path)) {
+        errno = EINVAL;
+        return -1;
+    }
+    return cleaner_open_path(path);
+}
+
+static int cleaner_open_relative_directory(int parentFD, NSArray<NSString *> *parts)
+{
+    int fd = dup(parentFD);
+    if (fd < 0) return -1;
+    for (NSString *part in parts) {
+        int next = openat(fd, part.fileSystemRepresentation,
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        int savedError = errno;
+        close(fd);
+        if (next < 0) { errno = savedError; return -1; }
+        fd = next;
+    }
+    return fd;
+}
+
+static int cleaner_open_app_root_at(int containerFD, NSString *relativeRoot)
+{
+    NSArray<NSString *> *parts = relativeRoot.pathComponents;
+    if (!((parts.count == 1 && [parts[0] isEqualToString:@"tmp"]) ||
+          (parts.count == 2 && [parts[0] isEqualToString:@"Library"] &&
+           [parts[1] isEqualToString:@"Caches"]))) {
+        errno = EINVAL;
+        return -1;
+    }
+    return cleaner_open_relative_directory(containerFD, parts);
+}
+
+// CrashReporter has no trusted app container, so its fixed parent directory
+// supplies the baseline. A filesystem mounted directly at the report root is
+// rejected before any traversal or deletion.
+static int cleaner_open_trusted_root(NSString *path, dev_t *deviceOut)
+{
+    if (cleaner_is_disposable_root(path)) {
+        int fd = cleaner_open_root(path);
+        if (fd < 0) return -1;
+        struct stat st = {0};
+        if (fstat(fd, &st) != 0) { int savedError = errno; close(fd); errno = savedError; return -1; }
+        if (deviceOut) *deviceOut = st.st_dev;
+        return fd;
+    }
+    if (!cleaner_is_crash_log_root(path)) { errno = EINVAL; return -1; }
+    NSString *parentPath = path.stringByDeletingLastPathComponent;
+    int parentFD = cleaner_open_path(parentPath);
+    if (parentFD < 0) return -1;
+    struct stat parentStat = {0};
+    if (fstat(parentFD, &parentStat) != 0) {
+        int savedError = errno; close(parentFD); errno = savedError; return -1;
+    }
+    int rootFD = cleaner_open_path(path);
+    int savedError = errno;
+    close(parentFD);
+    if (rootFD < 0) { errno = savedError; return -1; }
+    struct stat rootStat = {0};
+    if (fstat(rootFD, &rootStat) != 0 || !cleaner_device_matches(rootStat.st_dev, parentStat.st_dev)) {
+        close(rootFD);
+        errno = EXDEV;
+        return -1;
+    }
+    if (deviceOut) *deviceOut = parentStat.st_dev;
+    return rootFD;
 }
 
 // procmgr names are truncated to 31 characters. An app whose executable is
@@ -181,7 +276,7 @@ static unsigned long long cleaner_scan_directory_fd(int fd, dev_t device,
             if (errno != ENOENT) *complete = NO;
             continue;
         }
-        if (st.st_dev != device) { *complete = NO; continue; }
+        if (!cleaner_device_matches(st.st_dev, device)) { *complete = NO; continue; }
         if (S_ISREG(st.st_mode)) {
             total += (unsigned long long)st.st_size;
             walk->files++;
@@ -190,7 +285,7 @@ static unsigned long long cleaner_scan_directory_fd(int fd, dev_t device,
                                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
             struct stat opened = {0};
             if (child < 0) { *complete = NO; continue; }
-            if (fstat(child, &opened) != 0 || opened.st_dev != device ||
+            if (fstat(child, &opened) != 0 || !cleaner_device_matches(opened.st_dev, device) ||
                 opened.st_ino != st.st_ino) {
                 close(child); *complete = NO; continue;
             }
@@ -213,14 +308,31 @@ static unsigned long long cleaner_tree_bytes_walk(NSString *root,
         if (complete) *complete = NO;
         return 0;
     }
-    int fd = cleaner_open_root(root);
+    dev_t device = 0;
+    int fd = cleaner_open_trusted_root(root, &device);
+    if (fd < 0) { if (complete) *complete = (errno == ENOENT); return 0; }
+    BOOL finished = YES;
+    unsigned long long total = cleaner_scan_directory_fd(fd, device, 0, walk, &finished);
+    if (complete) *complete = finished;
+    return total;
+}
+
+static unsigned long long cleaner_tree_bytes_at(int containerFD, NSString *relativeRoot,
+                                                dev_t device, BOOL *complete,
+                                                CYCleanerTraversal *walk)
+{
+    if (cleaner_traversal_should_stop(walk, 0)) {
+        if (complete) *complete = NO;
+        return 0;
+    }
+    int fd = cleaner_open_app_root_at(containerFD, relativeRoot);
     if (fd < 0) { if (complete) *complete = (errno == ENOENT); return 0; }
     struct stat st = {0};
-    if (fstat(fd, &st) != 0) {
+    if (fstat(fd, &st) != 0 || !cleaner_device_matches(st.st_dev, device)) {
         close(fd); if (complete) *complete = NO; return 0;
     }
     BOOL finished = YES;
-    unsigned long long total = cleaner_scan_directory_fd(fd, st.st_dev, 0, walk, &finished);
+    unsigned long long total = cleaner_scan_directory_fd(fd, device, 0, walk, &finished);
     if (complete) *complete = finished;
     return total;
 }
@@ -252,7 +364,7 @@ static unsigned long long cleaner_remove_tree_at(int parentFD, const char *name,
         if (errno != ENOENT && failed) (*failed)++;
         return 0;
     }
-    if (st.st_dev != device) { if (failed) (*failed)++; return 0; }
+    if (!cleaner_device_matches(st.st_dev, device)) { if (failed) (*failed)++; return 0; }
     if (!S_ISDIR(st.st_mode)) {
         if (cleaner_traversal_should_stop(walk, depth)) return 0;
         if (unlinkat(parentFD, name, 0) == 0) {
@@ -266,7 +378,7 @@ static unsigned long long cleaner_remove_tree_at(int parentFD, const char *name,
     int fd = openat(parentFD, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) { if (failed) (*failed)++; return 0; }
     struct stat opened = {0};
-    if (fstat(fd, &opened) != 0 || opened.st_dev != device || opened.st_ino != st.st_ino) {
+    if (fstat(fd, &opened) != 0 || !cleaner_device_matches(opened.st_dev, device) || opened.st_ino != st.st_ino) {
         close(fd); if (failed) (*failed)++; return 0;
     }
     DIR *dir = fdopendir(fd);
@@ -283,7 +395,7 @@ static unsigned long long cleaner_remove_tree_at(int parentFD, const char *name,
     if (!cleaner_traversal_should_stop(walk, depth)) {
         struct stat current = {0};
         if (fstatat(parentFD, name, &current, AT_SYMLINK_NOFOLLOW) != 0 ||
-            current.st_dev != st.st_dev || current.st_ino != st.st_ino ||
+            !cleaner_device_matches(current.st_dev, st.st_dev) || current.st_ino != st.st_ino ||
             unlinkat(parentFD, name, AT_REMOVEDIR) != 0) {
             if (failed) (*failed)++;
         }
@@ -294,21 +406,16 @@ static unsigned long long cleaner_remove_tree_at(int parentFD, const char *name,
 // Counters accumulate across roots; initialize them once per app. A supplied
 // traversal shares the whole clean pass's budget/cancellation. NULL creates a
 // standalone bounded root operation (also useful to deterministic tests).
-static unsigned long long cleaner_clear_directory(NSString *dir,
-                                                  NSUInteger *removed,
-                                                  NSUInteger *failed,
-                                                  CYCleanerTraversal *operation)
+static unsigned long long cleaner_clear_directory_fd(int fd, dev_t device,
+                                                     NSUInteger *removed,
+                                                     NSUInteger *failed,
+                                                     CYCleanerTraversal *walk)
 {
-    CYCleanerTraversal local = cleaner_traversal(kCleanerMaxCleanSeconds, NULL);
-    CYCleanerTraversal *walk = operation ?: &local;
     if (cleaner_traversal_should_stop(walk, 0)) return 0;
-    int fd = cleaner_open_root(dir);
-    if (fd < 0) {
-        if (errno != ENOENT && failed) (*failed)++;
-        return 0;
-    }
     struct stat st = {0};
-    if (fstat(fd, &st) != 0) { close(fd); if (failed) (*failed)++; return 0; }
+    if (fstat(fd, &st) != 0 || !cleaner_device_matches(st.st_dev, device)) {
+        close(fd); if (failed) (*failed)++; return 0;
+    }
     DIR *root = fdopendir(fd);
     if (!root) { close(fd); if (failed) (*failed)++; return 0; }
     unsigned long long bytes = 0;
@@ -323,8 +430,41 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
     return bytes;
 }
 
+static unsigned long long cleaner_clear_directory(NSString *dir,
+                                                  NSUInteger *removed,
+                                                  NSUInteger *failed,
+                                                  CYCleanerTraversal *operation)
+{
+    CYCleanerTraversal local = cleaner_traversal(kCleanerMaxCleanSeconds, NULL);
+    CYCleanerTraversal *walk = operation ?: &local;
+    if (cleaner_traversal_should_stop(walk, 0)) return 0;
+    dev_t device = 0;
+    int fd = cleaner_open_trusted_root(dir, &device);
+    if (fd < 0) {
+        if (errno != ENOENT && failed) (*failed)++;
+        return 0;
+    }
+    return cleaner_clear_directory_fd(fd, device, removed, failed, walk);
+}
+
+static unsigned long long cleaner_clear_directory_at(int containerFD, NSString *relativeRoot,
+                                                     dev_t device, NSUInteger *removed,
+                                                     NSUInteger *failed, CYCleanerTraversal *walk)
+{
+    if (cleaner_traversal_should_stop(walk, 0)) return 0;
+    int fd = cleaner_open_app_root_at(containerFD, relativeRoot);
+    if (fd < 0) {
+        if (errno != ENOENT && failed) (*failed)++;
+        return 0;
+    }
+    return cleaner_clear_directory_fd(fd, device, removed, failed, walk);
+}
+
 @interface CYCleanerItem : NSObject <NSCopying>
 @property (nonatomic, strong) FBAppContainer *container;
+@property (nonatomic) dev_t containerDevice;
+@property (nonatomic) ino_t containerInode;
+@property (nonatomic) BOOL hasContainerIdentity;
 @property (nonatomic, strong) UIImage *icon;
 @property (nonatomic, copy) NSString *name;
 @property (nonatomic) unsigned long long cacheBytes;
@@ -361,6 +501,9 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
 {
     CYCleanerItem *copy = [[[self class] allocWithZone:zone] init];
     copy.container = self.container;
+    copy.containerDevice = self.containerDevice;
+    copy.containerInode = self.containerInode;
+    copy.hasContainerIdentity = self.hasContainerIdentity;
     copy.icon = self.icon;
     copy.name = self.name;
     copy.cacheBytes = self.cacheBytes;
@@ -1051,21 +1194,50 @@ static BOOL cleaner_intro_accepted(void)
                 if (![container isKindOfClass:FBAppContainer.class]) continue;
                 if (!cleaner_path_is_app_data(container.path)) continue;
 
-                CYCleanerItem *item = [[CYCleanerItem alloc] init];
-                item.container = container;
-                item.name = container.displayName.length ? container.displayName : container.identifier;
-                item.systemApp = container.systemApp;
-                item.active = cleaner_process_is_active(container.executableName, active);
+                // The ordinary container object supplies the cached icon and
+                // display affordances. Safety metadata is reread without icon
+                // work and must retain the same bundle association.
+                FBAppContainer *current = fb_current_container_for_path(container.path, NO);
+                BOOL metadataValid = current && current.kind == FBContainerKindData &&
+                                     current.executableName.length > 0;
+                FBAppContainer *safetyContainer = metadataValid ? current : container;
 
-                NSString *cachePath = [container.path stringByAppendingPathComponent:@"Library/Caches"];
-                NSString *tmpPath = [container.path stringByAppendingPathComponent:@"tmp"];
-                BOOL complete = NO;
-                item.cacheBytes = cleaner_tree_bytes_cancellable(cachePath, NULL, &complete, &scanCancelled);
-                item.incomplete = !complete;
-                complete = NO;
-                item.tempBytes = cleaner_tree_bytes_cancellable(tmpPath, NULL, &complete, &scanCancelled);
-                item.incomplete = item.incomplete || !complete;
-                item.icon = container.icon;   // loaded off the main thread
+                CYCleanerItem *item = [[CYCleanerItem alloc] init];
+                item.container = safetyContainer;
+                item.name = safetyContainer.displayName.length ? safetyContainer.displayName : safetyContainer.identifier;
+                item.systemApp = safetyContainer.systemApp;
+                item.active = !metadataValid || cleaner_process_is_active(safetyContainer.executableName, active);
+                item.icon = container.icon;   // loaded by the ordinary cache, never by the refresh
+
+                if (!metadataValid) {
+                    // Preserve an informational row if possible, but never
+                    // make an item with stale executable/container metadata
+                    // selectable or cleanable.
+                    item.incomplete = YES;
+                } else {
+                    int containerFD = cleaner_open_container(safetyContainer.path);
+                    struct stat containerStat = {0};
+                    if (containerFD < 0 || fstat(containerFD, &containerStat) != 0) {
+                        if (containerFD >= 0) close(containerFD);
+                        item.incomplete = YES;
+                        item.active = YES;
+                    } else {
+                        item.containerDevice = containerStat.st_dev;
+                        item.containerInode = containerStat.st_ino;
+                        item.hasContainerIdentity = YES;
+                        BOOL complete = NO;
+                        CYCleanerTraversal cacheWalk = cleaner_traversal(kCleanerMaxScanSeconds, &scanCancelled);
+                        item.cacheBytes = cleaner_tree_bytes_at(containerFD, @"Library/Caches",
+                                                                containerStat.st_dev, &complete, &cacheWalk);
+                        item.incomplete = !complete;
+                        complete = NO;
+                        CYCleanerTraversal tempWalk = cleaner_traversal(kCleanerMaxScanSeconds, &scanCancelled);
+                        item.tempBytes = cleaner_tree_bytes_at(containerFD, @"tmp",
+                                                               containerStat.st_dev, &complete, &tempWalk);
+                        item.incomplete = item.incomplete || !complete;
+                        close(containerFD);
+                    }
+                }
                 scanned++;
                 NSString *name = item.name;
                 NSUInteger done = scanned;
@@ -1267,9 +1439,36 @@ static BOOL cleaner_intro_accepted(void)
                 // half-cleaned before noticing it had become active. Fail
                 // closed: no list or no executable name means no deletion.
                 BOOL skipApp = NO;
+                int trustedContainerFD = -1;
+                dev_t trustedContainerDevice = 0;
                 if (!isLogs) {
+                    FBAppContainer *current = fb_current_container_for_path(item.container.path, NO);
+                    if (!current || current.kind != FBContainerKindData || current.executableName.length == 0 ||
+                        !item.hasContainerIdentity) {
+                        processUnavailable = YES;
+                        item.incomplete = YES;
+                    } else {
+                        // Open and verify the path once, then keep this
+                        // descriptor as the trusted parent for both roots.
+                        trustedContainerFD = cleaner_open_container(current.path);
+                        struct stat currentStat = {0};
+                        if (trustedContainerFD < 0 || fstat(trustedContainerFD, &currentStat) != 0 ||
+                            !cleaner_container_identity_matches(&currentStat, item.containerDevice,
+                                                                item.containerInode)) {
+                            if (trustedContainerFD >= 0) close(trustedContainerFD);
+                            trustedContainerFD = -1;
+                            processUnavailable = YES;
+                            item.incomplete = YES;
+                        } else {
+                            item.container = current;
+                            trustedContainerDevice = currentStat.st_dev;
+                        }
+                    }
                     NSSet<NSString *> *activeNames = settings_active_process_names();
-                    if (!activeNames || item.container.executableName.length == 0) {
+                    if (processUnavailable) {
+                        // A metadata or identity refresh failure is a hard
+                        // stop; do not consult stale executable state.
+                    } else if (!activeNames || item.container.executableName.length == 0) {
                         processUnavailable = YES;
                     } else if (cleaner_process_is_active(item.container.executableName, activeNames)) {
                         item.active = YES;
@@ -1289,9 +1488,9 @@ static BOOL cleaner_intro_accepted(void)
                     } else {
                         for (NSString *relativeRoot in @[ @"Library/Caches", @"tmp" ]) {
                             if (cleaner_traversal_should_stop(&traversal, 0)) break;
-                            appFreed += cleaner_clear_directory(
-                                [item.container.path stringByAppendingPathComponent:relativeRoot],
-                                &removed, &failed, &traversal);
+                            appFreed += cleaner_clear_directory_at(trustedContainerFD, relativeRoot,
+                                                                   trustedContainerDevice, &removed, &failed,
+                                                                   &traversal);
                         }
                     }
                 }
@@ -1315,14 +1514,15 @@ static BOOL cleaner_intro_accepted(void)
                     // Shared traversal: rescans draw from the same 60 s budget
                     // as the deletions instead of starting fresh 15 s clocks.
                     BOOL complete = NO;
-                    item.cacheBytes = cleaner_tree_bytes_walk(
-                        [item.container.path stringByAppendingPathComponent:@"Library/Caches"], &complete, &traversal);
+                    item.cacheBytes = cleaner_tree_bytes_at(trustedContainerFD, @"Library/Caches",
+                                                            trustedContainerDevice, &complete, &traversal);
                     item.incomplete = !complete;
                     complete = NO;
-                    item.tempBytes = cleaner_tree_bytes_walk(
-                        [item.container.path stringByAppendingPathComponent:@"tmp"], &complete, &traversal);
+                    item.tempBytes = cleaner_tree_bytes_at(trustedContainerFD, @"tmp",
+                                                           trustedContainerDevice, &complete, &traversal);
                     item.incomplete = item.incomplete || !complete;
                 }
+                if (trustedContainerFD >= 0) close(trustedContainerFD);
                 item.selected = NO;
                 if (failed > 0) failedItems++;
                 if (removed > 0) {
