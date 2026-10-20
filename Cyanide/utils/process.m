@@ -1399,6 +1399,45 @@ static void *pm_busy_fn(void *arg) {
 
 static bool pm_thread_sums_recount(uint64_t th, uint64_t *uMach, uint64_t *sMach);
 
+// Address/span helpers for every speculative task/thread field read. The
+// calibration offsets are runtime data (and cached across launches), so a
+// plausible kernel pointer alone is not enough: reject truncated offset math,
+// pointer arithmetic wraparound, and any span that is not mapped in the current
+// ksafe snapshot before calling kread/kread_ptr.
+static bool pm_offset_span(uint64_t offset, uint64_t bytes, uint64_t *endOut) {
+    if (bytes == 0 || bytes > UINT32_MAX || offset > UINT32_MAX ||
+        offset > UINT64_MAX - bytes || offset + bytes > UINT32_MAX)
+        return false;
+    if (endOut) *endOut = offset + bytes;
+    return true;
+}
+
+static bool pm_mapped_span(uint64_t base, uint64_t offset, uint64_t bytes) {
+    if (!procmgr_is_kern_ptr(base) || !ksafe_available() ||
+        !pm_offset_span(offset, bytes, NULL) ||
+        offset > UINT64_MAX - base ||
+        base + offset > UINT64_MAX - bytes)
+        return false;
+    return kaddr_is_mapped(base + offset, (uint32_t)bytes);
+}
+
+// Named separately because task ledger/CPU/head fields are consumed by more
+// than one path; callers must use this immediately before each task read.
+static bool pm_task_field_mapped(uint64_t task, uint32_t offset, uint32_t bytes) {
+    return pm_mapped_span(task, offset, bytes);
+}
+
+static bool pm_recount_array_span(uint32_t count, uint32_t stride,
+                                  uint64_t *bytesOut) {
+    if (count == 0 || stride < 16 ||
+        (uint64_t)count > (UINT64_MAX - 8) / stride)
+        return false;
+    uint64_t bytes = 8 + (uint64_t)count * stride;
+    if (!pm_offset_span(0, bytes, NULL)) return false;
+    if (bytesOut) *bytesOut = bytes;
+    return true;
+}
+
 // Sum the calibrated timers of all LIVE threads of a task, in the thread
 // calibration's unit (abstime if g_pm_thr_abstime). Walks
 // task->threads -> chain of thread->task_threads.next, stopping when it loops
@@ -1409,18 +1448,28 @@ static bool pm_thread_sums_recount(uint64_t th, uint64_t *uMach, uint64_t *sMach
 // the page-table walker is up we mapped-check the whole span we are about to
 // touch, narrowing the unmapped-read panic window to the race itself.
 static bool pm_live_thread_sums(uint64_t task, uint64_t *uOut, uint64_t *sOut) {
-    if (!g_pm_thr_cal) return false;
-    bool mappedGate = ksafe_available();
-    uint32_t loOff, hiOff;
+    if (!g_pm_thr_cal || !ksafe_available()) return false;
+    uint64_t loOff = 0, hiOff = 0, end = 0;
     if (g_pm_rc_cal) {
-        loOff = MIN(g_pm_rc_lifetime_off, off_thread_task_threads_next);
-        hiOff = MAX(g_pm_rc_lifetime_off, off_thread_task_threads_next) + 8;
+        if (!pm_offset_span(g_pm_rc_lifetime_off, 8, &end)) return false;
+        loOff = g_pm_rc_lifetime_off;
+        hiOff = end;
+        if (!pm_offset_span(off_thread_task_threads_next, 8, &end)) return false;
+        loOff = MIN(loOff, (uint64_t)off_thread_task_threads_next);
+        hiOff = MAX(hiOff, end);
     } else {
-        loOff = MIN(MIN(g_pm_off_thread_utime, g_pm_off_thread_stime),
-                    off_thread_task_threads_next);
-        hiOff = MAX(MAX(g_pm_off_thread_utime, g_pm_off_thread_stime),
-                    off_thread_task_threads_next) + 8;
+        if (!pm_offset_span(g_pm_off_thread_utime, 8, &end)) return false;
+        loOff = g_pm_off_thread_utime;
+        hiOff = end;
+        if (!pm_offset_span(g_pm_off_thread_stime, 8, &end)) return false;
+        loOff = MIN(loOff, (uint64_t)g_pm_off_thread_stime);
+        hiOff = MAX(hiOff, end);
+        if (!pm_offset_span(off_thread_task_threads_next, 8, &end)) return false;
+        loOff = MIN(loOff, (uint64_t)off_thread_task_threads_next);
+        hiOff = MAX(hiOff, end);
     }
+    if (hiOff <= loOff || !pm_offset_span(loOff, hiOff - loOff, NULL) ||
+        !pm_task_field_mapped(task, off_task_threads_next, 8)) return false;
     uint64_t head = task + off_task_threads_next;
     uint64_t first = kread64(head);
     if (first == head) { *uOut = 0; *sOut = 0; return true; }   // no live threads
@@ -1441,12 +1490,10 @@ static bool pm_live_thread_sums(uint64_t task, uint64_t *uOut, uint64_t *sOut) {
                 printf("[PROCMGR] thread walk: chain broke at i=%d t=0x%llx\n", i, t);
             return false;
         }
-        if (mappedGate && !kaddr_is_mapped(t + loOff, hiOff - loOff)) {
+        if (!pm_mapped_span(t, loOff, hiOff - loOff)) {
             // Thread exited and its struct got unmapped mid-walk. The span
             // includes task_threads.next, so there is no safe way on to the
-            // next thread: drop this sample (the caller shows no CPU for the
-            // process this refresh) rather than read the link we just failed
-            // to prove mapped -- that read is the panic this gate exists for.
+            // next thread: drop this sample rather than read the failed link.
             static int dbgU = 0;
             if (dbgU++ < 3)
                 printf("[PROCMGR] thread walk: thread 0x%llx unmapped at i=%d — sample dropped\n", t, i);
@@ -1455,11 +1502,11 @@ static bool pm_live_thread_sums(uint64_t task, uint64_t *uOut, uint64_t *sOut) {
         if (g_pm_rc_cal) {
             uint64_t tu = 0, ts = 0;
             if (!pm_thread_sums_recount(t, &tu, &ts)) {
+                if (!pm_mapped_span(t, g_pm_rc_lifetime_off, 8)) return false;
                 uint64_t P = kread64(t + g_pm_rc_lifetime_off);
                 if (P == 0) {
-                    // Thread exited mid-walk: rth_lifetime already freed and its
-                    // time rolled into task->total_* via recount rollup. A LIVE-
-                    // thread sum must contribute 0 for it — skip, don't fail.
+                    // Thread exited mid-walk: rth_lifetime already freed and
+                    // its time rolled into task->total_* via recount rollup.
                 } else {
                     static int dbg2 = 0;
                     if (dbg2++ < 3)
@@ -1469,23 +1516,21 @@ static bool pm_live_thread_sums(uint64_t task, uint64_t *uOut, uint64_t *sOut) {
                 }
                 goto next_thread;
             }
+            if (UINT64_MAX - u < tu || UINT64_MAX - s < ts) return false;
             u += tu; s += ts;
         } else {
-            u += kread64(t + g_pm_off_thread_utime);
-            s += kread64(t + g_pm_off_thread_stime);
+            if (!pm_mapped_span(t, g_pm_off_thread_utime, 8) ||
+                !pm_mapped_span(t, g_pm_off_thread_stime, 8)) return false;
+            uint64_t tu = kread64(t + g_pm_off_thread_utime);
+            uint64_t ts = kread64(t + g_pm_off_thread_stime);
+            if (UINT64_MAX - u < tu || UINT64_MAX - s < ts) return false;
+            u += tu; s += ts;
         }
-next_thread:;
+next_thread:
+        if (!pm_mapped_span(t, off_thread_task_threads_next, 8)) return false;
         uint64_t next = kread64(t + off_thread_task_threads_next);
-        // NULL terminates the list on this kernel (also hit when a thread
-        // dies mid-walk and its links are torn down) — that is a clean end,
-        // not corruption. Looping back to the first thread also ends it.
-        // task->threads is a queue_head_t: the LAST thread's next points back
-        // at the head inside the task (task + off_task_threads_next), not at
-        // the first thread. Without this check the head was walked as if it
-        // were a thread — task fields read as timer / recount pointers, and
-        // the walk "ended" only when task+head+next_off happened to be 0
-        // (live log 2026-10-07: "next=0x100000000 invalid at i=5"), failing
-        // CPU for those tasks and poisoning the task-total calibration.
+        // NULL terminates the list on this kernel; the last thread may also
+        // point back to the queue head inside the task rather than first.
         if (next == first || next == 0 || next == head) break;
         if (!procmgr_is_kern_ptr(next)) {
             static int dbg3 = 0;
@@ -1537,35 +1582,52 @@ static bool pm_thread_pair_verify(uint64_t th, uint32_t oU, uint32_t oS, bool ab
 // Sum one thread's recount lifetime tracks (mach units) using the calibrated
 // layout.
 static bool pm_thread_sums_recount(uint64_t th, uint64_t *uMach, uint64_t *sMach) {
+    uint64_t arrayBytes = 0;
+    if (!pm_mapped_span(th, g_pm_rc_lifetime_off, 8) ||
+        g_pm_rc_track_stride < 16 ||
+        g_pm_rc_lvl_stride > g_pm_rc_track_stride - 16 ||
+        !pm_recount_array_span(g_pm_rc_count, g_pm_rc_track_stride, &arrayBytes))
+        return false;
     uint64_t P = kread64(th + g_pm_rc_lifetime_off);
-    if (!procmgr_is_kern_ptr(P)) return false;
-    if (ksafe_available() &&
-        !kaddr_is_mapped(P, 8 + g_pm_rc_count * g_pm_rc_track_stride)) return false;
+    if (!procmgr_is_kern_ptr(P) || !pm_mapped_span(P, 0, arrayBytes)) return false;
     uint64_t u = 0, s = 0;
     for (uint32_t i = 0; i < g_pm_rc_count; i++) {
         uint64_t b = P + (uint64_t)i * g_pm_rc_track_stride;
-        s += kread64(b + 8);
-        u += kread64(b + 8 + g_pm_rc_lvl_stride);
+        uint64_t sv = kread64(b + 8);
+        uint64_t uv = kread64(b + 8 + g_pm_rc_lvl_stride);
+        if (UINT64_MAX - s < sv || UINT64_MAX - u < uv) return false;
+        s += sv;
+        u += uv;
     }
     *uMach = u; *sMach = s;
     return true;
 }
-
 // Sum with explicit layout parameters (used during calibration discovery).
 static void pm_recount_read_sums(uint64_t th, uint32_t off, uint32_t ts,
                                  uint32_t ls, uint32_t cnt,
                                  uint64_t *uMach, uint64_t *sMach) {
+    uint64_t arrayBytes = 0;
+    if (!pm_mapped_span(th, off, 8) || ts < 16 || ls > ts - 16 ||
+        !pm_recount_array_span(cnt, ts, &arrayBytes)) {
+        *uMach = 0; *sMach = 0; return;
+    }
     uint64_t P = kread64(th + off);
     // A failed read zero-fills (fail-safe early_kread), and P=0 would make the
-    // loop below read 0x8, 0x8+ls, … — garbage sums at best. Treat a non-kernel
-    // P as "no data this pass"; the value-match against thread_info rejects the
-    // candidate either way.
-    if (!procmgr_is_kern_ptr(P)) { *uMach = 0; *sMach = 0; return; }
+    // loop below read 0x8, 0x8+ls, … — garbage sums at best. Treat a non-
+    // kernel P as "no data this pass"; the value-match against thread_info
+    // rejects the candidate either way.
+    if (!procmgr_is_kern_ptr(P) || !pm_mapped_span(P, 0, arrayBytes)) {
+        *uMach = 0; *sMach = 0; return;
+    }
     uint64_t u = 0, s = 0;
     for (uint32_t i = 0; i < cnt; i++) {
         uint64_t b = P + (uint64_t)i * ts;
-        s += kread64(b + 8);
-        u += kread64(b + 8 + ls);
+        uint64_t sv = kread64(b + 8), uv = kread64(b + 8 + ls);
+        if (UINT64_MAX - s < sv || UINT64_MAX - u < uv) {
+            *uMach = 0; *sMach = 0; return;
+        }
+        s += sv;
+        u += uv;
     }
     *uMach = u; *sMach = s;
 }
@@ -2296,9 +2358,11 @@ static void pm_save_cache(void) {
 // thread for that one sample.
 static int pm_kernel_stats(uint64_t task, uint64_t *memOut, uint64_t *cpuOut) {
     int valid = 0;
+    if (!procmgr_is_kern_ptr(task) || !ksafe_available()) return 0;
 
     // --- memory: ledger physical-footprint entry (credit - debit) ---
-    if (g_pm_mem_cal && ksafe_available()) {
+    if (g_pm_mem_cal &&
+        pm_task_field_mapped(task, g_pm_off_task_ledger, sizeof(uint64_t))) {
         uint64_t ledger = kread_ptr(task + g_pm_off_task_ledger);
         // The ledger is a separate kernel object: mapped-check the exact
         // 16 bytes we are about to read before touching them.
@@ -2333,7 +2397,9 @@ static int pm_kernel_stats(uint64_t task, uint64_t *memOut, uint64_t *cpuOut) {
             if (tot) { *cpuOut = tot; valid |= 2; }
         }
     }
-    if (g_pm_cpu_cal && g_pm_thr_cal) {
+    if (g_pm_cpu_cal && g_pm_thr_cal &&
+        pm_task_field_mapped(task, g_pm_off_task_cpu_u, sizeof(uint64_t)) &&
+        pm_task_field_mapped(task, g_pm_off_task_cpu_s, sizeof(uint64_t))) {
         // The task totals only move when a thread terminates (its time is
         // folded in at exit), so any change across the bracket means a thread
         // may be counted both in u2/s2 and in the live walk. Retry the bracket;
@@ -2346,10 +2412,16 @@ static int pm_kernel_stats(uint64_t task, uint64_t *memOut, uint64_t *cpuOut) {
         uint64_t u1 = 0, s1 = 0, u2 = 0, s2 = 0, lu = 0, ls = 0;
         bool walkOk = false;
         for (int attempt = 0; attempt < 4; attempt++) {
+            if (!pm_task_field_mapped(task, g_pm_off_task_cpu_u, sizeof(uint64_t)) ||
+                !pm_task_field_mapped(task, g_pm_off_task_cpu_s, sizeof(uint64_t)))
+                break;
             u1 = kread64(task + g_pm_off_task_cpu_u);
             s1 = kread64(task + g_pm_off_task_cpu_s);
             lu = 0; ls = 0;
             walkOk = pm_live_thread_sums(task, &lu, &ls);
+            if (!pm_task_field_mapped(task, g_pm_off_task_cpu_u, sizeof(uint64_t)) ||
+                !pm_task_field_mapped(task, g_pm_off_task_cpu_s, sizeof(uint64_t)))
+                break;
             u2 = kread64(task + g_pm_off_task_cpu_u);
             s2 = kread64(task + g_pm_off_task_cpu_s);
             if (u2 == u1 && s2 == s1) break;
