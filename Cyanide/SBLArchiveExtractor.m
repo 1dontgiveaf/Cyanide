@@ -334,6 +334,38 @@ static NSData *sbl_decode_xz_data(NSData *input, NSProgress *progress, NSError *
     return out;
 }
 
+static BOOL sbl_create_directory_entry(NSString *path,
+                                        NSMutableSet<NSString *> *explicitDirectories,
+                                        NSError **error)
+{
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *parent = path.stringByDeletingLastPathComponent;
+    if (![fm createDirectoryAtPath:parent
+       withIntermediateDirectories:YES
+                        attributes:nil
+                             error:error]) {
+        return NO;
+    }
+    if (mkdir(path.fileSystemRepresentation, 0700) != 0 && errno != EEXIST) {
+        sbl_set_error(error, 55, @"Could not create an archive directory entry.");
+        return NO;
+    }
+    struct stat st;
+    if (lstat(path.fileSystemRepresentation, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        sbl_set_error(error, 26, @"ZIP contains file/directory output aliases.");
+        return NO;
+    }
+    NSString *identity = [NSString stringWithFormat:@"%llu:%llu",
+                          (unsigned long long)st.st_dev,
+                          (unsigned long long)st.st_ino];
+    if ([explicitDirectories containsObject:identity]) {
+        sbl_set_error(error, 26, @"ZIP contains duplicate output directories.");
+        return NO;
+    }
+    [explicitDirectories addObject:identity];
+    return YES;
+}
+
 static BOOL sbl_write_file(NSData *data, NSString *path, NSError **error)
 {
     NSString *parent = path.stringByDeletingLastPathComponent;
@@ -343,7 +375,32 @@ static BOOL sbl_write_file(NSData *data, NSString *path, NSError **error)
                                                        error:error]) {
         return NO;
     }
-    return [data writeToFile:path options:NSDataWritingAtomic error:error];
+    int fd = open(path.fileSystemRepresentation,
+                  O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        sbl_set_error(error, errno == EEXIST ? 26 : 55,
+                      errno == EEXIST ? @"Archive entries resolve to duplicate output paths."
+                                      : @"Could not create an extracted archive file.");
+        return NO;
+    }
+    const uint8_t *bytes = data.bytes;
+    size_t length = (size_t)data.length;
+    size_t offset = 0;
+    while (offset < length) {
+        ssize_t written = write(fd, bytes + offset, length - offset);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) {
+            close(fd);
+            sbl_set_error(error, 55, @"Could not write an extracted archive file.");
+            return NO;
+        }
+        offset += (size_t)written;
+    }
+    if (close(fd) != 0) {
+        sbl_set_error(error, 55, @"Could not close an extracted archive file.");
+        return NO;
+    }
+    return YES;
 }
 
 static const uint16_t kSBLZipDataDescriptorFlag = 1u << 3;
@@ -439,6 +496,7 @@ static BOOL sbl_extract_zip(NSData *zip, NSString *destination, NSProgress *prog
     NSUInteger extracted = 0;
     uint64_t totalBytes = 0;
     NSMutableSet<NSString *> *outputPaths = [NSMutableSet set];
+    NSMutableSet<NSString *> *explicitDirectories = [NSMutableSet set];
 
     for (uint16_t i = 0; i < count; i++) {
         if (sbl_cancelled(progress, error)) return NO;
@@ -538,13 +596,11 @@ static BOOL sbl_extract_zip(NSData *zip, NSString *destination, NSProgress *prog
                                       : @"ZIP contains an unsafe entry path.");
             return NO;
         }
-        if (!isDirectory) {
-            if ([outputPaths containsObject:outPath]) {
-                sbl_set_error(error, 26, @"ZIP contains duplicate output paths.");
-                return NO;
-            }
-            [outputPaths addObject:outPath];
+        if ([outputPaths containsObject:outPath]) {
+            sbl_set_error(error, 26, @"ZIP contains duplicate output paths.");
+            return NO;
         }
+        [outputPaths addObject:outPath];
 
         if (method != 0 && method != 8) {
             sbl_set_error(error, 27, @"ZIP uses an unsupported compression method.");
@@ -588,6 +644,8 @@ static BOOL sbl_extract_zip(NSData *zip, NSString *destination, NSProgress *prog
         if (!isDirectory) {
             if (!sbl_write_file(fileData, outPath, error)) return NO;
             extracted++;
+        } else if (!sbl_create_directory_entry(outPath, explicitDirectories, error)) {
+            return NO;
         }
     }
 
@@ -612,6 +670,7 @@ static BOOL sbl_extract_tar(NSData *tar, NSString *destination, NSProgress *prog
     NSUInteger entries = 0;
     uint64_t totalBytes = 0;
     BOOL ended = NO;
+    NSMutableSet<NSString *> *explicitDirectories = [NSMutableSet set];
 
     while (p + 512 <= len) {
         if (sbl_cancelled(progress, error)) return NO;
@@ -672,10 +731,13 @@ static BOOL sbl_extract_tar(NSData *tar, NSString *destination, NSProgress *prog
             NSString *bare = name ?: @"";
             while ([bare hasPrefix:@"./"]) bare = [bare substringFromIndex:2];
             while ([bare hasSuffix:@"/"]) bare = [bare substringToIndex:bare.length - 1];
-            if (bare.length && ![bare isEqualToString:@"."] &&
-                !sbl_safe_output_path(destination, name)) {
-                sbl_set_error(error, 33, @"TAR contains an unsafe directory path.");
-                return NO;
+            if (bare.length && ![bare isEqualToString:@"."]) {
+                NSString *outPath = sbl_safe_output_path(destination, name);
+                if (!outPath) {
+                    sbl_set_error(error, 33, @"TAR contains an unsafe directory path.");
+                    return NO;
+                }
+                if (!sbl_create_directory_entry(outPath, explicitDirectories, error)) return NO;
             }
         }
         // Everything else -- symlinks ('2'), hard links ('1'), pax ('x', 'g')
