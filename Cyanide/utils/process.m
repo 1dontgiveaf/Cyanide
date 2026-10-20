@@ -166,7 +166,14 @@ int procmgr_identity_for_pid(int pid, char *buf, size_t len, uint64_t *kprocOut)
         pthread_mutex_unlock(&g_pm_identity_lookup_lock);
         return -1;
     }
-    int n = procmgr_list(entries, cap);
+    // A list pass fails on any concurrent KRW error or a process exiting
+    // mid-walk; that says nothing about this pid. Retry briefly before
+    // refusing a user's Quit as "identity couldn't be verified".
+    int n = -1;
+    for (int attempt = 0; attempt < 3 && n < 0; attempt++) {
+        if (attempt) usleep(50000);
+        n = procmgr_list(entries, cap);
+    }
     int result = -1;
     if (n >= 0 && ksafe_available()) {
         krw_set_nonfatal(true);
@@ -281,6 +288,10 @@ static uint32_t g_pm_off_task_bsdinfo = 0;
 static uint64_t g_pm_task_proc_delta = 0;
 static int      g_pm_bsdinfo_attempts = 0;
 #define PM_BSDINFO_MAX_ATTEMPTS 3   // then give up for the session (log-quiet)
+// A pass whose launchd lookup failed (process list churn) proved nothing:
+// it gets these extra tries instead of using up a real attempt.
+static int      g_pm_bsdinfo_list_misses = 0;
+#define PM_BSDINFO_MAX_LIST_MISSES 10
 
 static bool pm_task_for_entry(uint64_t proc, uint64_t *taskOut);
 static bool pm_find_entry_task(int pid, uint64_t *procOut, uint64_t *taskOut);
@@ -326,6 +337,11 @@ static void pm_calibrate_bsdinfo(void) {
         g_pm_task_proc_delta = task - selfProc;
         printf("[PROCMGR] proc->task guard: no bsd_info field; using fixed "
                "proc+task delta 0x%llx (launchd xcheck=1)\n", g_pm_task_proc_delta);
+    } else if (!haveLaunchd && matches == 0 && g_pm_bsdinfo_list_misses < PM_BSDINFO_MAX_LIST_MISSES) {
+        // Without launchd's task there's no cross-check either way: retry
+        // on a later pass rather than give up the identity guard for good.
+        g_pm_bsdinfo_list_misses++;
+        g_pm_bsdinfo_attempts--;
     } else {
         printf("[PROCMGR] bsd_info calibration failed (attempt %d/%d, matches=%d "
                "launchd=%d) — proc->task guards stay kern-ptr-only\n",

@@ -177,7 +177,7 @@ static NSDictionary<NSString *, FBAppRecord *> *fb_apps_index(void)
         NSMutableDictionary *apps = [NSMutableDictionary dictionary];
         NSFileManager *fm = NSFileManager.defaultManager;
         for (NSString *item in [fm contentsOfDirectoryAtPath:@"/Applications" error:nil]) {
-            if (![item.pathExtension isEqualToString:@".app"]) continue;
+            if (![item.pathExtension isEqualToString:@"app"]) continue;
             NSString *bid = nil;
             FBAppRecord *app = fb_app_record_for_app([@"/Applications" stringByAppendingPathComponent:item], nil, &bid);
             if (app) apps[bid] = app;
@@ -222,7 +222,7 @@ static FBAppRecord *fb_current_app_record_for_identifier(NSString *identifier)
         if (fresh && [freshIdentifier isEqualToString:identifier]) return fresh;
     }
     for (NSString *item in [fm contentsOfDirectoryAtPath:@"/Applications" error:nil]) {
-        if (![item.pathExtension isEqualToString:@".app"]) continue;
+        if (![item.pathExtension isEqualToString:@"app"]) continue;
         NSString *freshIdentifier = nil;
         FBAppRecord *fresh = fb_app_record_for_app([@"/Applications" stringByAppendingPathComponent:item], nil,
                                                     &freshIdentifier);

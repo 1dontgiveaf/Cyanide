@@ -277,6 +277,8 @@ BOOL settings_kernel_access_available(void);
 // access: a "Run Exploit?" popup once per screen; `retry` runs once access is
 // ready. Declined, the tool shows kSettingsNoKernelAccessHint. Main thread.
 extern NSString * const kSettingsNoKernelAccessHint;
+// Whether settings_tool_needs_exploit already showed its popup on `tool`.
+BOOL settings_tool_exploit_was_offered(UIViewController *tool);
 void settings_tool_needs_exploit(UIViewController *tool, UITableView *tableView, NSString *toolName,
                                  void (^retry)(void));
 // Daemons screen (launchd disabled.plist). `disabled` maps label -> value as

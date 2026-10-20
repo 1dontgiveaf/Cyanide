@@ -7535,9 +7535,10 @@ static void settings_run_exploit_with_log_reason(UIViewController *presenter, NS
         if (completion) completion(NO);
         return;
     }
-    // Live or parked kernel access needs no run: the caller just retries,
-    // and a parked session is restored then, silently, as usual.
-    if (settings_krw_available_without_exploit()) {
+    // Only LIVE access short-circuits. A saved session the caller just failed
+    // to restore (e.g. launchd lookup failing) must not report success, or
+    // the caller would retry and fail in a loop without ever asking.
+    if (g_kexploit_done && kexploit_krw_session_active()) {
         if (completion) completion(YES);
         return;
     }
@@ -7599,9 +7600,14 @@ static void settings_offer_exploit_popup(UIViewController *tool, NSString *reaso
         });
         return;
     }
-    if (settings_krw_available_without_exploit()) { done(YES); return; }
+    if (g_kexploit_done && kexploit_krw_session_active()) { done(YES); return; }   // live only (see above)
     objc_setAssociatedObject(tool, kSettingsExploitOfferedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     settings_run_exploit_with_log_reason(tool, reason, done);
+}
+
+BOOL settings_tool_exploit_was_offered(UIViewController *tool)
+{
+    return tool && objc_getAssociatedObject(tool, kSettingsExploitOfferedKey) != nil;
 }
 
 void settings_tool_needs_exploit(UIViewController *tool, UITableView *tableView, NSString *toolName,
@@ -7633,13 +7639,14 @@ static NSDictionary<NSString *, NSString *> *settings_launchd_job_programs(void)
     static BOOL tried;
     @synchronized (NSNull.null) {
         if (tried) return programs;
-        tried = YES;
         NSData *data = [NSData dataWithContentsOfFile:@"/System/Library/xpc/launchd.plist"];
         id root = data ? [NSPropertyListSerialization propertyListWithData:data options:0 format:NULL error:nil] : nil;
         if (![root isKindOfClass:NSDictionary.class]) {
+            // Not cached: a later read (e.g. once the sandbox is lifted) may work.
             printf("[DAEMONS] launchd job cache not readable; guessing executable names\n");
             return nil;
         }
+        tried = YES;
         NSMutableDictionary *out = [NSMutableDictionary dictionary];
         // Jobs are dictionaries with a Label, nested under LaunchDaemons /
         // LaunchAgents / … keyed by their original plist path.
@@ -7654,7 +7661,10 @@ static NSDictionary<NSString *, NSString *> *settings_launchd_job_programs(void)
                 NSArray *args = node[@"ProgramArguments"];
                 if (![program isKindOfClass:NSString.class] && [args isKindOfClass:NSArray.class] &&
                     [args.firstObject isKindOfClass:NSString.class]) program = args.firstObject;
-                if ([program isKindOfClass:NSString.class]) out[label] = program.lastPathComponent;
+                // A job without Program/ProgramArguments (e.g. BundleProgram)
+                // still exists: record it, with the guessed executable name.
+                out[label] = [program isKindOfClass:NSString.class] ? program.lastPathComponent
+                                                                    : daemon_catalog_executable_guess(label);
                 continue;
             }
             for (id child in [node allValues]) if ([child isKindOfClass:NSDictionary.class]) [queue addObject:child];
@@ -7672,7 +7682,9 @@ static NSDictionary *settings_daemons_running(void)
     int cap = 4096;
     procmgr_entry_t *buf = calloc((size_t)cap, sizeof(procmgr_entry_t));
     int n = buf ? procmgr_list(buf, cap) : -1;
-    if (n < 0) { free(buf); return nil; }
+    // Without the process list the job list still says which labels exist
+    // here: keep that ("missing"), and mark every row's run state unknown.
+    BOOL pidsUnknown = n < 0;
     NSMutableDictionary<NSString *, NSNumber *> *pids = [NSMutableDictionary dictionary];
     for (int i = 0; i < n; i++) {
         buf[i].name[sizeof(buf[i].name) - 1] = 0;
@@ -7695,6 +7707,7 @@ static NSDictionary *settings_daemons_running(void)
             NSNumber *pid = pids[key];
             NSMutableDictionary *info = [NSMutableDictionary dictionaryWithObject:exe forKey:@"name"];
             if (pid != nil) info[@"pid"] = pid;
+            if (pidsUnknown) info[@"unknown"] = @YES;
             if ([exeUse countForObject:exe] > 1) info[@"shared"] = @([exeUse countForObject:exe]);
             // With the job cache read, a label it doesn't list isn't a job
             // on this iOS version.
@@ -7907,7 +7920,18 @@ NSSet<NSString *> *settings_active_process_names(void)
     for (int i = 0; i < n; i++) {
         buf[i].name[sizeof(buf[i].name) - 1] = 0;
         NSString *name = [NSString stringWithUTF8String:buf[i].name];
-        if (name.length == 0) { free(buf); return nil; } // undecodable/truncated UTF-8: fail closed
+        // The kernel cuts p_name at a byte, which can split the last UTF-8
+        // character of a long non-ASCII name: drop that partial character
+        // (at most 3 bytes) instead of failing the whole list.
+        for (size_t cut = 1; !name && cut <= 3; cut++) {
+            size_t len = strlen(buf[i].name);
+            if (len <= cut) break;
+            char trimmed[sizeof(buf[i].name)];
+            memcpy(trimmed, buf[i].name, len - cut);
+            trimmed[len - cut] = 0;
+            name = [NSString stringWithUTF8String:trimmed];
+        }
+        if (name.length == 0) { free(buf); return nil; } // still undecodable: fail closed
         int suspendCount = procmgr_suspend_count_for_entry(buf[i].kproc, buf[i].pid);
         // 0 means running; >0 is prewarmed/background-suspended and safe to
         // clean; -1 means we could not prove it is suspended, so protect it.
@@ -11600,6 +11624,9 @@ static NSString *pm_chip_name(NSString *machine) {
             self.silentRestoring = NO;
             self.exploitNeeded = YES;
             [self.tableView reloadData];
+            // Elsewhere the automatic run above already failed: offering it
+            // again would just start a second full run. The hint stays.
+            if (!settings_device_is_a18_above()) return;
             __weak typeof(self) weakSelf = self;
             settings_tool_needs_exploit(self, self.tableView, @"The Process Viewer", ^{
                 weakSelf.exploitNeeded = NO;
@@ -18272,8 +18299,12 @@ void cyanide_present_contact(UIViewController *host)
 - (void)runLocationServicesToggle
 {
     if (!settings_device_supported()) return;
-    [self presentActivityLog];
-    [self runLocationServicesToggleAllowingFullExploit:NO];
+    // Start once the log is up: a fast "no kernel access" result must find a
+    // settled presenter for the Run Exploit prompt, not one still animating in.
+    __weak typeof(self) weakSelf = self;
+    [self presentActivityLogWithCompletion:^{
+        [weakSelf runLocationServicesToggleAllowingFullExploit:NO];
+    }];
 }
 
 - (void)runLocationServicesToggleAllowingFullExploit:(BOOL)allowFullExploit
@@ -18288,7 +18319,18 @@ void cyanide_present_contact(UIViewController *host)
         // A18/M4 only (elsewhere the exploit already ran by itself): run it
         // on request with its log, then toggle again.
         settings_run_exploit_with_log(me, ^(BOOL ready) {
-            if (ready) [weakSelf runLocationServicesToggleAllowingFullExploit:NO];
+            typeof(self) owner = weakSelf;
+            if (!ready || !owner) return;
+            // The first attempt already marked its activity log Failed and a
+            // finished log ignores later results: show the retry in a new one.
+            // YES: this retry is final, it never asks again.
+            void (^retry)(void) = ^{
+                [weakSelf presentActivityLogWithCompletion:^{
+                    [weakSelf runLocationServicesToggleAllowingFullExploit:YES];
+                }];
+            };
+            if (owner.presentedViewController) [owner dismissViewControllerAnimated:YES completion:retry];
+            else retry();
         });
     });
 }

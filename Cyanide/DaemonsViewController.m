@@ -300,6 +300,7 @@ static void daemons_invalidate_snapshot(NSDictionary * __strong *disabled,
     if (daemon_catalog_is_legacy_label(label))
         return [name stringByAppendingString:@" · legacy disabled entry; job presence not checked"];
     if ([info[@"missing"] boolValue]) return [name stringByAppendingString:@" · not a job on this iOS version"];
+    if ([info[@"unknown"] boolValue]) return [name stringByAppendingString:@" · status unknown"];
     NSNumber *pid = info[@"pid"];
     NSNumber *shared = info[@"shared"];
     BOOL off = [self isLabelDisabled:label];
@@ -375,6 +376,9 @@ static void daemons_invalidate_snapshot(NSDictionary * __strong *disabled,
     if (self.busy || !self.snapshotValid || !self.disabled) { [self refreshUI]; return; }
     for (NSString *label in labels) {
         if (disable && [self isLabelMissing:label] && ![self isLabelDisabled:label]) continue;   // nothing to disable
+        // Legacy labels are enable-only; one staged disable would make the
+        // whole Save fail (launchd_disabled_apply refuses the batch).
+        if (!daemon_catalog_change_is_allowed(label, disable)) continue;
         if (disable == [self isLabelDisabled:label]) [self.staged removeObjectForKey:label];
         else self.staged[label] = @(disable);
     }
@@ -442,14 +446,24 @@ static void daemons_invalidate_snapshot(NSDictionary * __strong *disabled,
     });
 }
 
-// A failure that only a full exploit run can fix shows a banner that runs it
-// (with the log) when tapped -- never started or offered by itself, since it
-// can reboot A18/M4 devices. Then `retry` runs again. Anything else is shown.
+// A failure that only a full exploit run can fix gets the shared Run Exploit
+// popup (once per screen); `retry` runs after a successful run. Anything else
+// is shown in an alert.
 - (void)handleFailure:(NSString *)message retry:(void (^)(void))retry from:(UIViewController *)presenter
 {
     if ([message isEqualToString:kSettingsFullExploitRequiredMessage]) {
         if (!self.disabled) self.status = kSettingsNoKernelAccessHint;
         [self refreshUI];
+        // Already asked on this screen (e.g. a Save after kernel access was
+        // lost): say why nothing happened instead of failing silently.
+        if (settings_tool_exploit_was_offered(self)) {
+            if (!presenter.view.window || presenter.presentedViewController) return;
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Daemons"
+                message:kSettingsNoKernelAccessHint preferredStyle:UIAlertControllerStyleAlert];
+            [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            [presenter presentViewController:ac animated:YES completion:nil];
+            return;
+        }
         settings_tool_needs_exploit(self, self.tableView, @"Daemons", retry);
         return;
     }
@@ -612,7 +626,7 @@ static void daemons_invalidate_snapshot(NSDictionary * __strong *disabled,
         for (NSString *label in g.labels) allMissing &= [self isLabelMissing:label];
         if (allMissing)
             [facts addObject:@"not a job on this iOS version"];
-        else if (self.running)
+        else if (self.running && ![self.running[g.labels.firstObject][@"unknown"] boolValue])
             [facts addObject:running ? [NSString stringWithFormat:@"%lu running", (unsigned long)running] : @"not running"];
     }
     if (anyWarning) [facts addObject:@"still running although disabled"];

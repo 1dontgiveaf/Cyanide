@@ -209,7 +209,9 @@ static BOOL cleaner_process_is_active(NSString *executable, NSSet<NSString *> *a
     for (NSString *name in activeNames) {
         // p_name truncates bytes, not NSString characters. A short unrelated
         // process (Foo) must not cause FooBar to be falsely marked active.
-        if ([name lengthOfBytesUsingEncoding:NSUTF8StringEncoding] == 31 &&
+        // 28-31 bytes: a cut through a multi-byte character loses up to 3.
+        NSUInteger bytes = [name lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+        if (bytes >= 28 && bytes <= 31 &&
             [executable lengthOfBytesUsingEncoding:NSUTF8StringEncoding] > 31 &&
             [executable hasPrefix:name]) return YES;
     }
@@ -244,7 +246,10 @@ static CYCleanerTraversal cleaner_traversal(double seconds, int *cancelled)
 static BOOL cleaner_traversal_should_stop(CYCleanerTraversal *walk, NSUInteger depth)
 {
     double now = cleaner_monotonic_seconds();
-    if (walk->stopped || depth > kCleanerMaxTraversalDepth || now < 0 ||
+    // Depth is not a reason to stop the whole walk: one over-deep folder
+    // would end the pass for every later app. Callers skip that subtree.
+    (void)depth;
+    if (walk->stopped || now < 0 ||
         now >= walk->deadline ||
         (walk->cancelled && __atomic_load_n(walk->cancelled, __ATOMIC_RELAXED))) {
         walk->stopped = YES;
@@ -287,6 +292,8 @@ static unsigned long long cleaner_scan_directory_fd(int fd, dev_t device,
             total += (unsigned long long)st.st_size;
             walk->files++;
         } else if (S_ISDIR(st.st_mode)) {
+            // Too deep: leave this subtree out (size incomplete), keep going.
+            if (depth + 1 > kCleanerMaxTraversalDepth) { *complete = NO; continue; }
             int child = openat(fd, entry->d_name,
                                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
             struct stat opened = {0};
@@ -364,6 +371,8 @@ static unsigned long long cleaner_remove_tree_at(int parentFD, const char *name,
                                                  NSUInteger *removed,
                                                  NSUInteger *failed)
 {
+    // Too deep: this subtree stays (counted as a failure); the rest goes on.
+    if (depth > kCleanerMaxTraversalDepth) { if (failed) (*failed)++; return 0; }
     if (!cleaner_visit_entry(walk, depth)) return 0;
     struct stat st = {0};
     if (fstatat(parentFD, name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
@@ -985,7 +994,9 @@ static BOOL cleaner_intro_accepted(void)
 
 - (BOOL)itemSelectable:(CYCleanerItem *)item
 {
-    if (self.loading || self.cleaning || item.totalBytes == 0) return NO;
+    if (self.loading || self.cleaning) return NO;
+    if (item.selected) return YES;   // a selection can always be undone
+    if (item.totalBytes == 0) return NO;
     if (item.isCrashLogs) return YES;
     return !item.active && self.processListAvailable;
 }
@@ -1205,7 +1216,12 @@ static BOOL cleaner_intro_accepted(void)
             setPhase(CYCleanerPhaseFinding, 0, uuids.count);
             for (NSString *uuid in uuids) {
                 if (__atomic_load_n(&scanCancelled, __ATOMIC_RELAXED)) { scanAborted = YES; break; }
-                FBAppContainer *c = fb_container_for_path([dataParent stringByAppendingPathComponent:uuid], NO);
+                NSString *containerPath = [dataParent stringByAppendingPathComponent:uuid];
+                FBAppContainer *c = fb_container_for_path(containerPath, NO);
+                // A container cached before its app was indexed (installed
+                // while Cyanide ran) has no executable yet: look it up fresh.
+                if (c.kind == FBContainerKindData && !c.executableName)
+                    c = fb_current_container_for_path(containerPath, NO);
                 if (c.kind == FBContainerKindData && c.executableName) [containers addObject:c];
                 looked++;
                 if (looked % 4 == 0 || looked == uuids.count) setPhase(CYCleanerPhaseFinding, looked, uuids.count);
@@ -1556,8 +1572,15 @@ static BOOL cleaner_intro_accepted(void)
 
                 if (processUnavailable || cleaner_traversal_should_stop(&traversal, 0)) {
                     // Retain the last known sizes rather than pretending an
-                    // interrupted/unreadable rescan proved the roots empty.
+                    // interrupted/unreadable rescan proved the roots empty --
+                    // minus what this pass verifiably removed, so "≥ size"
+                    // stays a true lower bound.
                     item.incomplete = YES;
+                    unsigned long long left = appFreed;
+                    unsigned long long fromCache = MIN(left, item.cacheBytes);
+                    item.cacheBytes -= fromCache;
+                    left -= fromCache;
+                    item.tempBytes -= MIN(left, item.tempBytes);
                 } else if (isLogs) {
                     unsigned long long remaining = 0;
                     BOOL complete = YES;
@@ -1643,6 +1666,9 @@ static BOOL cleaner_intro_accepted(void)
                 NSMutableArray<CYCleanerItem *> *published = [NSMutableArray array];
                 for (CYCleanerItem *oldItem in self.items) {
                     CYCleanerItem *item = results[oldItem.key] ?: oldItem;
+                    // Without the process list the apps can't be deselected
+                    // (Not Checked); a leftover selection would block Clean.
+                    if (processUnavailable) item.selected = NO;
                     if (item.totalBytes > 0 || item.incomplete) [published addObject:item];
                 }
                 // Replace the model and reload together. Offscreen folder-review
