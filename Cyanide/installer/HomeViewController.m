@@ -428,13 +428,16 @@ static const CGFloat kMargin = 20.0;
     [s addArrangedSubview:[self sectionHeader:@"Tools"]];
     // Only while there is no live or saved kernel access: then the tools can't
     // get it by themselves on A18/M4. Runs the exploit alone, with the log.
-    self.kernelAccessRow = [self bigActionButton:@"Kernel Access"
-                                             sub:@"Not ready. Tap to run the exploit (no tweaks applied)"
-                                            icon:@"lock.open.fill"
-                                           color:UIColor.systemPurpleColor
-                                             sel:@selector(runExploit)];
-    self.kernelAccessRow.hidden = settings_kernel_access_available();
-    [s addArrangedSubview:self.kernelAccessRow];
+    // A local strong reference: the property is weak, so assigning the new
+    // view to it directly released it before it was added (no row at all).
+    UIView *kernelRow = [self bigActionButton:@"Kernel Access"
+                                          sub:@"Not ready. Tap to run the exploit (no tweaks applied)"
+                                         icon:@"lock.open.fill"
+                                        color:UIColor.systemPurpleColor
+                                          sel:@selector(runExploit)];
+    kernelRow.hidden = settings_kernel_access_available();
+    [s addArrangedSubview:kernelRow];
+    self.kernelAccessRow = kernelRow;
     [s addArrangedSubview:[self bigActionButton:@"Process Viewer"
                                           sub:@"See and quit running processes"
                                          icon:@"list.bullet.rectangle.fill"
