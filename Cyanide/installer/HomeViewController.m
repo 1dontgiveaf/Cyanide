@@ -387,6 +387,7 @@ static const CGFloat kMargin = 20.0;
         ? [NSString stringWithFormat:@"What's New in %@", [version hasPrefix:@"v"] ? [version substringFromIndex:1] : version]
         : @"What's New"];
     [s addArrangedSubview:header];
+    [s setCustomSpacing:18.0 afterView:header];
 
     NSArray<NSString *> *icons = @[ @"sparkles", @"star.fill", @"wand.and.stars" ];
     NSArray<UIColor *> *colors = @[ UIColor.systemBlueColor, UIColor.systemOrangeColor, UIColor.systemPurpleColor ];
@@ -665,10 +666,21 @@ static const CGFloat kMargin = 20.0;
         [iv.centerYAnchor  constraintEqualToAnchor:dot.centerYAnchor],
         [lbl.leadingAnchor constraintEqualToAnchor:dot.trailingAnchor constant:12.0],
         [lbl.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
-        [lbl.centerYAnchor constraintEqualToAnchor:dot.centerYAnchor],
+        // Centered on the icon when it fits one line; a longer text grows
+        // downwards from the row's top instead of up into the row above.
+        [lbl.topAnchor constraintGreaterThanOrEqualToAnchor:row.topAnchor],
         [row.bottomAnchor  constraintGreaterThanOrEqualToAnchor:dot.bottomAnchor],
         [row.bottomAnchor  constraintGreaterThanOrEqualToAnchor:lbl.bottomAnchor],
     ]];
+    NSLayoutConstraint *center = [lbl.centerYAnchor constraintEqualToAnchor:dot.centerYAnchor];
+    center.priority = UILayoutPriorityDefaultHigh;   // yields to the top limit for long texts
+    center.active = YES;
+    // Hug the taller of icon and text, so the row is never taller than needed.
+    for (UIView *v in @[ dot, lbl ]) {
+        NSLayoutConstraint *hug = [row.bottomAnchor constraintEqualToAnchor:v.bottomAnchor];
+        hug.priority = UILayoutPriorityDefaultLow;
+        hug.active = YES;
+    }
     return row;
 }
 
