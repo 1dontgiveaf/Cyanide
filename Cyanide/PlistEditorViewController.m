@@ -422,6 +422,12 @@ static const NSUInteger kPLMaxDataEditBytes = 64 * 1024;
     if ([tbc isKindOfClass:MainTabBarController.class]) [(MainTabBarController *)tbc setPopupBarSuppressed:NO];
 }
 
+- (void)viewDidDisappear:(BOOL)animated
+{
+    [super viewDidDisappear:animated];
+    filebrowser_cancel_shares_for_presenter(self);
+}
+
 - (void)reloadRows
 {
     NSArray *rows;
@@ -526,8 +532,18 @@ static const NSUInteger kPLMaxDataEditBytes = 64 * 1024;
         share.primaryAction = [UIAction actionWithHandler:^(UIAction *a) {
             typeof(self) me = weakSelf;
             if (!me) return;
+            // Capture the exact bytes shown by this clean document before the
+            // copy leaves the main thread.  In particular, do not make the
+            // writable editor's share worker reopen doc.path: save writes the
+            // inode in place under an exclusive lock, while a pathname read
+            // without that lock could otherwise observe a torn version.
+            NSData *snapshot = [me.doc.original copy];
+            if (!snapshot) {
+                [me showMessage:@"The loaded plist has no shareable snapshot." title:@"Couldn't Share"];
+                return;
+            }
             weakShare.enabled = NO;
-            filebrowser_share_file(me, me.doc.path, NO, me.doc.readOnly ? me.doc.original : nil, weakShare, ^{
+            filebrowser_share_file(me, me.doc.path, NO, snapshot, weakShare, ^{
                 weakShare.enabled = YES;
             });
         }];
