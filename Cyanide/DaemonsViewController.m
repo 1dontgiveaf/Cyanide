@@ -62,6 +62,18 @@ static void daemons_note_change(NSArray<NSString *> *labels)
                                             forKey:kDaemonsChangedLabelsKey];
 }
 
+static void daemons_invalidate_snapshot(NSDictionary * __strong *disabled,
+                                         NSDictionary * __strong *running,
+                                         NSMutableDictionary *staged,
+                                         NSString * __strong *status,
+                                         NSString *message)
+{
+    *disabled = nil;
+    *running = nil;
+    [staged removeAllObjects];
+    *status = message.length ? message : @"The list of disabled daemons could not be read. Check the log.";
+}
+
 @class DaemonGroupViewController;
 
 @interface DaemonsViewController ()
@@ -72,6 +84,7 @@ static void daemons_note_change(NSArray<NSString *> *labels)
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *staged;
 @property (nonatomic, copy) NSString *status;          // shown while not loaded / on error
 @property (nonatomic, assign) BOOL busy;
+@property (nonatomic, assign) BOOL snapshotValid;
 - (void)setLabels:(NSArray<NSString *> *)labels disabled:(BOOL)disable from:(UIViewController *)presenter;
 - (BOOL)isLabelDisabled:(NSString *)label;
 - (BOOL)willBeDisabled:(NSString *)label;
@@ -141,7 +154,7 @@ static void daemons_note_change(NSArray<NSString *> *labels)
     cell.selectionStyle = UITableViewCellSelectionStyleNone;
     UISwitch *sw = [UISwitch new];
     sw.on = ![self.owner willBeDisabled:label];
-    sw.enabled = self.owner.disabled && !self.owner.busy &&
+    sw.enabled = self.owner.snapshotValid && self.owner.disabled && !self.owner.busy &&
                  !([self.owner isLabelMissing:label] && ![self.owner isLabelDisabled:label]);
     __weak typeof(self) weakSelf = self;
     [sw addAction:[UIAction actionWithHandler:^(UIAction *a) {
@@ -310,7 +323,7 @@ static void daemons_note_change(NSArray<NSString *> *labels)
 - (void)refreshUI
 {
     BOOL dirty = self.staged.count > 0;
-    self.navigationItem.rightBarButtonItem.enabled = self.disabled && !self.busy && dirty;
+    self.navigationItem.rightBarButtonItem.enabled = self.snapshotValid && !self.busy && dirty;
     // Unsaved changes: Discard replaces Back, so they aren't lost by accident.
     self.navigationItem.hidesBackButton = dirty;
     self.navigationItem.leftBarButtonItem = dirty
@@ -340,8 +353,16 @@ static void daemons_note_change(NSArray<NSString *> *labels)
             me.disabled = disabled;
             me.running = running;
             me.status = nil;
-        } else if (!me.disabled) {
-            me.status = message;
+            me.snapshotValid = YES;
+        } else {
+            NSDictionary *failedDisabled = me.disabled;
+            NSDictionary *failedRunning = me.running;
+            NSString *failureStatus = me.status;
+            daemons_invalidate_snapshot(&failedDisabled, &failedRunning, me.staged, &failureStatus, message);
+            me.disabled = failedDisabled;
+            me.running = failedRunning;
+            me.status = failureStatus;
+            me.snapshotValid = NO;
         }
         [me refreshUI];
         if (!disabled) [me handleFailure:message retry:^{ [weakSelf loadAllowingFullExploit:NO]; } from:me];
@@ -351,7 +372,7 @@ static void daemons_note_change(NSArray<NSString *> *labels)
 - (void)setLabels:(NSArray<NSString *> *)labels disabled:(BOOL)disable from:(UIViewController *)presenter
 {
     if (disable && !self.warningAccepted) { [self refreshUI]; [self showWarningIfNeeded]; return; }
-    if (self.busy || !self.disabled) { [self refreshUI]; return; }
+    if (self.busy || !self.snapshotValid || !self.disabled) { [self refreshUI]; return; }
     for (NSString *label in labels) {
         if (disable && [self isLabelMissing:label] && ![self isLabelDisabled:label]) continue;   // nothing to disable
         if (disable == [self isLabelDisabled:label]) [self.staged removeObjectForKey:label];
@@ -395,7 +416,7 @@ static void daemons_note_change(NSArray<NSString *> *labels)
 
 - (void)saveAllowingFullExploit:(BOOL)allowFullExploit
 {
-    if (self.busy || !self.disabled || !self.staged.count) { [self refreshUI]; return; }
+    if (self.busy || !self.snapshotValid || !self.disabled || !self.staged.count) { [self refreshUI]; return; }
     NSDictionary<NSString *, NSNumber *> *changes = [self.staged copy];
     self.busy = YES;
     [self refreshUI];
@@ -606,7 +627,7 @@ static void daemons_note_change(NSArray<NSString *> *labels)
     sw.on = off == 0;   // partly disabled shows as off
     BOOL anyUsable = NO;
     for (NSString *label in g.labels) anyUsable |= ![self isLabelMissing:label] || [self isLabelDisabled:label];
-    sw.enabled = self.disabled && !self.busy && anyUsable;
+    sw.enabled = self.snapshotValid && self.disabled && !self.busy && anyUsable;
     __weak typeof(self) weakSelf = self;
     NSArray *labels = g.labels;
     [sw addAction:[UIAction actionWithHandler:^(UIAction *a) {
