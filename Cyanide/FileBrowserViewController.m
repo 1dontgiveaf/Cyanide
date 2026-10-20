@@ -1615,7 +1615,8 @@ static void fb_share_complete(FBShareOperation *op, NSString *failure)
     UIPopoverPresentationController *pop = avc.popoverPresentationController;
     id source = op.source;
     if ([source isKindOfClass:UIBarButtonItem.class]) pop.barButtonItem = source;
-    else if ([source isKindOfClass:UIView.class]) {
+    else if ([source isKindOfClass:UIView.class] && ((UIView *)source).window == presenter.view.window &&
+             ((UIView *)source).superview != nil) {
         pop.sourceView = source;
         pop.sourceRect = [(UIView *)source bounds];
     } else {
