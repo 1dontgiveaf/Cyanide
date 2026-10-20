@@ -568,7 +568,11 @@ static void daemons_note_change(NSArray<NSString *> *labels)
     NSMutableArray *facts = [NSMutableArray array];
     if (off > 0 && off < g.labels.count)
         [facts addObject:[NSString stringWithFormat:@"%lu of %lu disabled", (unsigned long)off, (unsigned long)g.labels.count]];
-    if (self.running)
+    BOOL allMissing = self.running != nil;
+    for (NSString *label in g.labels) allMissing &= [self isLabelMissing:label];
+    if (allMissing)
+        [facts addObject:@"not a job on this iOS version"];
+    else if (self.running)
         [facts addObject:running ? [NSString stringWithFormat:@"%lu running", (unsigned long)running] : @"not running"];
     if (anyWarning) [facts addObject:@"still running although disabled"];
     if (unsaved) [facts insertObject:@"unsaved" atIndex:0];
