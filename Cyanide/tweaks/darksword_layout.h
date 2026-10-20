@@ -35,6 +35,10 @@ typedef void (^DSLayoutProgressHandler)(int pagesDone, int pagesTotal,
                                         int iconsDone, int iconsTotal);
 void darksword_layout_set_progress_handler(DSLayoutProgressHandler handler);
 
+// Reads the device type and screen scale for icon sizing. Call once on the
+// main thread at launch; the icon resize itself runs off-main.
+void darksword_layout_prepare_device_info(void);
+
 // Convenience: applies all four if their values are meaningful. scale<=0
 // means "leave alone".
 bool darksword_layout_apply_in_session(double extraLeft,

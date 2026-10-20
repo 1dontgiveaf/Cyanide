@@ -230,14 +230,28 @@ static void rc_info_to_defaults(NSString *key, const RC_SBIconImageInfo *i)
 
 // The native geometry expected for this device class. Only used to recognize
 // a pre-1.10 applied value and as the last-resort fallback; a readable config
-// is still preferred.
+// is still preferred. Read once on the main thread at launch
+// (darksword_layout_prepare_device_info): the icon resize runs on a
+// background thread, where UIKit must not be called. Device type and screen
+// scale don't change while the app runs.
+static RC_SBIconImageInfo g_rc_expected_native;
+
+void darksword_layout_prepare_device_info(void)
+{
+    if (!NSThread.isMainThread) return;
+    if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad)
+        g_rc_expected_native = (RC_SBIconImageInfo){ 76.0, 76.0, 2.0, 17.1 };
+    else if (UIScreen.mainScreen.scale >= 2.5)
+        g_rc_expected_native = (RC_SBIconImageInfo){ 64.0, 64.0, 3.0, 14.4 };
+    else
+        g_rc_expected_native = (RC_SBIconImageInfo){ 60.0, 60.0, 2.0, 13.5 };
+}
+
 static RC_SBIconImageInfo rc_expected_native_icon_info(void)
 {
-    if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad)
-        return (RC_SBIconImageInfo){ 76.0, 76.0, 2.0, 17.1 };
-    if (UIScreen.mainScreen.scale >= 2.5)
-        return (RC_SBIconImageInfo){ 64.0, 64.0, 3.0, 14.4 };
-    return (RC_SBIconImageInfo){ 60.0, 60.0, 2.0, 13.5 };
+    // Not prepared (shouldn't happen): the old fixed base, never UIKit off-main.
+    if (g_rc_expected_native.width <= 0) return (RC_SBIconImageInfo){ 60.0, 60.0, 2.0, 13.5 };
+    return g_rc_expected_native;
 }
 
 // The scaled icon info for `cfg` (where = "Home" or "Dock").

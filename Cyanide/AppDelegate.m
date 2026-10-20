@@ -10,6 +10,7 @@
 #import "SettingsViewController.h"
 #import "TaskRop/Exception.h"   // round 21: excport lifecycle gate
 #import "DSKeepAlive.h"
+#import "tweaks/darksword_layout.h"
 #import "LogTextView.h"
 #import <signal.h>
 #import <sys/stat.h>
@@ -64,6 +65,7 @@ static dispatch_source_t g_sigterm_source;
     cyanide_launch_trace("didFinishLaunching: entry");
     [self logBootIdentity];
     settings_register_defaults();
+    darksword_layout_prepare_device_info();   // UIKit, so here on main
     log_set_verbose(YES);
     ds_keepalive_apply_enabled([[NSUserDefaults standardUserDefaults] boolForKey:kSettingsKeepAlive]);
     [self installTerminationHandlers];
