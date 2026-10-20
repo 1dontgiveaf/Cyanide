@@ -146,24 +146,56 @@ int procmgr_comm_for_pid(int pid, char *buf, size_t len) {
     return procmgr_identity_for_pid(pid, buf, len, NULL);
 }
 
+static pthread_mutex_t g_pm_identity_lookup_lock = PTHREAD_MUTEX_INITIALIZER;
+
 int procmgr_identity_for_pid(int pid, char *buf, size_t len, uint64_t *kprocOut) {
     if (kprocOut) *kprocOut = 0;
     if (!buf || len == 0) return -1;
     buf[0] = '\0';
     if (pid <= 0) return -1;
-    if (!kexploit_krw_session_active()) return -1;
-    krw_set_nonfatal(true);
-    uint64_t proc = proc_find(pid);
-    if (kprocOut && procmgr_is_kern_ptr(proc)) *kprocOut = proc;
-    if (procmgr_is_kern_ptr(proc)) {
-        char *nm = proc_get_p_name(proc);   // static buffer — copy out now
-        if (nm) {
+
+    // Identity is used immediately before destructive signalling. Resolve it
+    // through the complete mapped-gated list rather than a raw allproc lookup,
+    // whose two directional walks dereference every candidate without a
+    // kernel_map gate. Serialize callers so a lookup/revalidation pair cannot
+    // interleave with another identity operation's KRW error accounting.
+    pthread_mutex_lock(&g_pm_identity_lookup_lock);
+    const int cap = 8192;
+    procmgr_entry_t *entries = calloc((size_t)cap, sizeof(*entries));
+    if (!entries) {
+        pthread_mutex_unlock(&g_pm_identity_lookup_lock);
+        return -1;
+    }
+    int n = procmgr_list(entries, cap);
+    int result = -1;
+    if (n >= 0 && ksafe_available()) {
+        krw_set_nonfatal(true);
+        for (int i = 0; i < n; i++) {
+            if (entries[i].pid != pid) continue;
+            uint64_t proc = entries[i].kproc;
+            uint32_t procSpan = off_proc_p_name + 32 > off_proc_p_pid + 4
+                ? off_proc_p_name + 32 : off_proc_p_pid + 4;
+            if (!procmgr_is_kern_ptr(proc) ||
+                !kaddr_is_mapped(proc, procSpan)) break;
+            uint64_t errorsBefore = krw_op_error_count();
+            int currentPid = (int)kread32(proc + off_proc_p_pid);
+            char *nm = proc_get_p_name(proc);   // thread-local; copy out now
+            if (krw_op_error_count() != errorsBefore || currentPid != pid ||
+                !nm || !nm[0] || strncmp(nm, entries[i].name,
+                                          sizeof(entries[i].name) - 1) != 0) {
+                break;
+            }
+            if (kprocOut) *kprocOut = proc;
             strncpy(buf, nm, len - 1);
             buf[len - 1] = '\0';
+            result = buf[0] ? 0 : -1;
+            break;
         }
+        krw_set_nonfatal(false);
     }
-    krw_set_nonfatal(false);
-    return buf[0] ? 0 : -1;
+    free(entries);
+    pthread_mutex_unlock(&g_pm_identity_lookup_lock);
+    return result;
 }
 
 // Returns the proc's p_stat (PM_SRUN, PM_SSTOP, PM_SZOMB, ...) via libproc,
@@ -2795,10 +2827,10 @@ int procmgr_kill(int pid, const char *expectedComm, uint64_t expectedKproc) {
     // struct proc address is a generation token; Darwin has no atomic
     // pid+generation signal primitive here, so a check-to-signal TOCTOU remains
     // possible and is deliberately documented rather than overstated away.
-    // (No ksafe requirement: the identity lookup below is the same proc_find
-    // walk the other kill paths use without it, and refusing here returned
-    // -1 -- not -6 -- so Force Quit skipped its launchd fallback and did
-    // nothing at all whenever ksafe was unavailable.)
+    // The identity lookup now requires the mapped-address snapshot and fails
+    // closed when ksafe is unavailable. This narrows unsafe reads without
+    // claiming atomic PID lifetime: Darwin still has no pid+generation signal
+    // primitive, so the check-to-signal TOCTOU remains documented above.
     if (!expectedComm || !expectedComm[0] || !expectedKproc) {
         printf("[PROCMGR] kill: REFUSING pid %d — row identity unavailable\n", pid);
         return -1;

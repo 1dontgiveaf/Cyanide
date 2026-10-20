@@ -30,6 +30,7 @@ def function_body(source: str, signature: str) -> str:
 
 
 compat = function_body(PROCESS, "int procmgr_suspend_count(int pid)")
+identity = function_body(PROCESS, "int procmgr_identity_for_pid(int pid, char *buf, size_t len, uint64_t *kprocOut)")
 entry = function_body(PROCESS, "int procmgr_suspend_count_for_entry_locked(uint64_t proc, int pid)")
 strict = function_body(PROCESS, "static bool pm_task_matches_proc_strict(uint64_t task, uint64_t proc)")
 row = function_body(PROCESS, "bool procmgr_row_info_locked(uint64_t kproc, int pid, procmgr_row_info_t *out)")
@@ -40,6 +41,19 @@ assert "proc_find(" not in compat
 assert "procmgr_list(entries, cap)" in compat
 assert "if (n >= 0)" in compat
 assert "return -1;" in compat
+
+for needle in (
+    "pthread_mutex_lock(&g_pm_identity_lookup_lock);",
+    "procmgr_list(entries, cap)",
+    "if (n >= 0 && ksafe_available())",
+    "kaddr_is_mapped(proc, procSpan)",
+    "uint64_t errorsBefore = krw_op_error_count();",
+    "currentPid != pid",
+    "strncmp(nm, entries[i].name",
+    "pthread_mutex_unlock(&g_pm_identity_lookup_lock);",
+):
+    assert needle in identity, needle
+assert "proc_find(" not in identity
 
 for needle in (
     "if (!ksafe_available()) return false;",
