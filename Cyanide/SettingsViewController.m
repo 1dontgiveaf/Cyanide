@@ -14799,7 +14799,7 @@ UIViewController *settings_make_daemons_viewer(void)
         // drains) — no longer WIP.
         @{ @"title": @"Process Viewer",    @"icon": @"list.bullet.rectangle.fill", @"color": [UIColor systemGrayColor], @"section": @(-1), @"custom": @"procmgr" },
         @{ @"title": @"File Browser",      @"icon": @"folder.fill", @"color": [UIColor systemBlueColor], @"section": @(-1), @"custom": @"filebrowser" },
-        @{ @"title": @"Daemons",           @"icon": @"gearshape.2.fill", @"color": [UIColor systemTealColor], @"section": @(-1), @"custom": @"daemons" },
+        @{ @"title": @"Daemon Manager",    @"icon": @"gearshape.2.fill", @"color": [UIColor systemTealColor], @"section": @(-1), @"custom": @"daemons" },
         @{ @"title": @"System Info",       @"icon": @"info.circle.fill", @"color": [UIColor systemGreenColor], @"section": @(-1), @"custom": @"sysinfo" },
         @{ @"title": @"Cache Cleaner",     @"icon": @"trash.fill", @"color": [UIColor systemCyanColor], @"section": @(-1), @"custom": @"cleaner" },
     ];

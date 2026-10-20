@@ -449,7 +449,7 @@ static const CGFloat kMargin = 20.0;
                                          icon:@"folder.fill"
                                         color:UIColor.systemBlueColor
                                           sel:@selector(openFileBrowser)]];
-    [s addArrangedSubview:[self bigActionButton:@"Daemons"
+    [s addArrangedSubview:[self bigActionButton:@"Daemon Manager"
                                           sub:@"Turn system services off and on"
                                          icon:@"gearshape.2.fill"
                                         color:UIColor.systemTealColor
@@ -810,7 +810,7 @@ static const CGFloat kMargin = 20.0;
         [me updateKernelAccessRow];
         if (!ready || !me || me.presentedViewController) return;
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Kernel Access Ready"
-            message:@"Process Viewer, File Browser, Daemons, Cache Cleaner and System Info can use it now."
+            message:@"Process Viewer, File Browser, Daemon Manager, Cache Cleaner and System Info can use it now."
             preferredStyle:UIAlertControllerStyleAlert];
         [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
         [me presentViewController:ac animated:YES completion:nil];

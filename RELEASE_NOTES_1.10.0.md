@@ -4,7 +4,7 @@
 
 # Cyanide 1.10.0
 
-A Cache Cleaner, a Run Exploit button and one consistent way for the tools to get kernel access, file sharing from the File Browser, accurate icon resizing, and a cleaned-up Daemons list.
+A Cache Cleaner, a Run Exploit button and one consistent way for the tools to get kernel access, file sharing from the File Browser, accurate icon resizing, and a cleaned-up Daemon Manager.
 
 ## New
 
@@ -21,9 +21,9 @@ A Cache Cleaner, a Run Exploit button and one consistent way for the tools to ge
 
 ## Improvements
 
-- **Kernel access for the tools.** Process Viewer, File Browser, Daemons, Cache Cleaner, System Info and the Location Services toggle (also from Control Center and links) reuse live or saved kernel access. When there is none, they run the exploit by themselves, except on A18 / M4, where a run can reboot the device: there they ask whether to run it (or use **Run Exploit** on Home), and the run happens with the log on screen instead of hidden in the background.
+- **Kernel access for the tools.** Process Viewer, File Browser, Daemon Manager, Cache Cleaner, System Info and the Location Services toggle (also from Control Center and links) reuse live or saved kernel access. When there is none, they run the exploit by themselves, except on A18 / M4, where a run can reboot the device: there they ask whether to run it (or use **Run Exploit** on Home), and the run happens with the log on screen instead of hidden in the background.
 - **Cache Cleaner safety.** Cleaning never follows links out of an app's folders, scans are bounded and stop if Cyanide goes to the background, and the result reports the space actually freed. An app that changes during a clean is skipped instead of stopping the whole pass, and the progress bar moves as each app finishes.
-- **Daemons list.** Groups and daemons that don't exist on your iOS version are hidden instead of shown greyed out as "not running". AirPrint and Bluetooth Wake were removed: neither is a system daemon on iOS 17 or 18. A daemon you disabled with an older version can still be switched back on.
+- **Daemon Manager** (formerly Daemons). Groups and daemons that don't exist on your iOS version are hidden instead of shown greyed out as "not running". AirPrint and Bluetooth Wake were removed: neither is a system daemon on iOS 17 or 18. A daemon you disabled with an older version can still be switched back on.
 - **Home Layout Extras.** Uneven left/right Home Screen padding is kept when icons are resized, the Dock keeps scaling evenly, and turning Layout Extras off restores the normal layout while remembering your slider values.
 - **What's New on Home** opens Settings → What's New when tapped.
 - **Respring screen.** While SpringBoard restarts, Cyanide shows its logo and "Preparing respring…" instead of a second spinner next to the one from iOS.

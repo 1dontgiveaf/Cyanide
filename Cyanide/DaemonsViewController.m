@@ -132,7 +132,7 @@ static void daemons_invalidate_snapshot(NSDictionary * __strong *disabled,
     if (self.group.caution) s = [s stringByAppendingFormat:@"\n\n⚠️ %@", self.group.caution];
     return [s stringByAppendingString:@"\n\nSwitched on means the daemon may run. Changes are written when you tap Save and take effect after a restart. "
                                       @"Most daemons only run while something needs them, so “not running” doesn't mean disabled. "
-                                      @"Pull down on the Daemons list to refresh."];
+                                      @"Pull down on the list to refresh."];
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
@@ -180,7 +180,7 @@ static void daemons_invalidate_snapshot(NSDictionary * __strong *disabled,
 - (void)viewDidLoad
 {
     [super viewDidLoad];
-    self.title = @"Daemons";
+    self.title = @"Daemon Manager";
     self.navigationItem.largeTitleDisplayMode = UINavigationItemLargeTitleDisplayModeAlways;
     self.staged = [NSMutableDictionary dictionary];
     self.navigationItem.rightBarButtonItem =
@@ -458,17 +458,17 @@ static void daemons_invalidate_snapshot(NSDictionary * __strong *disabled,
         // lost): say why nothing happened instead of failing silently.
         if (settings_tool_exploit_was_offered(self)) {
             if (!presenter.view.window || presenter.presentedViewController) return;
-            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Daemons"
+            UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Daemon Manager"
                 message:kSettingsNoKernelAccessHint preferredStyle:UIAlertControllerStyleAlert];
             [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
             [presenter presentViewController:ac animated:YES completion:nil];
             return;
         }
-        settings_tool_needs_exploit(self, self.tableView, @"Daemons", retry);
+        settings_tool_needs_exploit(self, self.tableView, @"Daemon Manager", retry);
         return;
     }
     if (!presenter.view.window || presenter.presentedViewController) return;
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Daemons" message:message ?: @"Something went wrong."
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Daemon Manager" message:message ?: @"Something went wrong."
                                                          preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
     [presenter presentViewController:ac animated:YES completion:nil];
