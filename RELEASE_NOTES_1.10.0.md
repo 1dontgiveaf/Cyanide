@@ -13,6 +13,7 @@ A Cache Cleaner, accurate icon resizing, a cleaner respring screen, plus steadie
   - Apps in use are skipped and re-checked right before each one is cleaned; built-in apps are not selected by default.
   - A summary shows what's reclaimable and how much is selected; apps can be sorted by size or name and filtered by name.
   - Long-press an app to open its caches in the File Browser, or use **Review Folders** to see the exact paths before cleaning.
+  - **Crash Logs** is a separate, opt-in row. It removes only the contents of the CrashReporter folders, never app data. The same folder review and confirmation apply.
   - The first time you open it, Cyanide explains what cleaning can cause before anything can be removed.
   - While it loads, it shows what it's doing (getting access, finding apps, checking running apps, scanning).
 

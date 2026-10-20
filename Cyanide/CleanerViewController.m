@@ -56,12 +56,34 @@ static BOOL cleaner_is_disposable_root(NSString *path)
             [parts[2] isEqualToString:@"Caches"]);
 }
 
+// Crash reports are the only non-app roots Cleaner may touch. Keep this list
+// exact: no broad Library/Logs walk and no caller-supplied path.
+static NSArray<NSString *> *cleaner_crash_log_roots(void)
+{
+    return @[
+        @"/private/var/mobile/Library/Logs/CrashReporter",
+        @"/private/var/logs/CrashReporter",
+        @"/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.osanalytics/Library/Logs/CrashReporter",
+    ];
+}
+
+static BOOL cleaner_is_crash_log_root(NSString *path)
+{
+    NSString *canonical = fb_canonical_path(path);
+    for (NSString *root in cleaner_crash_log_roots())
+        if ([canonical isEqualToString:root]) return YES;
+    return NO;
+}
+
 // O_NOFOLLOW on a pathname open protects only its final component. Anchor at
 // / and open EVERY component relative to the descriptor already validated.
 // Scan and delete both consume this descriptor; neither reopens the pathname.
 static int cleaner_open_root(NSString *path)
 {
-    if (!cleaner_is_disposable_root(path)) { errno = EINVAL; return -1; }
+    if (!cleaner_is_disposable_root(path) && !cleaner_is_crash_log_root(path)) {
+        errno = EINVAL;
+        return -1;
+    }
     int fd = open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) return -1;
     NSArray<NSString *> *parts = fb_canonical_path(path).pathComponents;
@@ -215,13 +237,6 @@ static unsigned long long cleaner_tree_bytes_cancellable(NSString *root,
     return total;
 }
 
-static unsigned long long cleaner_tree_bytes(NSString *root,
-                                             NSUInteger *fileCount,
-                                             BOOL *complete)
-{
-    return cleaner_tree_bytes_cancellable(root, fileCount, complete, NULL);
-}
-
 // Removal is always relative to an open, no-follow descriptor. Mounts and
 // swapped directory identities are rejected. Successfully removed child bytes
 // remain reportable even if an enclosing directory is left behind.
@@ -318,12 +333,28 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
 @property (nonatomic) BOOL systemApp;
 @property (nonatomic) BOOL selected;
 @property (nonatomic) BOOL incomplete;
+// Non-nil only for the synthetic Crash Logs row. The roots are already
+// validated by cleaner_is_crash_log_root() before deletion.
+@property (nonatomic, copy) NSArray<NSString *> *logRoots;
+@property (nonatomic, copy) NSDictionary<NSString *, NSNumber *> *logRootBytes;
+@property (nonatomic) NSUInteger fileCount;
 @end
 
 @implementation CYCleanerItem
 - (unsigned long long)totalBytes
 {
     return self.cacheBytes + self.tempBytes;
+}
+
+- (BOOL)isCrashLogs
+{
+    return self.logRoots != nil;
+}
+
+- (NSString *)key
+{
+    if (self.logRoots) return @"__cyanide_crash_logs__";
+    return self.container.path ?: self.name ?: @"";
 }
 
 - (id)copyWithZone:(NSZone *)zone
@@ -338,6 +369,9 @@ static unsigned long long cleaner_clear_directory(NSString *dir,
     copy.systemApp = self.systemApp;
     copy.selected = self.selected;
     copy.incomplete = self.incomplete;
+    copy.logRoots = self.logRoots;
+    copy.logRootBytes = self.logRootBytes;
+    copy.fileCount = self.fileCount;
     return copy;
 }
 @end
@@ -472,6 +506,7 @@ typedef NS_ENUM(NSInteger, CYCleanerSection) {
     CYCleanerSectionSummary,
     CYCleanerSectionApps,
     CYCleanerSectionSystem,
+    CYCleanerSectionLogs,
     CYCleanerSectionSkipped,
     CYCleanerSectionCount,
 };
@@ -484,11 +519,12 @@ typedef NS_ENUM(NSInteger, CYCleanerPhase) {
     CYCleanerPhaseFinding,     // reading every app container's metadata and icon
     CYCleanerPhaseProcesses,   // reading the running-process list
     CYCleanerPhaseScanning,    // measuring each app's caches
+    CYCleanerPhaseLogs,        // measuring CrashReporter folders
 };
 static NSString * const kCleanerSortKey = @"CleanerSort";
 // The explanation version the user acknowledged; bump to show it again.
 static NSString * const kCleanerIntroAcceptedKey = @"CleanerIntroAcceptedVersion";
-static const NSInteger kCleanerIntroVersion = 2;
+static const NSInteger kCleanerIntroVersion = 3;
 
 static BOOL cleaner_intro_accepted(void)
 {
@@ -497,6 +533,7 @@ static BOOL cleaner_intro_accepted(void)
 
 @interface CleanerViewController () <UISearchResultsUpdating>
 @property (nonatomic, copy) NSArray<CYCleanerItem *> *items;
+@property (nonatomic, strong) CYCleanerItem *crashLogs;
 @property (nonatomic) BOOL processListAvailable;
 @property (nonatomic) BOOL accessReady;
 @property (nonatomic) BOOL loading;
@@ -528,6 +565,7 @@ static BOOL cleaner_intro_accepted(void)
 // queue — so the arrays are rebuilt lazily and invalidated at those points.
 @property (nonatomic, copy) NSArray<CYCleanerItem *> *cachedApps;
 @property (nonatomic, copy) NSArray<CYCleanerItem *> *cachedSystem;
+@property (nonatomic, copy) NSArray<CYCleanerItem *> *cachedLogs;
 @property (nonatomic, copy) NSArray<CYCleanerItem *> *cachedSkipped;
 @property (nonatomic) BOOL sectionCacheValid;
 // Round 53: toolbar width follows the actual view, not a frozen
@@ -606,7 +644,7 @@ static BOOL cleaner_intro_accepted(void)
     if (cleaner_intro_accepted() || self.presentedViewController) return;
     UIAlertController *ac = [UIAlertController
         alertControllerWithTitle:@"Before You Clean"
-                         message:@"Cleaner removes the contents of each app's Library/Caches and tmp folders. "
+                         message:@"Cleaner removes the contents of each app's Library/Caches and tmp folders, plus optional CrashReporter logs. "
                                  @"Documents, settings, logins and other app data are not touched. Active apps are checked again before each folder. "
                                  @"Detection is best-effort; close apps before cleaning.\n\n"
                                  @"What can happen:\n"
@@ -721,12 +759,21 @@ static BOOL cleaner_intro_accepted(void)
     self.sectionCacheValid = NO;
 }
 
+- (void)setCrashLogs:(CYCleanerItem *)crashLogs
+{
+    _crashLogs = crashLogs;
+    self.sectionCacheValid = NO;
+}
+
 - (NSArray<CYCleanerItem *> *)itemsInSection:(NSInteger)section
 {
     if (!self.sectionCacheValid) {
         NSMutableArray<CYCleanerItem *> *apps = [NSMutableArray array];
         NSMutableArray<CYCleanerItem *> *system = [NSMutableArray array];
+        NSMutableArray<CYCleanerItem *> *logs = [NSMutableArray array];
         NSMutableArray<CYCleanerItem *> *skipped = [NSMutableArray array];
+        if (self.crashLogs && [self matchesFilter:self.crashLogs])
+            [logs addObject:self.crashLogs];
         for (CYCleanerItem *item in self.items) {
             if (![self matchesFilter:item]) continue;
             if (item.active || !self.processListAvailable) [skipped addObject:item];
@@ -744,11 +791,13 @@ static BOOL cleaner_intro_accepted(void)
         [skipped sortUsingComparator:cmp];
         self.cachedApps = apps;
         self.cachedSystem = system;
+        self.cachedLogs = logs;
         self.cachedSkipped = skipped;
         self.sectionCacheValid = YES;
     }
     switch (section) {
         case CYCleanerSectionSkipped: return self.cachedSkipped;
+        case CYCleanerSectionLogs:    return self.cachedLogs;
         case CYCleanerSectionSystem:  return self.cachedSystem;
         case CYCleanerSectionApps:    return self.cachedApps;
         default:                      return @[];
@@ -757,13 +806,16 @@ static BOOL cleaner_intro_accepted(void)
 
 - (BOOL)itemSelectable:(CYCleanerItem *)item
 {
-    return !item.active && item.totalBytes > 0 && self.processListAvailable && !self.loading && !self.cleaning;
+    if (self.loading || self.cleaning || item.totalBytes == 0) return NO;
+    if (item.isCrashLogs) return YES;
+    return !item.active && self.processListAvailable;
 }
 
 - (NSUInteger)selectedCount
 {
     NSUInteger count = 0;
     for (CYCleanerItem *item in self.items) if (item.selected) count++;
+    if (self.crashLogs.selected) count++;
     return count;
 }
 
@@ -771,6 +823,7 @@ static BOOL cleaner_intro_accepted(void)
 {
     unsigned long long bytes = 0;
     for (CYCleanerItem *item in self.items) if (item.selected) bytes += item.totalBytes;
+    if (self.crashLogs.selected) bytes += self.crashLogs.totalBytes;
     return bytes;
 }
 
@@ -778,7 +831,15 @@ static BOOL cleaner_intro_accepted(void)
 {
     unsigned long long bytes = 0;
     for (CYCleanerItem *item in self.items) bytes += item.totalBytes;
+    if (self.crashLogs) bytes += self.crashLogs.totalBytes;
     return bytes;
+}
+
+- (NSUInteger)selectedAppCount
+{
+    NSUInteger count = 0;
+    for (CYCleanerItem *item in self.items) if (item.selected) count++;
+    return count;
 }
 
 #pragma mark Controls
@@ -786,13 +847,14 @@ static BOOL cleaner_intro_accepted(void)
 - (void)updateControls
 {
     NSUInteger count = [self selectedCount];
-    BOOL enabled = !self.loading && !self.cleaning && self.accessReady && self.processListAvailable && count > 0;
+    BOOL selectedAppsNeedProcessList = [self selectedAppCount] > 0 && !self.processListAvailable;
+    BOOL enabled = !self.loading && !self.cleaning && self.accessReady && count > 0 &&
+                   !selectedAppsNeedProcessList;
     UIButtonConfiguration *cfg = self.cleanButton.configuration;
     if (self.cleaning) cfg.title = @"Cleaning…";
     else if (count > 0)
-        cfg.title = [NSString stringWithFormat:@"Clean %lu App%@ · %@", (unsigned long)count,
-                     count == 1 ? @"" : @"s", cleaner_bytes([self selectedBytes])];
-    else cfg.title = @"Select Apps to Clean";
+        cfg.title = [NSString stringWithFormat:@"Clean Selected · %@", cleaner_bytes([self selectedBytes])];
+    else cfg.title = @"Select Items to Clean";
     self.cleanButton.configuration = cfg;
     self.cleanButton.enabled = enabled;
     self.cleanProgress.hidden = !self.cleaning;
@@ -928,6 +990,7 @@ static BOOL cleaner_intro_accepted(void)
     self.scanTotal = 0;
     self.scanName = nil;
     self.accessMessage = nil;
+    self.crashLogs = nil;
     [self.tableView reloadData];
     [self updateControls];
     __weak typeof(self) weakSelf = self;
@@ -1026,6 +1089,39 @@ static BOOL cleaner_intro_accepted(void)
                 [items addObject:item];
             }
 
+            CYCleanerItem *crashLogs = nil;
+            if (!scanAborted) {
+                setPhase(CYCleanerPhaseLogs, 0, 0);
+                unsigned long long logBytes = 0;
+                NSUInteger logFiles = 0;
+                NSMutableArray<NSString *> *logRoots = [NSMutableArray array];
+                NSMutableDictionary<NSString *, NSNumber *> *logRootBytes = [NSMutableDictionary dictionary];
+                BOOL logsComplete = YES;
+                for (NSString *root in cleaner_crash_log_roots()) {
+                    if (__atomic_load_n(&scanCancelled, __ATOMIC_RELAXED)) { scanAborted = YES; break; }
+                    BOOL complete = YES;
+                    NSUInteger files = 0;
+                    unsigned long long bytes = cleaner_tree_bytes_cancellable(root, &files, &complete, &scanCancelled);
+                    if (bytes > 0) {
+                        logBytes += bytes;
+                        logFiles += files;
+                        [logRoots addObject:root];
+                        logRootBytes[root] = @(bytes);
+                    }
+                    if (!complete) logsComplete = NO;
+                }
+                if (logBytes > 0) {
+                    crashLogs = [[CYCleanerItem alloc] init];
+                    crashLogs.name = @"Crash Logs";
+                    crashLogs.cacheBytes = logBytes;
+                    crashLogs.fileCount = logFiles;
+                    crashLogs.logRoots = logRoots;
+                    crashLogs.logRootBytes = logRootBytes;
+                    crashLogs.incomplete = !logsComplete;
+                    crashLogs.selected = NO;
+                }
+            }
+
             dispatch_async(dispatch_get_main_queue(), ^{
                 typeof(self) self = weakSelf;
                 if (!self) return;
@@ -1040,6 +1136,7 @@ static BOOL cleaner_intro_accepted(void)
                     return;
                 }
                 self.items = items;
+                self.crashLogs = crashLogs;
                 self.processListAvailable = processListAvailable;
                 self.sectionCacheValid = NO;  // availability also drives membership
                 self.loading = NO;
@@ -1075,6 +1172,7 @@ static BOOL cleaner_intro_accepted(void)
     (void)sender;
     NSMutableArray<CYCleanerItem *> *selected = [NSMutableArray array];
     for (CYCleanerItem *item in self.items) if (item.selected) [selected addObject:item];
+    if (self.crashLogs.selected) [selected addObject:self.crashLogs];
     if (selected.count == 0) return;
     CYCleanerFoldersViewController *vc = [[CYCleanerFoldersViewController alloc] init];
     vc.items = selected;
@@ -1092,7 +1190,9 @@ static BOOL cleaner_intro_accepted(void)
     (void)sender;
     if (self.loading || self.cleaning || !self.accessReady) return;
     if (!cleaner_intro_accepted()) { [self showIntroIfNeeded]; return; }
-    if (!self.processListAvailable) {
+    NSUInteger appCount = [self selectedAppCount];
+    BOOL logsSelected = self.crashLogs.selected;
+    if (appCount > 0 && !self.processListAvailable) {
         UIAlertController *alert = [UIAlertController
             alertControllerWithTitle:@"Kernel Access Needed"
                              message:@"Cleaner cannot tell which apps are active without kernel access. Run the chain once, then try again."
@@ -1104,9 +1204,13 @@ static BOOL cleaner_intro_accepted(void)
     NSUInteger count = [self selectedCount];
     if (count == 0) return;
 
-    NSString *message = [NSString stringWithFormat:
-        @"Remove Library/Caches and tmp contents for %lu app%@ (%@ in logical file sizes)? Documents, settings and app data are not touched. Apps may need to redownload content.",
-        (unsigned long)count, count == 1 ? @"" : @"s", cleaner_bytes([self selectedBytes])];
+    NSMutableString *message = [NSMutableString stringWithFormat:
+        @"Remove the selected disposable data (%@ in logical file sizes)? Documents, settings and app data are not touched.",
+        cleaner_bytes([self selectedBytes])];
+    if (appCount > 0)
+        [message appendFormat:@" %lu app cache/temp folder%@.", (unsigned long)appCount, appCount == 1 ? @"" : @"s"];
+    if (logsSelected) [message appendString:@" CrashReporter logs."];
+    [message appendString:@" Apps may need to redownload content."];
     UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"Clean Caches?"
                                                                      message:message
                                                               preferredStyle:UIAlertControllerStyleAlert];
@@ -1132,6 +1236,7 @@ static BOOL cleaner_intro_accepted(void)
     // live table must not change until results are published on the main queue.
     NSMutableArray<CYCleanerItem *> *work = [NSMutableArray array];
     for (CYCleanerItem *item in self.items) if (item.selected) [work addObject:[item copy]];
+    if (self.crashLogs.selected) [work addObject:[self.crashLogs copy]];
 
     __block int cancelled = 0;
     __block UIBackgroundTaskIdentifier bgTask = UIBackgroundTaskInvalid;
@@ -1151,12 +1256,17 @@ static BOOL cleaner_intro_accepted(void)
         @autoreleasepool {
             CYCleanerTraversal traversal = cleaner_traversal(kCleanerMaxCleanSeconds, &cancelled);
             BOOL processUnavailable = NO;
-            NSUInteger cleanedApps = 0, skippedActive = 0, failedApps = 0, done = 0;
+            NSUInteger cleanedApps = 0, skippedActive = 0, failedItems = 0, done = 0;
+            BOOL cleanedLogs = NO;
             unsigned long long freed = 0;
 
             for (CYCleanerItem *item in work) {
                 if (processUnavailable || cleaner_traversal_should_stop(&traversal, 0)) break;
-                if (!cleaner_path_is_app_data(item.container.path)) { failedApps++; continue; }
+                BOOL isLogs = item.isCrashLogs;
+                if (!isLogs && !cleaner_path_is_app_data(item.container.path)) {
+                    failedItems++;
+                    continue;
+                }
 
                 // Refresh the active check once per app, before touching any
                 // of its roots: each process-list read is a kernel round
@@ -1164,23 +1274,32 @@ static BOOL cleaner_intro_accepted(void)
                 // half-cleaned before noticing it had become active. Fail
                 // closed: no list or no executable name means no deletion.
                 BOOL skipApp = NO;
-                NSSet<NSString *> *activeNames = settings_active_process_names();
-                if (!activeNames || item.container.executableName.length == 0) {
-                    processUnavailable = YES;
-                } else if (cleaner_process_is_active(item.container.executableName, activeNames)) {
-                    item.active = YES;
-                    skippedActive++;
-                    skipApp = YES;
+                if (!isLogs) {
+                    NSSet<NSString *> *activeNames = settings_active_process_names();
+                    if (!activeNames || item.container.executableName.length == 0) {
+                        processUnavailable = YES;
+                    } else if (cleaner_process_is_active(item.container.executableName, activeNames)) {
+                        item.active = YES;
+                        skippedActive++;
+                        skipApp = YES;
+                    }
                 }
 
                 NSUInteger removed = 0, failed = 0;
                 unsigned long long appFreed = 0;
                 if (!processUnavailable && !skipApp) {
-                    for (NSString *relativeRoot in @[ @"Library/Caches", @"tmp" ]) {
-                        if (cleaner_traversal_should_stop(&traversal, 0)) break;
-                        appFreed += cleaner_clear_directory(
-                            [item.container.path stringByAppendingPathComponent:relativeRoot],
-                            &removed, &failed, &traversal);
+                    if (isLogs) {
+                        for (NSString *root in item.logRoots) {
+                            if (cleaner_traversal_should_stop(&traversal, 0)) break;
+                            appFreed += cleaner_clear_directory(root, &removed, &failed, &traversal);
+                        }
+                    } else {
+                        for (NSString *relativeRoot in @[ @"Library/Caches", @"tmp" ]) {
+                            if (cleaner_traversal_should_stop(&traversal, 0)) break;
+                            appFreed += cleaner_clear_directory(
+                                [item.container.path stringByAppendingPathComponent:relativeRoot],
+                                &removed, &failed, &traversal);
+                        }
                     }
                 }
                 freed += appFreed;
@@ -1189,6 +1308,16 @@ static BOOL cleaner_intro_accepted(void)
                     // Retain the last known sizes rather than pretending an
                     // interrupted/unreadable rescan proved the roots empty.
                     item.incomplete = YES;
+                } else if (isLogs) {
+                    unsigned long long remaining = 0;
+                    BOOL complete = YES;
+                    for (NSString *root in item.logRoots) {
+                        BOOL rootComplete = YES;
+                        remaining += cleaner_tree_bytes_walk(root, &rootComplete, &traversal);
+                        complete = complete && rootComplete;
+                    }
+                    item.cacheBytes = remaining;
+                    item.incomplete = !complete;
                 } else {
                     // Shared traversal: rescans draw from the same 60 s budget
                     // as the deletions instead of starting fresh 15 s clocks.
@@ -1202,9 +1331,12 @@ static BOOL cleaner_intro_accepted(void)
                     item.incomplete = item.incomplete || !complete;
                 }
                 item.selected = NO;
-                if (failed > 0) failedApps++;
-                if (removed > 0) cleanedApps++;
-                // Progress reflects finished apps, not started ones: the bar
+                if (failed > 0) failedItems++;
+                if (removed > 0) {
+                    if (isLogs) cleanedLogs = YES;
+                    else cleanedApps++;
+                }
+                // Progress reflects finished items, not started ones: the bar
                 // only reaches 100% when the pass has actually ended.
                 done++;
                 float fraction = (float)done / (float)MAX(work.count, (NSUInteger)1);
@@ -1227,29 +1359,38 @@ static BOOL cleaner_intro_accepted(void)
                     self.sectionCacheValid = NO;  // everything moves to Not Checked
                 }
                 NSMutableString *result = [NSMutableString stringWithFormat:
-                    @"Removed %@ (logical size) from %lu app%@.", cleaner_bytes(freed),
-                    (unsigned long)cleanedApps, cleanedApps == 1 ? @"" : @"s"];
+                    @"Removed %@ (logical size).", cleaner_bytes(freed)];
+                if (cleanedApps > 0)
+                    [result appendFormat:@" %lu app%@ cleaned.", (unsigned long)cleanedApps,
+                     cleanedApps == 1 ? @"" : @"s"];
+                if (cleanedLogs) [result appendString:@" Crash logs removed."];
                 if (skippedActive > 0)
                     [result appendFormat:@" Skipped %lu active app%@.", (unsigned long)skippedActive,
                      skippedActive == 1 ? @"" : @"s"];
-                if (failedApps > 0)
-                    [result appendFormat:@" Some files in %lu app%@ could not be removed.",
-                     (unsigned long)failedApps, failedApps == 1 ? @"" : @"s"];
+                if (failedItems > 0)
+                    [result appendFormat:@" Some files in %lu item%@ could not be removed.",
+                     (unsigned long)failedItems, failedItems == 1 ? @"" : @"s"];
                 if (interrupted)
                     [result appendString:@" Cleaning stopped at a safety limit or background expiration; results are partial."];
                 if (processUnavailable)
                     [result appendString:@" Stopped: active-app detection was unavailable; remaining roots were not cleaned."];
                 self.resultText = result;
                 NSMutableDictionary<NSString *, CYCleanerItem *> *results = [NSMutableDictionary dictionary];
-                for (CYCleanerItem *item in work) results[item.container.path] = item;
+                CYCleanerItem *logsResult = nil;
+                for (CYCleanerItem *item in work) {
+                    if (item.isCrashLogs) logsResult = item;
+                    else if (item.key.length) results[item.key] = item;
+                }
                 NSMutableArray<CYCleanerItem *> *published = [NSMutableArray array];
                 for (CYCleanerItem *oldItem in self.items) {
-                    CYCleanerItem *item = results[oldItem.container.path] ?: oldItem;
+                    CYCleanerItem *item = results[oldItem.key] ?: oldItem;
                     if (item.totalBytes > 0 || item.incomplete) [published addObject:item];
                 }
                 // Replace the model and reload together. Offscreen folder-review
                 // controllers keep their original stable item snapshots.
                 self.items = published;
+                self.crashLogs = (logsResult && (logsResult.totalBytes > 0 || logsResult.incomplete))
+                    ? logsResult : nil;
                 [self.tableView reloadData];
                 [self updateControls];
                 UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, self.resultText);
@@ -1280,6 +1421,7 @@ static BOOL cleaner_intro_accepted(void)
     switch ((CYCleanerSection)section) {
         case CYCleanerSectionApps:   return [NSString stringWithFormat:@"Apps (%lu)", (unsigned long)count];
         case CYCleanerSectionSystem: return [NSString stringWithFormat:@"Built-in Apps (%lu)", (unsigned long)count];
+        case CYCleanerSectionLogs:   return [NSString stringWithFormat:@"Crash Logs (%lu)", (unsigned long)count];
         default: return nil;
     }
 }
@@ -1320,11 +1462,11 @@ static BOOL cleaner_intro_accepted(void)
     // Right under the card, where it's seen: how the list works.
     if (section == CYCleanerSectionSummary)
         return !self.loading && self.items.count
-            ? @"Tap an app to select or deselect it. Touch and hold an app to open its cache folders in the File Browser."
+            ? @"Tap an app or Crash Logs to select or deselect it. Touch and hold an app to open its cache folders in the File Browser."
             : nil;
     if (section != CYCleanerSectionSkipped) return nil;
-    return @"Only Library/Caches and tmp contents are removed. Documents, settings and app data are not touched. "
-           @"Active-app checks are best-effort; built-in apps are not selected by default.";
+    return @"Only Library/Caches and tmp contents, plus the optional CrashReporter folders, are removed. "
+           @"Documents, settings and app data are not touched. Active-app checks are best-effort; built-in apps and Crash Logs are not selected by default.";
 }
 
 - (void)configureSummary:(CYCleanerSummaryCell *)cell
@@ -1354,6 +1496,12 @@ static BOOL cleaner_intro_accepted(void)
                 cell.bar.progress = 1;
                 cell.statusLabel.text = @"Apps in use are left alone.";
                 break;
+            case CYCleanerPhaseLogs:
+                cell.captionLabel.text = @"Checking Crash Logs";
+                cell.totalLabel.text = @"…";
+                cell.bar.progress = 1;
+                cell.statusLabel.text = @"Reading CrashReporter folders.";
+                break;
             case CYCleanerPhaseScanning:
                 cell.captionLabel.text = @"Measuring Caches";
                 cell.totalLabel.text = self.scanTotal ? [NSString stringWithFormat:@"%lu / %lu",
@@ -1374,12 +1522,12 @@ static BOOL cleaner_intro_accepted(void)
         cell.statusLabel.text = self.accessMessage ?: @"Filesystem access is not available.";
         return;
     }
-    cell.captionLabel.text = @"Cache + Temp Size";
+    cell.captionLabel.text = @"Reclaimable";
     cell.totalLabel.text = cleaner_bytes(total);
     cell.bar.progress = total ? (float)((double)selected / (double)total) : 0;
     NSMutableArray<NSString *> *lines = [NSMutableArray array];
     if (self.resultText) [lines addObject:self.resultText];
-    [lines addObject:[NSString stringWithFormat:@"%@ selected in %lu app%@", cleaner_bytes(selected),
+    [lines addObject:[NSString stringWithFormat:@"%@ selected in %lu item%@", cleaner_bytes(selected),
                       (unsigned long)[self selectedCount], [self selectedCount] == 1 ? @"" : @"s"]];
     [lines addObject:@"Logical file sizes, not guaranteed recovered storage."];
     if (!self.processListAvailable)
@@ -1404,12 +1552,20 @@ static BOOL cleaner_intro_accepted(void)
     cell.nameLabel.textColor = selectable ? UIColor.labelColor : UIColor.secondaryLabelColor;
     cell.iconView.image = item.icon ?: [UIImage systemImageNamed:@"app.dashed"];
     cell.iconView.tintColor = UIColor.tertiaryLabelColor;
-    NSMutableArray<NSString *> *parts = [NSMutableArray array];
-    if (item.cacheBytes > 0) [parts addObject:[NSString stringWithFormat:@"%@ cache", cleaner_bytes(item.cacheBytes)]];
-    if (item.tempBytes > 0) [parts addObject:[NSString stringWithFormat:@"%@ temp", cleaner_bytes(item.tempBytes)]];
-    if (item.active) [parts addObject:@"in use"];
-    else if (item.incomplete) [parts addObject:@"incomplete scan"];
-    cell.detailLabel.text = [parts componentsJoinedByString:@" · "];
+    if (item.isCrashLogs) {
+        cell.iconView.image = [UIImage systemImageNamed:@"doc.text.magnifyingglass"];
+        cell.iconView.tintColor = UIColor.systemOrangeColor;
+        cell.detailLabel.text = [NSString stringWithFormat:@"%lu crash log file%@ · CrashReporter",
+                                 (unsigned long)item.fileCount, item.fileCount == 1 ? @"" : @"s"];
+        if (item.incomplete) cell.detailLabel.text = [cell.detailLabel.text stringByAppendingString:@" · incomplete scan"];
+    } else {
+        NSMutableArray<NSString *> *parts = [NSMutableArray array];
+        if (item.cacheBytes > 0) [parts addObject:[NSString stringWithFormat:@"%@ cache", cleaner_bytes(item.cacheBytes)]];
+        if (item.tempBytes > 0) [parts addObject:[NSString stringWithFormat:@"%@ temp", cleaner_bytes(item.tempBytes)]];
+        if (item.active) [parts addObject:@"in use"];
+        else if (item.incomplete) [parts addObject:@"incomplete scan"];
+        cell.detailLabel.text = [parts componentsJoinedByString:@" · "];
+    }
     cell.sizeLabel.text = item.incomplete ? [@"≥ " stringByAppendingString:cleaner_bytes(item.totalBytes)]
                                           : cleaner_bytes(item.totalBytes);
     cell.checkView.image = [UIImage systemImageNamed:item.active ? @"minus.circle"
@@ -1453,17 +1609,27 @@ static BOOL cleaner_intro_accepted(void)
     // tree that is actively being deleted underneath it.
     if (self.cleaning) return nil;
     CYCleanerItem *item = [self itemsInSection:indexPath.section][(NSUInteger)indexPath.row];
-    NSString *caches = [item.container.path stringByAppendingPathComponent:@"Library/Caches"];
-    NSString *tmp = [item.container.path stringByAppendingPathComponent:@"tmp"];
     __weak typeof(self) weakSelf = self;
     return [UIContextMenuConfiguration configurationWithIdentifier:nil previewProvider:nil
                                                     actionProvider:^UIMenu *(NSArray<UIMenuElement *> *s) {
-        NSMutableArray *actions = [NSMutableArray arrayWithObject:
-            [UIAction actionWithTitle:@"Show Caches in File Browser" image:[UIImage systemImageNamed:@"folder"]
-                           identifier:nil handler:^(UIAction *a) { [weakSelf openInFileBrowser:caches]; }]];
-        if (item.tempBytes > 0)
-            [actions addObject:[UIAction actionWithTitle:@"Show tmp in File Browser" image:[UIImage systemImageNamed:@"folder"]
-                                              identifier:nil handler:^(UIAction *a) { [weakSelf openInFileBrowser:tmp]; }]];
+        NSMutableArray *actions = [NSMutableArray array];
+        if (item.isCrashLogs) {
+            for (NSString *root in item.logRoots) {
+                NSString *name = root.lastPathComponent.length ? root.lastPathComponent : root;
+                [actions addObject:[UIAction actionWithTitle:[NSString stringWithFormat:@"Show %@ in File Browser", name]
+                                                       image:[UIImage systemImageNamed:@"folder"]
+                                                  identifier:nil
+                                                     handler:^(UIAction *a) { [weakSelf openInFileBrowser:root]; }]];
+            }
+        } else {
+            NSString *caches = [item.container.path stringByAppendingPathComponent:@"Library/Caches"];
+            NSString *tmp = [item.container.path stringByAppendingPathComponent:@"tmp"];
+            [actions addObject:[UIAction actionWithTitle:@"Show Caches in File Browser" image:[UIImage systemImageNamed:@"folder"]
+                                               identifier:nil handler:^(UIAction *a) { [weakSelf openInFileBrowser:caches]; }]];
+            if (item.tempBytes > 0)
+                [actions addObject:[UIAction actionWithTitle:@"Show tmp in File Browser" image:[UIImage systemImageNamed:@"folder"]
+                                                  identifier:nil handler:^(UIAction *a) { [weakSelf openInFileBrowser:tmp]; }]];
+        }
         return [UIMenu menuWithTitle:item.name children:actions];
     }];
 }
@@ -1483,6 +1649,15 @@ static BOOL cleaner_intro_accepted(void)
 - (NSArray<NSDictionary<NSString *, id> *> *)foldersForItem:(CYCleanerItem *)item
 {
     NSMutableArray *out = [NSMutableArray array];
+    if (item.isCrashLogs) {
+        for (NSString *root in item.logRoots) {
+            NSNumber *bytes = item.logRootBytes[root] ?: @(item.cacheBytes);
+            [out addObject:@{ @"title": @"CrashReporter",
+                              @"path": root,
+                              @"bytes": bytes }];
+        }
+        return out;
+    }
     if (item.cacheBytes > 0) {
         [out addObject:@{ @"title": @"Library/Caches",
                           @"path": [item.container.path stringByAppendingPathComponent:@"Library/Caches"],
