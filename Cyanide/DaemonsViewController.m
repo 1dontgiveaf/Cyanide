@@ -452,9 +452,9 @@ static void daemons_note_change(NSArray<NSString *> *labels)
     NSMutableArray *out = [NSMutableArray array];
     for (CYDaemonGroup *g in daemon_catalog_groups()) {
         // The catalog covers several iOS versions: a group none of whose
-        // daemons is a launchd job here (AirPrint and Bluetooth Wake on iOS
-        // 18.5) can't do anything, so it isn't shown -- unless one of its
-        // labels is disabled and could still be switched back on.
+        // daemons is a launchd job here can't do anything, so it isn't
+        // shown -- unless one of its labels is disabled and could still be
+        // switched back on.
         BOOL usable = NO;
         for (NSString *label in g.labels) usable |= ![self isLabelMissing:label] || [self isLabelDisabled:label];
         if (!usable) continue;

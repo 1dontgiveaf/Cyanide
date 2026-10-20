@@ -7597,7 +7597,7 @@ static NSDictionary *settings_daemons_running(void)
             if (programs && !programs[label]) {
                 info[@"missing"] = @YES;
                 // Name what this iOS has instead, if anything looks related
-                // ("com.apple.printd" -> jobs with "print" in the label).
+                // ("com.apple.foo.bard" -> jobs with "bar" in the label).
                 NSString *stem = label.pathExtension.length ? label.pathExtension : label;
                 if (stem.length > 4 && [stem hasSuffix:@"d"]) stem = [stem substringToIndex:stem.length - 1];
                 NSMutableArray *similar = [NSMutableArray array];
