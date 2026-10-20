@@ -20,6 +20,10 @@ static NSString * const SBLArchiveErrorDomain = @"SnowBoardLiteArchive";
 // these is refused instead of being allocated / written.
 static const uint64_t kSBLMaxEntryBytes = 64ull * 1024 * 1024;    // per extracted file
 static const uint64_t kSBLMaxTotalBytes = 256ull * 1024 * 1024;   // whole archive / decompressed tar
+// Directories normally carry no data. A small allowance preserves ZIP writers
+// that encode an empty directory as a tiny raw-deflate stream, while refusing
+// compressed zero-output payloads before they are copied or inflated.
+static const uint64_t kSBLMaxDirectoryCompressedBytes = 64ull * 1024;
 // liblzma decoder memory limit (dictionary etc., not output). xz -9 needs ~65 MiB.
 static const uint64_t kSBLXZMemLimit    = 128ull * 1024 * 1024;
 // inflate() runs in slices of this size (input and output) so a cancel is seen
@@ -547,7 +551,11 @@ static BOOL sbl_extract_zip(NSData *zip, NSString *destination, NSProgress *prog
             return NO;
         }
         uint64_t entryBytes = (method == 0) ? compSize : uncompSize;
-        if ((isDirectory && uncompSize != 0) || entryBytes > kSBLMaxEntryBytes) {
+        BOOL invalidDirectoryPayload = isDirectory &&
+            (uncompSize != 0 ||
+             (method == 0 && compSize != 0) ||
+             (method == 8 && (uint64_t)compSize > kSBLMaxDirectoryCompressedBytes));
+        if (invalidDirectoryPayload || (!isDirectory && entryBytes > kSBLMaxEntryBytes)) {
             sbl_set_error(error, 24, @"ZIP directory payload or entry size is invalid.");
             return NO;
         }
