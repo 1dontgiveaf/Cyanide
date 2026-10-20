@@ -157,16 +157,19 @@ cleaner_clear_directory(cache, &removed, &failed, &walk);
 check(walk.stopped && (exists([cache stringByAppendingPathComponent:@"one"]) ||
     exists([cache stringByAppendingPathComponent:@"two"])), "directory-only removal cap");
 
-// A bounded stack refuses a very deep cache rather than exhausting descriptors.
+// An over-deep subtree is skipped, not allowed to stop the whole pass.
 a = app(); cache = [a stringByAppendingPathComponent:@"Library/Caches"];
 NSString *deep = cache;
 for (NSUInteger i = 0; i < kCleanerMaxTraversalDepth + 2; i++) deep = [deep stringByAppendingPathComponent:@"d"];
 NSString *deepFile = [deep stringByAppendingPathComponent:@"keep.bin"]; put(deepFile, 32);
+put([cache stringByAppendingPathComponent:@"sibling.bin"], 16);
 complete = YES; scan_path(cache, &complete);
 check(!complete, "depth-limited scan");
-walk = cleaner_traversal(10, NULL);
+walk = cleaner_traversal(10, NULL); removed = failed = 0;
 cleaner_clear_directory(cache, &removed, &failed, &walk);
-check(walk.stopped && exists(deepFile), "depth-limited removal");
+check(!walk.stopped && exists(deepFile), "depth-limited removal leaves deep subtree");
+check(!exists([cache stringByAppendingPathComponent:@"sibling.bin"]), "depth-limited removal continues with siblings");
+check(failed > 0, "depth-limited removal reports the skipped subtree");
 
 // Expiration/cancellation gates both deletes and post-clean scans.
 a = app(); cache = [a stringByAppendingPathComponent:@"Library/Caches"];

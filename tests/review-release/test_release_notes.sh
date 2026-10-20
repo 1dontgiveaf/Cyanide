@@ -39,11 +39,9 @@ cat > "$CASE/RELEASE_NOTES_1.10.0.md" <<'EOF'
 - Curated fix bullet.
 EOF
 cat > "$CASE/override.md" <<'EOF'
-## Released
+## Pending
 
-### v1.9.0 - 2026-10-19
-
-- [x] explicit override bullet
+- [ ] explicit override bullet
 EOF
 
 (
@@ -71,11 +69,17 @@ EOF
     grep -Fq '<string>Curated nested detail.</string>' Cyanide/Changelog.plist
     grep -Fq '<string>historical curated bullet</string>' Cyanide/Changelog.plist
 
-    CHANGELOG_RELEASE_NOTES_FILE=override.md ./scripts/gen-changelog.sh >/dev/null
+    CHANGELOG_PENDING_VERSION=1.10.0 \
+    CHANGELOG_PENDING_BASE=v1.9.0 \
+    CHANGELOG_RELEASE_NOTES_FILE=override.md \
+        ./scripts/gen-changelog.sh >/dev/null
     grep -Fq '<string>explicit override bullet</string>' Cyanide/Changelog.plist
+    # The override applies only to the pending entry; released history keeps
+    # its own source.
+    grep -Fq '<string>historical curated bullet</string>' Cyanide/Changelog.plist
 )
 
-grep -Fq 'release_notes_file_for_version "$NEW_VERSION"' "$ROOT/scripts/release.sh"
+grep -Fq 'release_notes_file_for_version "$NEW_VERSION" "$RELEASE_NOTES_FILE_OVERRIDE"' "$ROOT/scripts/release.sh"
 gngrep='NOTES="${NOTES_ARG:-${NOTES_FROM_FILE:-${NOTES:-$NOTES_DEFAULT}}}"'
 grep -Fq "$gngrep" "$ROOT/scripts/release.sh"
 printf '%s\n' 'PASS: release-note selection, historical parsing, and explicit override'
