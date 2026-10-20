@@ -23,6 +23,12 @@ static const NSUInteger kCleanerMaxTraversalDepth = 64;
 static const double kCleanerMaxScanSeconds = 15;
 static const double kCleanerMaxCleanSeconds = 60;
 
+static BOOL cleaner_scan_should_restart(BOOL stale, BOOL loading, BOOL cleaning,
+                                        BOOL visible, BOOL foreground, BOOL accessReady)
+{
+    return stale && !loading && !cleaning && visible && foreground && accessReady;
+}
+
 static void cleaner_suppress_popup_bar(UIViewController *vc, BOOL suppressed)
 {
     UITabBarController *tbc = vc.tabBarController;
@@ -702,6 +708,8 @@ static BOOL cleaner_intro_accepted(void)
 // showing the stale one.
 @property (nonatomic, copy) void (^scanCancel)(void);
 @property (nonatomic) BOOL scanStale;
+@property (nonatomic) NSUInteger scanGeneration;
+@property (nonatomic) BOOL cleanerVisible;
 // Round 53: section-array cache. itemsInSection: filters + sorts on every
 // call, and the table asks per row/count/header. Membership depends only on
 // items, filter, sort and processListAvailable — all mutated on the main
@@ -756,18 +764,14 @@ static BOOL cleaner_intro_accepted(void)
                name:UIApplicationDidEnterBackgroundNotification object:nil];
     [nc addObserver:self selector:@selector(cleaner_willEnterForeground)
                name:UIApplicationWillEnterForegroundNotification object:nil];
+    [nc addObserver:self selector:@selector(cleaner_didBecomeActive)
+               name:UIApplicationDidBecomeActiveNotification object:nil];
 }
 
 - (void)viewWillAppear:(BOOL)animated
 {
     [super viewWillAppear:animated];
     [self.navigationController setToolbarHidden:NO animated:animated];
-    // Round 53: a pass cancelled on disappear/backgrounding is never
-    // published — rescan on return instead of showing the stale one.
-    if (self.scanStale && self.accessReady && !self.loading && !self.cleaning) {
-        self.scanStale = NO;
-        [self reloadData];
-    }
     // Start right away, not after the push animation: the card shows what's
     // happening from the first frame. On first open the explanation comes
     // first; nothing is read until it is accepted.
@@ -777,7 +781,9 @@ static BOOL cleaner_intro_accepted(void)
 - (void)viewDidAppear:(BOOL)animated
 {
     [super viewDidAppear:animated];
+    self.cleanerVisible = YES;
     cleaner_suppress_popup_bar(self, YES);
+    [self cleaner_scheduleStaleScanIfNeeded];
     if (cleaner_intro_accepted() && !self.accessReady && !self.loading) [self ensureAccessAllowingFullExploit:NO];
     [self showIntroIfNeeded];
 }
@@ -817,6 +823,7 @@ static BOOL cleaner_intro_accepted(void)
     [super viewWillDisappear:animated];
     // Round 53: popping or covering the VC cancels an in-flight scan
     // promptly instead of letting it burn CPU on results no one sees.
+    self.cleanerVisible = NO;
     if (self.scanCancel) { self.scanCancel(); self.scanStale = YES; }
     [self.navigationController setToolbarHidden:YES animated:animated];
     cleaner_suppress_popup_bar(self, NO);
@@ -832,11 +839,28 @@ static BOOL cleaner_intro_accepted(void)
 
 - (void)cleaner_willEnterForeground
 {
-    if (self.scanStale && self.view.window && self.accessReady &&
-        !self.loading && !self.cleaning) {
-        self.scanStale = NO;
+    [self cleaner_scheduleStaleScanIfNeeded];
+}
+
+- (void)cleaner_didBecomeActive
+{
+    [self cleaner_scheduleStaleScanIfNeeded];
+}
+
+- (void)cleaner_scheduleStaleScanIfNeeded
+{
+    BOOL foreground = UIApplication.sharedApplication.applicationState == UIApplicationStateActive;
+    if (!cleaner_scan_should_restart(self.scanStale, self.loading, self.cleaning,
+                                     self.cleanerVisible, foreground, self.accessReady)) return;
+    if (!settings_filesystem_access_available()) {
         [self reloadData];
+        return;
     }
+    // Clear the marker before starting. If access has to be reacquired,
+    // reloadData now has access and will own the replacement transition;
+    // retaining this marker here would make every callback launch another pass.
+    self.scanStale = NO;
+    [self reloadData];
 }
 
 - (void)viewDidLayoutSubviews
@@ -1118,6 +1142,8 @@ static BOOL cleaner_intro_accepted(void)
         return;
     }
 
+    self.scanStale = NO;
+    NSUInteger scanGeneration = ++self.scanGeneration;
     self.loading = YES;
     self.phase = CYCleanerPhaseFinding;
     self.foundDone = 0;
@@ -1140,7 +1166,7 @@ static BOOL cleaner_intro_accepted(void)
     void (^setPhase)(CYCleanerPhase, NSUInteger, NSUInteger) = ^(CYCleanerPhase phase, NSUInteger done, NSUInteger total) {
         dispatch_async(dispatch_get_main_queue(), ^{
             typeof(self) self = weakSelf;
-            if (!self || !self.loading) return;
+            if (!self || self.scanGeneration != scanGeneration || !self.loading) return;
             self.phase = phase;
             if (phase == CYCleanerPhaseFinding) { self.foundDone = done; self.foundTotal = total; }
             [self reloadSummary];
@@ -1176,15 +1202,24 @@ static BOOL cleaner_intro_accepted(void)
             }
             NSUInteger total = containers.count;
             setPhase(CYCleanerPhaseProcesses, 0, 0);
-            NSSet<NSString *> *active = settings_active_process_names();
+            NSSet<NSString *> *active = nil;
+            BOOL processListAvailable = NO;
+            // Do not enter the process-list reader after cancellation. This
+            // pass is already stale and the kernel round trip only delays its
+            // completion while the screen is hidden/backgrounded.
+            if (!__atomic_load_n(&scanCancelled, __ATOMIC_RELAXED)) {
+                active = settings_active_process_names();
+                processListAvailable = (active != nil);
+            } else {
+                scanAborted = YES;
+            }
             dispatch_async(dispatch_get_main_queue(), ^{
                 typeof(self) self = weakSelf;
-                if (!self || !self.loading) return;
+                if (!self || self.scanGeneration != scanGeneration || !self.loading) return;
                 self.scanTotal = total;
                 self.phase = CYCleanerPhaseScanning;
                 [self reloadSummary];
             });
-            BOOL processListAvailable = (active != nil);
             if (!active) active = [NSSet set];
 
             NSMutableArray<CYCleanerItem *> *items = [NSMutableArray array];
@@ -1243,7 +1278,7 @@ static BOOL cleaner_intro_accepted(void)
                 NSUInteger done = scanned;
                 dispatch_async(dispatch_get_main_queue(), ^{
                     typeof(self) self = weakSelf;
-                    if (!self || !self.loading) return;
+                    if (!self || self.scanGeneration != scanGeneration || !self.loading) return;
                     self.scanDone = done;
                     self.scanName = name;
                     [self reloadSummary];
@@ -1290,14 +1325,18 @@ static BOOL cleaner_intro_accepted(void)
             dispatch_async(dispatch_get_main_queue(), ^{
                 typeof(self) self = weakSelf;
                 if (!self) return;
+                if (self.scanGeneration != scanGeneration) return;
                 self.scanCancel = nil;   // late pulls are no-ops once the pass ends
                 if (scanAborted || __atomic_load_n(&scanCancelled, __ATOMIC_RELAXED)) {
-                    // Round 53: never publish a cancelled pass — the side
-                    // that cancelled set scanStale, and the next appearance/
-                    // foreground rescans instead of showing stale data.
+                    // Never publish a cancelled pass. Once loading clears,
+                    // schedule exactly one replacement when the same VC is
+                    // visible and active; otherwise the next appearance/
+                    // foreground callback owns the replacement.
                     self.loading = NO;
+                    self.scanStale = YES;
                     [self.tableView reloadData];
                     [self updateControls];
+                    [self cleaner_scheduleStaleScanIfNeeded];
                     return;
                 }
                 self.items = items;
