@@ -1695,6 +1695,73 @@ void filebrowser_share_file(UIViewController *presenter, NSString *path, BOOL vi
     });
 }
 
+static const NSTimeInterval kFBShareStaleAge = 24.0 * 60.0 * 60.0;
+
+static BOOL fb_share_is_uuid_directory_name(NSString *name)
+{
+    if (name.length != 36) return NO;
+    NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:name];
+    return uuid && [uuid.UUIDString caseInsensitiveCompare:name] == NSOrderedSame;
+}
+
+static void fb_share_sweep_now(void)
+{
+    NSString *root = fb_share_root();
+    int rootFD = open(root.fileSystemRepresentation, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (rootFD < 0) return;
+    struct stat rootSt;
+    if (fstat(rootFD, &rootSt) != 0 || !S_ISDIR(rootSt.st_mode)) {
+        close(rootFD);
+        return;
+    }
+    DIR *rootDir = fdopendir(rootFD);
+    if (!rootDir) { close(rootFD); return; }
+    time_t now = time(NULL);
+    struct dirent *item;
+    while ((item = readdir(rootDir)) != NULL) {
+        NSString *name = [[NSString alloc] initWithUTF8String:item->d_name];
+        if (!fb_share_is_uuid_directory_name(name)) continue;
+        NSString *dir = [root stringByAppendingPathComponent:name];
+        struct stat dirSt;
+        if (lstat(dir.fileSystemRepresentation, &dirSt) != 0 || !S_ISDIR(dirSt.st_mode)) continue;
+        if (dirSt.st_mtimespec.tv_sec > now || now - dirSt.st_mtimespec.tv_sec < kFBShareStaleAge) continue;
+
+        // A live worker or activity sheet holds this marker lock.  Never
+        // remove it even when the directory itself is old.
+        NSString *marker = [dir stringByAppendingPathComponent:@".active"];
+        int markerFD = open(marker.fileSystemRepresentation, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (markerFD >= 0) {
+            struct stat markerSt;
+            BOOL regular = fstat(markerFD, &markerSt) == 0 && S_ISREG(markerSt.st_mode);
+            if (!regular || flock(markerFD, LOCK_EX | LOCK_NB) != 0) {
+                close(markerFD);
+                continue;
+            }
+        } else if (errno != ENOENT) {
+            // A marker symlink or other unexpected object is not ours to
+            // interpret; leave the directory for a later safe inspection.
+            continue;
+        }
+
+        struct stat verify;
+        struct stat currentRoot;
+        BOOL sameDir = lstat(dir.fileSystemRepresentation, &verify) == 0 &&
+                       S_ISDIR(verify.st_mode) && verify.st_dev == dirSt.st_dev && verify.st_ino == dirSt.st_ino;
+        BOOL sameRoot = lstat(root.fileSystemRepresentation, &currentRoot) == 0 &&
+                        S_ISDIR(currentRoot.st_mode) && currentRoot.st_dev == rootSt.st_dev && currentRoot.st_ino == rootSt.st_ino;
+        if (sameDir && sameRoot) [NSFileManager.defaultManager removeItemAtPath:dir error:nil];
+        if (markerFD >= 0) close(markerFD);
+    }
+    closedir(rootDir);
+}
+
+void filebrowser_sweep_stale_share_staging(void)
+{
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        fb_share_sweep_now();
+    });
+}
+
 @implementation FBFileViewController (Share)
 
 - (void)shareCopy:(UIBarButtonItem *)sender

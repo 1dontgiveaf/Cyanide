@@ -13,6 +13,7 @@
 #import "tweaks/location_services.h"
 #import "installer/InstallProgressViewController.h"
 #import "UpdateChecker.h"
+#import "FileBrowserViewController.h"
 #import "TaskRop/Exception.h"   // round 30: excport lifecycle gate (early close)
 
 // Did this request launch Cyanide? "A scene already exists" is not the test:
@@ -977,6 +978,7 @@ static const double kQuietMinPhase = 0.35;   // a phase stays readable at least 
 
 - (void)sceneWillEnterForeground:(UIScene *)scene {
     cyanide_launch_trace("sceneWillEnterForeground");
+    filebrowser_sweep_stale_share_staging();
     g_scene_visit_user_owned = NO;
     // A quiet shortcut run that sent Cyanide home leaves its cover behind;
     // a normal reopen must show the app (a new shortcut run puts it back).
