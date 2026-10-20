@@ -804,6 +804,8 @@ static NSString * const kSettingsSpringBoardRestartedNotification = @"CYSpringBo
 @property (nonatomic, assign) BOOL didLoadWebKitFallback;
 @end
 
+static const NSInteger kDSRespringBadgeTag = 0x5245;   // the logo + label shown while waiting
+
 @implementation DSRespringOverlayView
 
 - (NSString *)respringHTML {
@@ -870,6 +872,40 @@ static NSString * const kSettingsSpringBoardRestartedNotification = @"CYSpringBo
     self.webView.frame = self.bounds;
 }
 
+// The Cyanide logo and a label instead of a spinner: iOS shows its own
+// spinner in the middle of the screen while SpringBoard restarts, and a
+// second one from us looked doubled (and blurry once iOS took over the
+// screen). Kept above the centre so the iOS spinner has the middle.
+- (UIView *)respringBadge {
+    UIView *badge = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 240, 120)];
+    badge.tag = kDSRespringBadgeTag;
+
+    UIImageView *logo = [[UIImageView alloc] initWithFrame:CGRectMake(84, 0, 72, 72)];
+    UIImage *appIcon = [UIImage imageNamed:@"AppIcon60x60"];
+    if (!appIcon) {
+        NSString *f = [[[NSBundle mainBundle] infoDictionary][@"CFBundleIcons"][@"CFBundlePrimaryIcon"][@"CFBundleIconFiles"] lastObject];
+        appIcon = f ? [UIImage imageNamed:f] : nil;
+    }
+    logo.image = appIcon;
+    logo.contentMode = UIViewContentModeScaleAspectFit;
+    logo.layer.cornerRadius = 16.0;
+    logo.layer.cornerCurve = kCACornerCurveContinuous;
+    logo.clipsToBounds = YES;
+    [badge addSubview:logo];
+
+    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(0, 88, 240, 24)];
+    label.text = @"Preparing respring…";
+    label.font = [UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold];
+    label.textColor = [UIColor colorWithWhite:1.0 alpha:0.8];
+    label.textAlignment = NSTextAlignmentCenter;
+    [badge addSubview:label];
+
+    badge.center = CGPointMake(CGRectGetMidX(self.bounds), CGRectGetMidY(self.bounds) - 150.0);
+    badge.autoresizingMask = UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin |
+                             UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin;
+    return badge;
+}
+
 - (void)loadRespringPayload {
     if (self.didLoadPayload) return;
     self.didLoadPayload = YES;
@@ -896,8 +932,7 @@ static NSString * const kSettingsSpringBoardRestartedNotification = @"CYSpringBo
             if (!weakSelf.superview || weakSelf.webView) return;
             printf("[RESPRING] no SpringBoard restart seen 10 s after the request; "
                    "using the WebKit fallback\n");
-            for (UIView *v in weakSelf.subviews)
-                if ([v isKindOfClass:UIActivityIndicatorView.class]) [v removeFromSuperview];
+            [[weakSelf viewWithTag:kDSRespringBadgeTag] removeFromSuperview];
             [weakSelf loadWebKitFallback];
         });
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -905,14 +940,7 @@ static NSString * const kSettingsSpringBoardRestartedNotification = @"CYSpringBo
             printf("[RESPRING] no SpringBoard restart seen after 25 s; removing the respring cover\n");
             [weakSelf removeFromSuperview];
         });
-        UIActivityIndicatorView *spinner =
-            [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
-        spinner.color = UIColor.whiteColor;
-        spinner.center = CGPointMake(CGRectGetMidX(self.bounds), CGRectGetMidY(self.bounds));
-        spinner.autoresizingMask = UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin |
-                                   UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin;
-        [spinner startAnimating];
-        [self addSubview:spinner];
+        [self addSubview:[self respringBadge]];
         return;
     }
     [self loadWebKitFallback];
