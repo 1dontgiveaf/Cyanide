@@ -196,18 +196,23 @@ static BOOL ad_decrypt_range_in_springboard(NSString *src, NSString *dst, uint64
         if (fdIn < 0) { *why = [NSString stringWithFormat:@"SpringBoard: open failed (%s)", strerror(ad_sb_errno())]; break; }
         fdOut = (int)r_dlsym_call(R_TIMEOUT, "open", rdst, O_WRONLY | O_CLOEXEC, 0, 0, 0, 0, 0, 0);
         if (fdOut < 0) { *why = [NSString stringWithFormat:@"SpringBoard: can't write the copy (%s)", strerror(ad_sb_errno())]; break; }
-        struct { const char *name; size_t addrOff, len; } variants[] = {
-            { "page-range",  0,     mapLen },
-            { "crypt-range", delta, mapLen > delta ? mapLen - delta : 0 },
-            { "crypt-exact", delta, s->cryptsize },
-            { "page-exact",  0,     s->cryptsize },
-            { "crypt-page",  delta, mapLen > delta + getpagesize() ? getpagesize() : 0 },
+        struct { const char *name; size_t mapOff, addrOff, len, readOff; } variants[] = {
+            { "page-range",        aligned, 0,     mapLen, delta },
+            { "crypt-range",       aligned, delta, mapLen > delta ? mapLen - delta : 0, delta },
+            { "crypt-exact",       aligned, delta, s->cryptsize, delta },
+            { "page-exact",        aligned, 0,     s->cryptsize, delta },
+            { "crypt-page",        aligned, delta, mapLen > delta + getpagesize() ? getpagesize() : 0, delta },
+            { "prefix-page-range", 0,       aligned, mapLen, start },
+            { "prefix-crypt-range", 0,      start, mapLen > delta ? mapLen - delta : 0, start },
+            { "prefix-crypt-exact", 0,      start, s->cryptsize, start },
         };
         uint32_t subtypes[2] = { s->cpusubtype, s->cpusubtype & ~(uint32_t)CPU_SUBTYPE_MASK };
         for (size_t i = 0; i < sizeof(variants) / sizeof(variants[0]) && !ok; i++) {
-            if (!variants[i].len || variants[i].addrOff + variants[i].len > mapLen) continue;
-            uint64_t map = r_dlsym_call(R_TIMEOUT, "mmap", 0, mapLen, PROT_READ, MAP_PRIVATE,
-                                        (uint64_t)fdIn, aligned, 0, 0);
+            size_t mapSize = variants[i].mapOff + mapLen;
+            if (!variants[i].len || variants[i].addrOff + variants[i].len > mapSize ||
+                variants[i].readOff + s->cryptsize > mapSize) continue;
+            uint64_t map = r_dlsym_call(R_TIMEOUT, "mmap", 0, mapSize, PROT_READ, MAP_PRIVATE,
+                                        (uint64_t)fdIn, variants[i].mapOff, 0, 0);
             if (!map || map == (uint64_t)-1) {
                 *why = [NSString stringWithFormat:@"SpringBoard: mmap failed (%s)", strerror(ad_sb_errno())];
                 break;
@@ -220,8 +225,8 @@ static BOOL ad_decrypt_range_in_springboard(NSString *src, NSString *dst, uint64
                                       s->cryptid, s->cputype, subtypes[v], 0, 0, 0);
                 if (r != 0) e = ad_sb_errno();
             }
-            printf("[DECRYPT]   springboard %s addr=+0x%zx len=0x%zx: %s\n",
-                   variants[i].name, variants[i].addrOff, variants[i].len,
+            printf("[DECRYPT]   springboard %s map+0x%zx addr+0x%zx len=0x%zx: %s\n",
+                   variants[i].name, variants[i].mapOff, variants[i].addrOff, variants[i].len,
                    r == 0 ? "ok" : strerror(e));
             if (r == 0) {
                 uint64_t done = 0;
@@ -229,13 +234,11 @@ static BOOL ad_decrypt_range_in_springboard(NSString *src, NSString *dst, uint64
                 while (done < s->cryptsize) {
                     uint64_t chunk = MIN((uint64_t)s->cryptsize - done, 8ULL * 1024 * 1024);
                     int64_t n = (int64_t)r_dlsym_call(R_TIMEOUT, "pwrite", (uint64_t)fdOut,
-                                                      map + delta + done, chunk, start + done, 0, 0, 0, 0);
+                                                      map + variants[i].readOff + done, chunk, start + done, 0, 0, 0, 0);
                     if (n <= 0 || !r_last_call_ok()) { wrote = NO; break; }
                     done += (uint64_t)n;
                 }
                 if (wrote) {
-                    // Compare the written bytes locally; a successful mremap of
-                    // the wrong page leaves the encrypted bytes unchanged.
                     uint8_t a[64], b[64];
                     int fsrc = open(src.fileSystemRepresentation, O_RDONLY | O_CLOEXEC);
                     int fdst = open(dst.fileSystemRepresentation, O_RDONLY | O_CLOEXEC);
@@ -248,7 +251,7 @@ static BOOL ad_decrypt_range_in_springboard(NSString *src, NSString *dst, uint64
                     if (differs) ok = YES;
                 }
             }
-            r_dlsym_call(R_TIMEOUT, "munmap", map, mapLen, 0, 0, 0, 0, 0, 0);
+            r_dlsym_call(R_TIMEOUT, "munmap", map, mapSize, 0, 0, 0, 0, 0, 0);
         }
         if (!ok) *why = @"SpringBoard: no accepted mremap variant";
     } while (0);
