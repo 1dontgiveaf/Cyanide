@@ -268,18 +268,25 @@ static BOOL ad_try_mremap_variants(int fd, int out, uint64_t start, size_t page,
                                    const ADEncryptedSlice *s, ADMremapEncrypted fn,
                                    NSString **why)
 {
-    struct { const char *name; size_t addrOff, len; } variants[] = {
-        { "page-range",  0,     mapLen },
-        { "crypt-range", delta, mapLen > delta ? mapLen - delta : 0 },
-        { "crypt-exact", delta, s->cryptsize },
-        { "page-exact",  0,     s->cryptsize },
-        { "crypt-page",  delta, page },
+    // mapOff is where the mmap starts in the file; addrOff is the address
+    // passed to mremap; readOff is where the plaintext must be read from.
+    struct { const char *name; size_t mapOff, addrOff, len, readOff; } variants[] = {
+        { "page-range",         aligned, 0,     mapLen, delta },
+        { "crypt-range",        aligned, delta, mapLen > delta ? mapLen - delta : 0, delta },
+        { "crypt-exact",        aligned, delta, s->cryptsize, delta },
+        { "page-exact",         aligned, 0,     s->cryptsize, delta },
+        { "crypt-page",         aligned, delta, mapLen > delta + page ? page : 0, delta },
+        { "prefix-page-range",  0,       aligned, mapLen, start },
+        { "prefix-crypt-range", 0,       start, mapLen > delta ? mapLen - delta : 0, start },
+        { "prefix-crypt-exact", 0,       start, s->cryptsize, start },
     };
     uint32_t subtypes[2] = { s->cpusubtype, s->cpusubtype & ~(uint32_t)CPU_SUBTYPE_MASK };
     for (size_t i = 0; i < sizeof(variants) / sizeof(variants[0]); i++) {
-        if (!variants[i].len || variants[i].addrOff + variants[i].len > mapLen) continue;
-        void *map = mmap(NULL, mapLen, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, (off_t)aligned);
-        if (map == MAP_FAILED) map = mmap(NULL, mapLen, PROT_READ, MAP_PRIVATE, fd, (off_t)aligned);
+        size_t mapSize = variants[i].mapOff + mapLen;
+        if (!variants[i].len || variants[i].addrOff + variants[i].len > mapSize ||
+            variants[i].readOff + s->cryptsize > mapSize) continue;
+        void *map = mmap(NULL, mapSize, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, (off_t)variants[i].mapOff);
+        if (map == MAP_FAILED) map = mmap(NULL, mapSize, PROT_READ, MAP_PRIVATE, fd, (off_t)variants[i].mapOff);
         if (map == MAP_FAILED) {
             if (why) *why = [NSString stringWithFormat:@"mmap: %s", strerror(errno)];
             return NO;
@@ -291,28 +298,28 @@ static BOOL ad_try_mremap_variants(int fd, int out, uint64_t start, size_t page,
             r = fn((void *)(uintptr_t)addr, variants[i].len, s->cryptid, s->cputype, subtypes[v]);
             if (r != 0) e = errno;
         }
-        printf("[DECRYPT]   variant %s addr=+0x%zx len=0x%zx: %s\n",
-               variants[i].name, variants[i].addrOff, variants[i].len,
+        printf("[DECRYPT]   variant %s map+0x%zx addr+0x%zx len=0x%zx: %s\n",
+               variants[i].name, variants[i].mapOff, variants[i].addrOff, variants[i].len,
                r == 0 ? "ok" : strerror(e));
         if (r == 0) {
             // Only accept bytes that actually differ from the encrypted file.
             uint8_t enc[64], dec[64];
             size_t probe = MIN(sizeof(enc), (size_t)s->cryptsize);
             if (!ad_pread_all(fd, enc, probe, (off_t)start)) {
-                munmap(map, mapLen);
+                munmap(map, mapSize);
                 if (why) *why = @"reading the encrypted probe failed";
                 return NO;
             }
-            memcpy(dec, (const uint8_t *)map + delta, probe);
+            memcpy(dec, (const uint8_t *)map + variants[i].readOff, probe);
             if (memcmp(enc, dec, probe) != 0) {
-                BOOL wrote = ad_pwrite_all(out, (const uint8_t *)map + delta,
+                BOOL wrote = ad_pwrite_all(out, (const uint8_t *)map + variants[i].readOff,
                                            s->cryptsize, (off_t)start);
-                munmap(map, mapLen);
+                munmap(map, mapSize);
                 if (!wrote) { if (why) *why = @"writing the copy failed"; return NO; }
                 return YES;
             }
         }
-        munmap(map, mapLen);
+        munmap(map, mapSize);
     }
     if (why) *why = @"mremap_encrypted: no accepted mapping variant";
     return NO;

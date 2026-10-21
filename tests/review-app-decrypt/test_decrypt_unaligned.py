@@ -15,6 +15,8 @@ assert "ad_try_mremap_variants" in SOURCE
 assert "\"page-range\"" in SOURCE
 assert "\"crypt-range\"" in SOURCE
 assert "\"crypt-exact\"" in SOURCE
+assert "\"prefix-page-range\"" in SOURCE
+assert "\"prefix-crypt-range\"" in SOURCE
 assert "mremapEncrypted" in SOURCE
 assert "posix_spawn" not in SOURCE
 assert "task_for_pid" not in SOURCE
