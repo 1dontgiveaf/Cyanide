@@ -112,12 +112,26 @@ bool lara_upside_down_enable_in_session(void)
 
 static pid_t g_lara_overlay_pid = 0;   // SpringBoard pid the overlay was enabled in
 
-bool lara_debug_overlay_enable_in_session(void)
+// Our swap gives the overlay UIWindow's plain -init, which leaves it with a
+// zero frame (it showed up tiny): size it to the screen explicitly.
+static void lara_debug_overlay_size(uint64_t overlay, CGRect screenBounds)
+{
+    if (!r_is_objc_ptr(overlay) || CGRectIsEmpty(screenBounds)) return;
+    double rect[4] = { screenBounds.origin.x, screenBounds.origin.y,
+                       screenBounds.size.width, screenBounds.size.height };
+    r_msg2_main_raw(overlay, "setFrame:", rect, sizeof(rect), NULL, 0, NULL, 0, NULL, 0);
+}
+
+bool lara_debug_overlay_enable_in_session(CGRect screenBounds)
 {
     pid_t sbPid = (pid_t)remote_call_current_pid();
     if (sbPid > 0 && sbPid == g_lara_overlay_pid) {
+        // A second gesture recognizer would only double-fire; just resize.
+        uint64_t clsOverlay = r_class("UIDebuggingInformationOverlay");
+        if (r_is_objc_ptr(clsOverlay))
+            lara_debug_overlay_size(r_msg2_main(clsOverlay, "overlay", 0, 0, 0, 0), screenBounds);
         printf("[LARA] debug overlay already enabled in this SpringBoard\n");
-        return true;   // a second gesture recognizer would only double-fire
+        return true;
     }
 
     uint64_t clsOverlay = r_class("UIDebuggingInformationOverlay");
@@ -158,6 +172,7 @@ bool lara_debug_overlay_enable_in_session(void)
         return false;
     }
     r_msg2_main(overlay, "setWindowScene:", scene, 0, 0, 0);
+    lara_debug_overlay_size(overlay, screenBounds);
 
     uint64_t tap = r_msg2_main(clsTap, "alloc", 0, 0, 0, 0);
     tap = r_is_objc_ptr(tap)

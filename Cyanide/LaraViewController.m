@@ -200,7 +200,8 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             break;
         }
         case LaraToolDebugOverlay: {
-            [self runNamed:@"Enabling" work:^BOOL{ return lara_debug_overlay_enable_in_session(); }
+            CGRect screen = self.view.window.windowScene.screen.bounds;   // UIKit: read here, on main
+            [self runNamed:@"Enabling" work:^BOOL{ return lara_debug_overlay_enable_in_session(screen); }
                       done:^(BOOL ok) { if (ok) weakSelf.status = @"Enabled. Double-tap the status bar."; }];
             break;
         }
