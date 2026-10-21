@@ -6,8 +6,10 @@
 //  installed on this device, e.g. to inject a tweak into it and sideload it.
 //  Idea from lara by rooootdev; implemented differently: every Mach-O in the
 //  bundle (app, frameworks and app extensions) is decrypted with the kernel's
-//  own FairPlay pager through mremap_encrypted, without launching the app and
-//  without walking another process's memory.
+//  own FairPlay pager through mremap_encrypted. A range that isn't 16 KB
+//  aligned cannot use mremap_encrypted; that executable is started suspended,
+//  its already-decrypted pages are read from the task, and it is killed before
+//  it can run its UI.
 //
 //  Needs filesystem access (sandbox lifted). Blocking; run off-main.
 //

@@ -5,10 +5,11 @@
 //  Decrypted IPAs of installed App Store apps. Idea from lara by rooootdev
 //  (kexploit/decrypt.m); implemented differently: lara launches the app and
 //  walks its vm_map with kernel reads, and leaves app extensions encrypted.
-//  Here every Mach-O in the bundle is decrypted by mapping it into Cyanide and
-//  asking the kernel's FairPlay pager to decrypt that mapping
-//  (mremap_encrypted, as flexdecrypt does): no app launch, no RemoteCall into
-//  the app, no kernel memory walking -- and extensions work the same way.
+//  Here every Mach-O is decrypted by mapping it into Cyanide and asking the
+//  kernel's FairPlay pager to decrypt that mapping (mremap_encrypted, as
+//  flexdecrypt does). A range that isn't 16 KB aligned cannot use mremap;
+//  that executable is started suspended, its decrypted pages are read from
+//  the task, and it is killed before it can run its UI.
 //
 
 #import "app_decrypt.h"
@@ -21,6 +22,12 @@
 #import <mach-o/fat.h>
 #import <dlfcn.h>
 #import <fcntl.h>
+#import <spawn.h>
+#import <sys/wait.h>
+#import <mach/mach.h>
+#import <mach/task_info.h>
+#import <mach/thread_act.h>
+#import <mach/arm/thread_status.h>
 #import <sys/mman.h>
 #import <sys/stat.h>
 #import <unistd.h>
@@ -75,6 +82,7 @@ typedef struct {
     uint32_t cputype, cpusubtype;
     uint32_t cryptoff, cryptsize, cryptid;
     uint64_t cryptidFileOffset;   // where to write cryptid = 0
+    uint32_t filetype;            // MH_EXECUTE for apps/extensions
 } ADEncryptedSlice;
 
 static BOOL ad_pread_all(int fd, void *buf, size_t len, off_t off)
@@ -118,6 +126,7 @@ static BOOL ad_parse_slice(int fd, uint64_t off, uint64_t fileSize, ADEncryptedS
             out->sliceOffset = off;
             out->cputype = (uint32_t)mh.cputype;
             out->cpusubtype = (uint32_t)mh.cpusubtype;
+            out->filetype = (uint32_t)mh.filetype;
             out->cryptoff = e->cryptoff;
             out->cryptsize = e->cryptsize;
             out->cryptid = e->cryptid;
@@ -231,6 +240,143 @@ static BOOL ad_decrypt_range_in_springboard(NSString *src, NSString *dst, uint64
     return ok;
 }
 
+// Read a range from a freshly spawned (suspended) task.
+static BOOL ad_task_read(task_t task, uint64_t addr, void *buf, size_t len)
+{
+    vm_size_t got = 0;
+    kern_return_t kr = vm_read_overwrite(task, (vm_address_t)addr,
+        (vm_size_t)len, (vm_address_t)(uintptr_t)buf, &got);
+    return kr == KERN_SUCCESS && got == (vm_size_t)len;
+}
+
+// The main executable's Mach-O header in a suspended task. dyld's
+// all_image_infos is available once the process is mapped; the stack slot is
+// the fallback flexdecrypt uses.
+static uint64_t ad_task_main_header(task_t task)
+{
+    struct task_dyld_info tdi;
+    mach_msg_type_number_t tdiCount = TASK_DYLD_INFO_COUNT;
+    if (task_info(task, TASK_DYLD_INFO, (task_info_t)&tdi, &tdiCount) == KERN_SUCCESS &&
+        tdi.all_image_info_addr) {
+        struct {
+            uint32_t version;
+            uint32_t count;
+            uint64_t infoArray;
+        } ai = {0};
+        if (ad_task_read(task, tdi.all_image_info_addr, &ai, sizeof(ai)) &&
+            ai.infoArray && ai.count) {
+            uint64_t firstImage = 0;
+            if (ad_task_read(task, ai.infoArray, &firstImage, sizeof(firstImage)) &&
+                firstImage) return firstImage;
+        }
+    }
+    thread_act_array_t threads = NULL;
+    mach_msg_type_number_t threadCount = 0;
+    if (task_threads(task, &threads, &threadCount) != KERN_SUCCESS) return 0;
+    uint64_t header = 0;
+    if (threads && threadCount) {
+        arm_thread_state64_t state;
+        mach_msg_type_number_t stateCount = ARM_THREAD_STATE64_COUNT;
+        if (thread_get_state(threads[0], ARM_THREAD_STATE64,
+                             (thread_state_t)&state, &stateCount) == KERN_SUCCESS) {
+            uint64_t sp = (uint64_t)arm_thread_state64_get_sp(state);
+            uint64_t slots[4] = {0};
+            if (ad_task_read(task, sp, slots, sizeof(slots))) {
+                for (int i = 0; i < 4 && !header; i++) {
+                    uint32_t magic = 0;
+                    if (slots[i] && ad_task_read(task, slots[i], &magic, sizeof(magic)) &&
+                        (magic == MH_MAGIC_64 || magic == MH_MAGIC ||
+                         magic == FAT_MAGIC || magic == FAT_CIGAM ||
+                         magic == FAT_MAGIC_64 || magic == FAT_CIGAM_64))
+                        header = slots[i];
+                }
+            }
+        }
+    }
+    if (threads) {
+        for (mach_msg_type_number_t i = 0; i < threadCount; i++)
+            mach_port_deallocate(mach_task_self(), threads[i]);
+        vm_deallocate(mach_task_self(), (vm_address_t)threads,
+                      (vm_size_t)threadCount * sizeof(thread_act_t));
+    }
+    return header;
+}
+
+// For an executable whose encrypted range starts off a 16 KB boundary,
+// mremap_encrypted cannot work: mmap and mremap both require 16 KB alignment.
+// Flexdecrypt handles this case by launching the app suspended, letting the
+// kernel decrypt its pages, and reading the encrypted range back from the
+// task. We do the same locally; if the sandbox refuses task_for_pid, the
+// caller falls back to the existing SpringBoard path.
+static BOOL ad_decrypt_range_in_spawned_process(NSString *src, int out, uint64_t start,
+                                                const ADEncryptedSlice *s, NSString **why)
+{
+    if (s->filetype != MH_EXECUTE) {
+        *why = @"not a spawned executable";
+        return NO;
+    }
+    if (!s->cryptsize || s->cryptsize > 256u * 1024u * 1024u) {
+        *why = @"implausible encrypted size";
+        return NO;
+    }
+    const char *path = src.fileSystemRepresentation;
+    posix_spawnattr_t attr;
+    if (posix_spawnattr_init(&attr) != 0) { *why = @"posix_spawnattr_init failed"; return NO; }
+    sigset_t empty;
+    sigemptyset(&empty);
+    posix_spawnattr_setsigmask(&attr, &empty);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_START_SUSPENDED | POSIX_SPAWN_SETPGROUP);
+    extern char **environ;
+    char *argv[] = { (char *)path, NULL };
+    pid_t pid = 0;
+    int rc = posix_spawn(&pid, path, NULL, &attr, argv, environ);
+    posix_spawnattr_destroy(&attr);
+    if (rc != 0 || pid <= 0) {
+        *why = [NSString stringWithFormat:@"posix_spawn: %s", strerror(rc)];
+        return NO;
+    }
+    mach_port_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS || task == MACH_PORT_NULL) {
+        kill(pid, SIGKILL);
+        waitpid(pid, NULL, 0);
+        *why = [NSString stringWithFormat:@"task_for_pid: 0x%x", kr];
+        return NO;
+    }
+    uint64_t header = ad_task_main_header(task);
+    BOOL ok = NO;
+    void *buf = NULL;
+    if (!header) {
+        *why = @"no Mach-O header in the spawned task";
+    } else {
+        struct mach_header_64 mh;
+        if (!ad_task_read(task, header, &mh, sizeof(mh)) ||
+            mh.magic != MH_MAGIC_64) {
+            *why = @"spawned task header is not a thin 64-bit Mach-O";
+        } else if ((uint32_t)mh.cputype != s->cputype) {
+            *why = @"spawned task runs a different CPU slice";
+        } else {
+            buf = malloc(s->cryptsize);
+            if (!buf) {
+                *why = @"no memory for the decrypted range";
+            } else if (!ad_task_read(task, header + s->cryptoff, buf, s->cryptsize)) {
+                *why = @"reading the spawned task's encrypted range failed";
+            } else if (!ad_pwrite_all(out, buf, s->cryptsize, (off_t)start)) {
+                *why = @"writing the spawned task's plaintext failed";
+            } else {
+                printf("[DECRYPT]   spawn pid %d header 0x%llx read 0x%x bytes at 0x%llx: ok\n",
+                       pid, header, s->cryptsize, header + s->cryptoff);
+                ok = YES;
+            }
+        }
+    }
+    free(buf);
+    kill(pid, SIGKILL);
+    waitpid(pid, NULL, 0);
+    mach_port_deallocate(mach_task_self(), task);
+    return ok;
+}
+
 // Writes a copy of `src` with every encrypted slice decrypted and its cryptid
 // cleared to `dst`. *decrypted is NO when the file had nothing encrypted.
 static BOOL ad_decrypt_file(NSString *src, NSString *dst, BOOL useSpringBoard, BOOL *decrypted, NSString **errorOut)
@@ -274,34 +420,45 @@ static BOOL ad_decrypt_file(NSString *src, NSString *dst, BOOL useSpringBoard, B
         // Whole pages: on a 16 KB system the kernel rejects a partial last
         // page (a 4 KB range in an app extension failed with ENOMEM).
         size_t mapLen = ((delta + s.cryptsize) + page - 1) & ~(page - 1);
-        // 1) Here, in Cyanide.
+        // 1) Here, in Cyanide. If the range is not 16 KB aligned, mmap and
+        // mremap_encrypted cannot both be satisfied; for an executable, launch
+        // it suspended and read the decrypted range from its task instead
+        // (the fallback flexdecrypt uses for applications).
         NSString *localWhy = nil;
-        void *map = mmap(NULL, mapLen, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, (off_t)aligned);
-        if (map == MAP_FAILED) map = mmap(NULL, mapLen, PROT_READ, MAP_PRIVATE, fd, (off_t)aligned);
         BOOL localOK = NO;
-        if (map == MAP_FAILED) {
-            localWhy = [NSString stringWithFormat:@"mmap: %s", strerror(errno)];
-            map = NULL;
-        } else if (!mremapEncrypted) {
-            localWhy = @"no mremap_encrypted";
-        } else {
-            // Diagnostics for the device log: what the kernel is being asked.
-            printf("[DECRYPT] %s: cpu=0x%x/0x%x cryptid=%u slice=0x%llx cryptoff=0x%x (16K-aligned=%d) map=0x%llx+0x%zx\n",
-                   src.lastPathComponent.UTF8String, s.cputype, s.cpusubtype, s.cryptid, s.sliceOffset, s.cryptoff,
-                   (int)((start % page) == 0), aligned, mapLen);
-            uint32_t subtypes[2] = { s.cpusubtype, s.cpusubtype & ~(uint32_t)CPU_SUBTYPE_MASK };
-            int r = -1, e = 0;
-            for (int v = 0; v < 2 && r != 0; v++) {
-                if (v == 1 && subtypes[1] == subtypes[0]) break;
-                r = mremapEncrypted(map, mapLen, s.cryptid, s.cputype, subtypes[v]);
-                if (r != 0) e = errno;
-                printf("[DECRYPT]   local variant %d (subtype 0x%x): %s\n", v, subtypes[v], r == 0 ? "ok" : strerror(e));
-            }
-            if (r != 0) {
-                localWhy = [NSString stringWithFormat:@"mremap_encrypted: %s", strerror(e)];
+        if ((start % page) && s.filetype == MH_EXECUTE) {
+            NSString *spawnWhy = nil;
+            localOK = ad_decrypt_range_in_spawned_process(src, out, start, &s, &spawnWhy);
+            if (!localOK) localWhy = [@"spawn: " stringByAppendingString:spawnWhy ?: @"failed"];
+        }
+        void *map = NULL;
+        if (!localOK) {
+            map = mmap(NULL, mapLen, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, (off_t)aligned);
+            if (map == MAP_FAILED) map = mmap(NULL, mapLen, PROT_READ, MAP_PRIVATE, fd, (off_t)aligned);
+            if (map == MAP_FAILED) {
+                localWhy = [NSString stringWithFormat:@"mmap: %s", strerror(errno)];
+                map = NULL;
+            } else if (!mremapEncrypted) {
+                localWhy = @"no mremap_encrypted";
             } else {
-                localOK = ad_pwrite_all(out, (const uint8_t *)map + delta, s.cryptsize, (off_t)start);
-                if (!localOK) localWhy = @"writing the copy failed";
+                // Diagnostics for the device log: what the kernel is being asked.
+                printf("[DECRYPT] %s: cpu=0x%x/0x%x cryptid=%u slice=0x%llx cryptoff=0x%x (16K-aligned=%d) map=0x%llx+0x%zx\n",
+                       src.lastPathComponent.UTF8String, s.cputype, s.cpusubtype, s.cryptid, s.sliceOffset, s.cryptoff,
+                       (int)((start % page) == 0), aligned, mapLen);
+                uint32_t subtypes[2] = { s.cpusubtype, s.cpusubtype & ~(uint32_t)CPU_SUBTYPE_MASK };
+                int r = -1, e = 0;
+                for (int v = 0; v < 2 && r != 0; v++) {
+                    if (v == 1 && subtypes[1] == subtypes[0]) break;
+                    r = mremapEncrypted(map, mapLen, s.cryptid, s.cputype, subtypes[v]);
+                    if (r != 0) e = errno;
+                    printf("[DECRYPT]   local variant %d (subtype 0x%x): %s\n", v, subtypes[v], r == 0 ? "ok" : strerror(e));
+                }
+                if (r != 0) {
+                    localWhy = [NSString stringWithFormat:@"mremap_encrypted: %s", strerror(e)];
+                } else {
+                    localOK = ad_pwrite_all(out, (const uint8_t *)map + delta, s.cryptsize, (off_t)start);
+                    if (!localOK) localWhy = @"writing the copy failed";
+                }
             }
         }
         if (map) munmap(map, mapLen);
