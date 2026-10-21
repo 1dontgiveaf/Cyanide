@@ -4,10 +4,11 @@
 //
 //  Settings → Lara → App Decrypt: makes a decrypted IPA of an App Store app
 //  installed on this device, e.g. to inject a tweak into it and sideload it.
-//  Idea from lara by rooootdev; implemented differently: every Mach-O in the
-//  bundle (app, frameworks and app extensions) is decrypted with the kernel's
-//  own FairPlay pager through mremap_encrypted, without launching the app and
-//  without walking another process's memory.
+//  Idea from lara by rooootdev; implemented on Cyanide's own KRW. iOS 18
+//  refuses mremap_encrypted outside the app itself, so the app is started
+//  suspended in the background and its decrypted pages are read through the
+//  kernel from the FairPlay pager objects in its VM map. Encrypted app
+//  extensions aren't loaded by the app and are left out.
 //
 //  Needs filesystem access (sandbox lifted). Blocking; run off-main.
 //
