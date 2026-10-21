@@ -201,8 +201,17 @@ static BOOL ad_decrypt_range_in_springboard(NSString *src, NSString *dst, uint64
             *why = [NSString stringWithFormat:@"SpringBoard: mmap failed (%s)", strerror(ad_sb_errno())];
             break;
         }
-        int r = (int)r_dlsym_call(R_TIMEOUT, "mremap_encrypted", map, mapLen, s->cryptid, s->cputype, s->cpusubtype, 0, 0, 0);
-        if (r != 0) { *why = [NSString stringWithFormat:@"SpringBoard: mremap_encrypted failed (%s)", strerror(ad_sb_errno())]; break; }
+        // Same variants as in Cyanide: subtype as in the header, then without
+        // its capability bits.
+        uint32_t subtypes[2] = { s->cpusubtype, s->cpusubtype & ~(uint32_t)CPU_SUBTYPE_MASK };
+        int r = -1, e = 0;
+        for (int v = 0; v < 2 && r != 0; v++) {
+            if (v == 1 && subtypes[1] == subtypes[0]) break;
+            r = (int)r_dlsym_call(R_TIMEOUT, "mremap_encrypted", map, mapLen, s->cryptid, s->cputype, subtypes[v], 0, 0, 0);
+            if (r != 0) e = ad_sb_errno();
+            printf("[DECRYPT]   springboard variant %d (subtype 0x%x): %s\n", v, subtypes[v], r == 0 ? "ok" : strerror(e));
+        }
+        if (r != 0) { *why = [NSString stringWithFormat:@"SpringBoard: mremap_encrypted failed (%s)", strerror(e)]; break; }
         fdOut = (int)r_dlsym_call(R_TIMEOUT, "open", rdst, O_WRONLY | O_CLOEXEC, 0, 0, 0, 0, 0, 0);
         if (fdOut < 0) { *why = [NSString stringWithFormat:@"SpringBoard: can't write the copy (%s)", strerror(ad_sb_errno())]; break; }
         uint64_t done = 0, size = s->cryptsize;
@@ -275,11 +284,25 @@ static BOOL ad_decrypt_file(NSString *src, NSString *dst, BOOL useSpringBoard, B
             map = NULL;
         } else if (!mremapEncrypted) {
             localWhy = @"no mremap_encrypted";
-        } else if (mremapEncrypted(map, mapLen, s.cryptid, s.cputype, s.cpusubtype) != 0) {
-            localWhy = [NSString stringWithFormat:@"mremap_encrypted: %s", strerror(errno)];
         } else {
-            localOK = ad_pwrite_all(out, (const uint8_t *)map + delta, s.cryptsize, (off_t)start);
-            if (!localOK) localWhy = @"writing the copy failed";
+            // Diagnostics for the device log: what the kernel is being asked.
+            printf("[DECRYPT] %s: cpu=0x%x/0x%x cryptid=%u slice=0x%llx cryptoff=0x%x (16K-aligned=%d) map=0x%llx+0x%zx\n",
+                   src.lastPathComponent.UTF8String, s.cputype, s.cpusubtype, s.cryptid, s.sliceOffset, s.cryptoff,
+                   (int)((start % page) == 0), aligned, mapLen);
+            uint32_t subtypes[2] = { s.cpusubtype, s.cpusubtype & ~(uint32_t)CPU_SUBTYPE_MASK };
+            int r = -1, e = 0;
+            for (int v = 0; v < 2 && r != 0; v++) {
+                if (v == 1 && subtypes[1] == subtypes[0]) break;
+                r = mremapEncrypted(map, mapLen, s.cryptid, s.cputype, subtypes[v]);
+                if (r != 0) e = errno;
+                printf("[DECRYPT]   local variant %d (subtype 0x%x): %s\n", v, subtypes[v], r == 0 ? "ok" : strerror(e));
+            }
+            if (r != 0) {
+                localWhy = [NSString stringWithFormat:@"mremap_encrypted: %s", strerror(e)];
+            } else {
+                localOK = ad_pwrite_all(out, (const uint8_t *)map + delta, s.cryptsize, (off_t)start);
+                if (!localOK) localWhy = @"writing the copy failed";
+            }
         }
         if (map) munmap(map, mapLen);
         printf("[DECRYPT] %s: off=0x%llx size=0x%x delta=0x%zx local=%s\n", src.lastPathComponent.UTF8String,
