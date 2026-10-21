@@ -10,6 +10,8 @@
 #import "LaraViewController.h"
 #import "SettingsViewController.h"
 #import "tweaks/lara_tools.h"
+#import "tweaks/app_decrypt.h"
+#import "FileBrowserViewController.h"
 #import <errno.h>
 #import <PhotosUI/PhotosUI.h>
 
@@ -49,6 +51,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             case LaraToolJIT:            self.title = @"JIT Enabler"; break;
             case LaraToolAppLimit:       self.title = @"3-App Limit"; break;
             case LaraToolCards:          self.title = @"Wallet Card Art"; break;
+            case LaraToolDecrypt:        self.title = @"App Decrypt"; break;
         }
     }
     return self;
@@ -59,7 +62,8 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
     [super viewDidLoad];
     self.navigationItem.largeTitleDisplayMode = UINavigationItemLargeTitleDisplayModeNever;
     if (self.tool == LaraToolPerformanceHUD || self.tool == LaraToolHiddenSettings) [self readState];
-    if (self.tool == LaraToolJIT || self.tool == LaraToolAppLimit || self.tool == LaraToolCards) [self listJITApps];
+    if (self.tool == LaraToolJIT || self.tool == LaraToolAppLimit || self.tool == LaraToolCards ||
+        self.tool == LaraToolDecrypt) [self listJITApps];
 }
 
 // Apps signed with get-task-allow; needs the filesystem sandbox lifted.
@@ -81,9 +85,10 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             if (needsRun) settings_tool_needs_exploit(me, me.tableView, @"JIT Enabler", ^{ [weakSelf listJITApps]; });
             return;
         }
-        BOOL limit = me.tool == LaraToolAppLimit, cards = me.tool == LaraToolCards;
+        BOOL limit = me.tool == LaraToolAppLimit, cards = me.tool == LaraToolCards, decrypt = me.tool == LaraToolDecrypt;
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-            NSArray *apps = cards ? lara_wallet_cards() : limit ? lara_sideloaded_apps() : lara_jit_candidate_apps();
+            NSArray *apps = decrypt ? app_decrypt_store_apps() : cards ? lara_wallet_cards()
+                          : limit ? lara_sideloaded_apps() : lara_jit_candidate_apps();
             dispatch_async(dispatch_get_main_queue(), ^{
                 typeof(self) me2 = weakSelf;
                 if (!me2) return;
@@ -92,6 +97,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
                 // Keep a result message set while the list reloaded.
                 BOOL placeholder = [me2.status isEqualToString:@"Looking for apps…"];
                 me2.status = apps.count ? (placeholder ? nil : me2.status)
+                    : decrypt ? @"No App Store apps found."
                     : cards ? @"No cards found in Wallet."
                     : limit ? @"No sideloaded apps found."
                     : @"No app here can get JIT. It only works for apps installed with a development profile (get-task-allow), e.g. sideloaded with a developer certificate.";
@@ -156,7 +162,8 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView
 {
-    return self.tool == LaraToolAppLimit ? 2 : 1;   // app limit: action, then the apps
+    // App limit: action, then the apps. Decrypt: finished IPAs, then the apps.
+    return (self.tool == LaraToolAppLimit || self.tool == LaraToolDecrypt) ? 2 : 1;
 }
 
 - (NSUInteger)markedAppCount
@@ -169,6 +176,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
 {
     if (self.tool == LaraToolAppLimit) return section == 0 ? (self.jitApps ? 1 : 0) : (NSInteger)self.jitApps.count;
+    if (self.tool == LaraToolDecrypt) return section == 0 ? 1 : (NSInteger)self.jitApps.count;
     switch (self.tool) {
         case LaraToolPerformanceHUD: return kLaraHUDModeCount;
         case LaraToolDebugOverlay:
@@ -181,14 +189,17 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
         case LaraToolJIT: return (NSInteger)self.jitApps.count;
         case LaraToolAppLimit: return 0;
         case LaraToolCards: return (NSInteger)self.jitApps.count;
+        case LaraToolDecrypt: return 0;
     }
     return 0;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section
 {
-    if (self.tool != LaraToolAppLimit || section != 1 || !self.jitApps.count) return nil;
-    return @"Sideloaded Apps";
+    if (section != 1 || !self.jitApps.count) return nil;
+    if (self.tool == LaraToolAppLimit) return @"Sideloaded Apps";
+    if (self.tool == LaraToolDecrypt) return @"App Store Apps";
+    return nil;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section
@@ -207,6 +218,9 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             break;
         case LaraToolHiddenSettings:
             about = @"Hidden iOS preferences. Most take effect after a respring and stay until you turn them off.";
+            break;
+        case LaraToolDecrypt:
+            about = @"Makes a decrypted IPA of an App Store app on this device, e.g. to inject a tweak into it and sideload it. The app, its frameworks and extensions are decrypted by iOS itself; the app isn't opened. IPAs stay on this device (Documents/Decrypted) until you share them. Use it only for apps you own; removing copy protection may be restricted where you live.";
             break;
         case LaraToolCards:
             about = @"Replace the picture of a card in Wallet with your own (cosmetic only). The original is backed up and can be restored. Respring or reopen Wallet to see the change.";
@@ -259,6 +273,28 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             [sw addTarget:self action:@selector(prefSwitched:) forControlEvents:UIControlEventValueChanged];
             cell.accessoryView = sw;
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            break;
+        }
+        case LaraToolDecrypt: {
+            if (indexPath.section == 0) {
+                NSUInteger n = 0;
+                for (NSString *f in [NSFileManager.defaultManager contentsOfDirectoryAtPath:app_decrypt_output_dir() error:nil])
+                    if ([f.pathExtension isEqualToString:@"ipa"]) n++;
+                c.text = @"Decrypted IPAs";
+                c.secondaryText = n ? [NSString stringWithFormat:@"%lu IPA%@ — open to share or delete", (unsigned long)n, n == 1 ? @"" : @"s"]
+                                    : @"None yet";
+                c.secondaryTextProperties.color = UIColor.secondaryLabelColor;
+                c.image = [UIImage systemImageNamed:@"shippingbox.fill"];
+                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+                break;
+            }
+            NSDictionary *app = self.jitApps[indexPath.row];
+            c.text = app[@"name"];
+            c.secondaryText = [NSString stringWithFormat:@"%@ · %@", app[@"bundleID"], app[@"version"]];
+            c.secondaryTextProperties.color = UIColor.secondaryLabelColor;
+            c.image = app[@"icon"] ?: [UIImage systemImageNamed:@"app.dashed"];
+            c.imageProperties.maximumSize = CGSizeMake(36, 36);
+            c.imageProperties.cornerRadius = 8;
             break;
         }
         case LaraToolCards: {
@@ -336,6 +372,14 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
         case LaraToolCards:
             [self cardTapped:self.jitApps[indexPath.row] at:indexPath];
             break;
+        case LaraToolDecrypt:
+            if (indexPath.section == 0) {
+                [self.navigationController pushViewController:[[FileBrowserViewController alloc] initWithPath:app_decrypt_output_dir()]
+                                                     animated:YES];
+            } else {
+                [self confirmDecrypt:self.jitApps[indexPath.row]];
+            }
+            break;
         case LaraToolJIT: {
             NSDictionary *app = self.jitApps[indexPath.row];
             NSString *bid = app[@"bundleID"], *name = app[@"name"];
@@ -351,6 +395,60 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             break;
         }
     }
+}
+
+#pragma mark App decrypt
+
+- (void)confirmDecrypt:(NSDictionary *)app
+{
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"Decrypt %@?", app[@"name"]]
+        message:@"Makes a decrypted IPA of this app for your own use (e.g. tweak injection and sideloading). It can take a while for large apps; keep Cyanide open."
+        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) weakSelf = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"Decrypt" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        [weakSelf decrypt:app];
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)decrypt:(NSDictionary *)app
+{
+    if (self.busy) return;
+    self.busy = YES;
+    self.status = [NSString stringWithFormat:@"Decrypting %@…", app[@"name"]];
+    [self.tableView reloadData];
+    // A large app takes a while: keep going for a bit if Cyanide is backgrounded.
+    __block UIBackgroundTaskIdentifier bg = [UIApplication.sharedApplication beginBackgroundTaskWithName:@"Decrypt" expirationHandler:^{
+        [UIApplication.sharedApplication endBackgroundTask:bg];
+        bg = UIBackgroundTaskInvalid;
+    }];
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        __block CFAbsoluteTime lastUI = 0;
+        NSString *error = nil;
+        NSString *ipa = app_decrypt_make_ipa(app, ^(NSString *step, double fraction) {
+            CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+            if (now - lastUI < 0.25 && fraction < 1) return;   // don't flood the main queue
+            lastUI = now;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                weakSelf.status = [NSString stringWithFormat:@"%@ — %.0f %%", step, fraction * 100];
+                [weakSelf.tableView reloadData];
+            });
+        }, &error);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (bg != UIBackgroundTaskInvalid) { [UIApplication.sharedApplication endBackgroundTask:bg]; bg = UIBackgroundTaskInvalid; }
+            typeof(self) me = weakSelf;
+            if (!me) return;
+            me.busy = NO;
+            me.status = ipa ? [NSString stringWithFormat:@"Saved %@.", ipa.lastPathComponent] : (error ?: @"Decryption failed. Check the log.");
+            [me.tableView reloadData];
+            if (ipa && me.view.window) {
+                UITableViewCell *cell = [me.tableView cellForRowAtIndexPath:[NSIndexPath indexPathForRow:0 inSection:0]];
+                filebrowser_share_file(me, ipa, NO, nil, cell, nil);
+            }
+        });
+    });
 }
 
 #pragma mark Wallet card art
