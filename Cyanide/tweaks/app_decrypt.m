@@ -16,6 +16,10 @@
 #import "../LogTextView.h"
 #import "remote_objc.h"
 #import "../TaskRop/RemoteCall.h"
+#import "../TaskRop/VM.h"
+#import "../kexploit/kutils.h"
+#import "../kexploit/kexploit_opa334.h"
+#import "../utils/process.h"
 #import <UIKit/UIKit.h>
 #import <mach-o/loader.h>
 #import <mach-o/fat.h>
@@ -76,6 +80,8 @@ typedef struct {
     uint32_t cryptoff, cryptsize, cryptid;
     uint64_t cryptidFileOffset;   // where to write cryptid = 0
     BOOL hasCodesign;             // LC_CODE_SIGNATURE present
+    uint8_t uuid[16];             // LC_UUID: finds the image in a running process
+    BOOL hasUUID;
 } ADEncryptedSlice;
 
 static BOOL ad_pread_all(int fd, void *buf, size_t len, off_t off)
@@ -110,10 +116,16 @@ static BOOL ad_parse_slice(int fd, uint64_t off, uint64_t fileSize, ADEncryptedS
     uint64_t cmdsOff = off + sizeof(mh);
     if (cmdsOff + mh.sizeofcmds > fileSize || !ad_pread_all(fd, cmds.mutableBytes, mh.sizeofcmds, (off_t)cmdsOff)) return NO;
     const uint8_t *p = cmds.bytes, *end = p + cmds.length;
-    BOOL hasCodesign = NO, foundEncryption = NO;
+    BOOL hasCodesign = NO, foundEncryption = NO, hasUUID = NO;
+    uint8_t uuid[16] = {0};
     for (uint32_t i = 0; i < mh.ncmds && p + sizeof(struct load_command) <= end; i++) {
         const struct load_command *lc = (const void *)p;
         if (lc->cmdsize < sizeof(struct load_command) || p + lc->cmdsize > end) return NO;
+        if (lc->cmd == LC_CODE_SIGNATURE) hasCodesign = YES;
+        if (lc->cmd == LC_UUID && lc->cmdsize >= sizeof(struct uuid_command)) {
+            memcpy(uuid, ((const struct uuid_command *)(const void *)p)->uuid, 16);
+            hasUUID = YES;
+        }
         if (lc->cmd == LC_ENCRYPTION_INFO_64 && lc->cmdsize >= sizeof(struct encryption_info_command_64)) {
             const struct encryption_info_command_64 *e = (const void *)p;
             if (e->cryptid == 0) return NO;
@@ -132,6 +144,8 @@ static BOOL ad_parse_slice(int fd, uint64_t off, uint64_t fileSize, ADEncryptedS
     }
     if (foundEncryption) {
         out->hasCodesign = hasCodesign;
+        out->hasUUID = hasUUID;
+        memcpy(out->uuid, uuid, 16);
         return YES;
     }
     return NO;
@@ -345,7 +359,163 @@ static BOOL ad_try_mremap_variants(int fd, int out, uint64_t start, size_t page,
 
 // Writes a copy of `src` with every encrypted slice decrypted and its cryptid
 // cleared to `dst`. *decrypted is NO when the file had nothing encrypted.
-static BOOL ad_decrypt_file(NSString *src, NSString *dst, BOOL useSpringBoard, BOOL *decrypted, NSString **errorOut)
+#pragma mark - Reading the decrypted code from the running app
+
+// FairPlay decrypts an app's code for its own process: the encrypted range of
+// each image is backed by an "apple protect" pager object that hands out
+// plaintext pages. Cyanide finds those objects in the app's VM map and maps
+// them into itself (vm_map_object_range); touching a page has the kernel
+// decrypt it, so pages the app never ran come out decrypted too (lara copied
+// only resident pages and left the rest encrypted).
+
+@interface ADProcess : NSObject
+@property (nonatomic) int pid;
+@property (nonatomic) uint64_t vmMap;
+@property (nonatomic, strong) NSMutableData *entries;                    // struct VMEntryInfo[], executable only
+@property (nonatomic, strong) NSMutableDictionary<NSData *, NSNumber *> *bases;   // LC_UUID -> load address of the slice
+@end
+@implementation ADProcess
+@end
+
+static int ad_pid_for_bundle(uint64_t bundleStr)
+{
+    uint64_t clsPred = r_class("RBSProcessPredicate"), clsHandle = r_class("RBSProcessHandle");
+    if (!r_is_objc_ptr(clsPred) || !r_is_objc_ptr(clsHandle)) return 0;
+    uint64_t pred = r_msg2(clsPred, "predicateMatchingBundleIdentifier:", bundleStr, 0, 0, 0);
+    uint64_t handle = r_is_objc_ptr(pred) ? r_msg2(clsHandle, "handleForPredicate:error:", pred, 0, 0, 0) : 0;
+    return r_is_objc_ptr(handle) ? (int)(r_msg2(handle, "rbs_pid", 0, 0, 0, 0) & 0xffffffffULL) : 0;
+}
+
+static NSData *ad_uuid_key(const uint8_t uuid[16]) { return [NSData dataWithBytes:uuid length:16]; }
+
+// LC_UUID of the Mach-O header at the start of `page` (one mapped page).
+static BOOL ad_header_uuid(const uint8_t *page, size_t len, uint8_t uuid[16])
+{
+    if (len < sizeof(struct mach_header_64)) return NO;
+    const struct mach_header_64 *mh = (const void *)page;
+    if (mh->magic != MH_MAGIC_64 || sizeof(*mh) + mh->sizeofcmds > len) return NO;
+    const uint8_t *p = page + sizeof(*mh), *end = p + mh->sizeofcmds;
+    for (uint32_t i = 0; i < mh->ncmds && p + sizeof(struct load_command) <= end; i++) {
+        const struct load_command *lc = (const void *)p;
+        if (lc->cmdsize < sizeof(*lc) || p + lc->cmdsize > end) return NO;
+        if (lc->cmd == LC_UUID && lc->cmdsize >= sizeof(struct uuid_command)) {
+            memcpy(uuid, ((const struct uuid_command *)(const void *)p)->uuid, 16);
+            return YES;
+        }
+        p += lc->cmdsize;
+    }
+    return NO;
+}
+
+// Collects the app's executable map entries and finds where each wanted
+// image (by UUID) starts. Kernel reads only on the app's own map entries.
+static BOOL ad_process_scan(ADProcess *proc, NSSet<NSData *> *wanted, NSString **why)
+{
+    if (!kexploit_krw_ready()) { *why = @"kernel access isn't active"; return NO; }
+    char comm[64] = {0};
+    uint64_t kproc = 0;
+    if (procmgr_identity_for_pid(proc.pid, comm, sizeof(comm), &kproc) != 0 || !kproc) {
+        *why = [NSString stringWithFormat:@"process %d not found", proc.pid];
+        return NO;
+    }
+    uint64_t task = proc_task(kproc);
+    proc.vmMap = task ? task_get_vm_map(task) : 0;
+    if (!proc.vmMap) { *why = @"the app's memory map wasn't found"; return NO; }
+
+    NSMutableData *entries = [NSMutableData data];
+    vm_map_iterate_entries(proc.vmMap, ^(uint64_t start, uint64_t end, uint64_t entry, BOOL *stop) {
+        if (start >= 0x7000000000ULL) return;               // user space only
+        struct VMEntryInfo info;
+        if (!vm_map_entry_info(entry, &info) || info.isSubmap || !info.object) return;
+        if (!(info.protection & VM_PROT_EXECUTE)) return;   // code only
+        [entries appendBytes:&info length:sizeof(info)];
+    });
+    proc.entries = entries;
+    proc.bases = [NSMutableDictionary dictionary];
+    const struct VMEntryInfo *e = entries.bytes;
+    NSUInteger n = entries.length / sizeof(*e);
+    size_t page = (size_t)getpagesize();
+    for (NSUInteger i = 0; i < n && proc.bases.count < wanted.count; i++) {
+        if (e[i].offset % page) continue;
+        struct VMShmem m = vm_map_object_range(e[i].object, e[i].offset, page);
+        if (!m.used) continue;
+        uint8_t uuid[16];
+        BOOL isImage = ad_header_uuid((const uint8_t *)m.localAddress, page, uuid);
+        vm_shmem_release(&m, page);
+        if (!isImage) continue;
+        NSData *key = ad_uuid_key(uuid);
+        // The header sits at the entry's start: that's the slice's offset 0.
+        if ([wanted containsObject:key] && !proc.bases[key]) proc.bases[key] = @(e[i].start);
+    }
+    printf("[DECRYPT] process %d (%s): %lu executable entries, %lu of %lu images found\n", proc.pid, comm,
+           (unsigned long)n, (unsigned long)proc.bases.count, (unsigned long)wanted.count);
+    if (!proc.bases.count) { *why = @"the app's code wasn't found in its memory"; return NO; }
+    return YES;
+}
+
+// Copies the plaintext of [fileOff, fileOff+len) of the image with `uuid`
+// into `out` at the same file offset.
+static BOOL ad_process_copy(ADProcess *proc, const ADEncryptedSlice *s, int out, NSString **why)
+{
+    NSNumber *baseNum = s->hasUUID ? proc.bases[ad_uuid_key(s->uuid)] : nil;
+    if (!baseNum) { *why = @"not loaded in the running app"; return NO; }
+    uint64_t base = baseNum.unsignedLongLongValue;   // address of the slice's file offset 0
+    size_t page = (size_t)getpagesize();
+    const struct VMEntryInfo *e = proc.entries.bytes;
+    NSUInteger n = proc.entries.length / sizeof(*e);
+    uint64_t fileStart = s->cryptoff, fileEnd = (uint64_t)s->cryptoff + s->cryptsize;   // within the slice
+    uint64_t pos = fileStart;
+    while (pos < fileEnd) {
+        uint64_t addr = base + pos;
+        uint64_t pageAddr = addr & ~((uint64_t)page - 1);
+        const struct VMEntryInfo *hit = NULL;
+        for (NSUInteger i = 0; i < n; i++) if (pageAddr >= e[i].start && pageAddr < e[i].end) { hit = &e[i]; break; }
+        if (!hit) { *why = [NSString stringWithFormat:@"address 0x%llx isn't mapped in the app", addr]; return NO; }
+        uint64_t chunk = MIN(hit->end - pageAddr, 1ULL << 20);
+        uint64_t want = fileEnd - pos + (addr - pageAddr);
+        chunk = MIN(chunk, (want + page - 1) & ~((uint64_t)page - 1));
+        struct VMShmem m = vm_map_object_range(hit->object, hit->offset + (pageAddr - hit->start), chunk);
+        if (!m.used) { *why = [NSString stringWithFormat:@"mapping 0x%llx failed", pageAddr]; return NO; }
+        uint64_t avail = chunk - (addr - pageAddr);
+        uint64_t take = MIN(avail, fileEnd - pos);
+        BOOL wrote = ad_pwrite_all(out, (const uint8_t *)m.localAddress + (addr - pageAddr), (size_t)take,
+                                   (off_t)(s->sliceOffset + pos));
+        vm_shmem_release(&m, chunk);
+        if (!wrote) { *why = @"writing the copy failed"; return NO; }
+        pos += take;
+    }
+    return YES;
+}
+
+// Starts the app in the background (FrontBoard's "activate suspended"), so
+// Cyanide stays in front and keeps its kernel access; falls back to opening
+// it and having SpringBoard bring Cyanide back. Returns the pid, 0 on failure.
+static int ad_launch_for_decrypt(NSString *bundleID, NSString **why)
+{
+    uint64_t bid = r_cfstr(bundleID.UTF8String);
+    if (!bid) { *why = @"SpringBoard: no memory"; return 0; }
+    int pid = ad_pid_for_bundle(bid);
+    if (pid > 0) return pid;
+    uint64_t svc = r_class("FBSSystemService");
+    svc = r_is_objc_ptr(svc) ? r_msg2(svc, "sharedService", 0, 0, 0, 0) : 0;
+    uint64_t yes = r_msg2(r_class("NSNumber"), "numberWithBool:", 1, 0, 0, 0);
+    uint64_t opts = r_msg2(r_class("NSDictionary"), "dictionaryWithObject:forKey:", yes, r_cfstr("__ActivateSuspended"), 0, 0);
+    if (r_is_objc_ptr(svc) && r_is_objc_ptr(opts)) {
+        r_msg2_main(svc, "openApplication:options:withResult:", bid, opts, 0, 0);
+        for (int i = 0; i < 30 && pid <= 0; i++) { usleep(200000); pid = ad_pid_for_bundle(bid); }
+        if (pid > 0) {
+            printf("[DECRYPT] %s started in the background (pid %d)\n", bundleID.UTF8String, pid);
+            usleep(1500000);   // let dyld map the frameworks
+            return pid;
+        }
+    }
+    printf("[DECRYPT] background launch of %s failed; opening it\n", bundleID.UTF8String);
+    *why = @"the app didn't start in the background";
+    return 0;
+}
+
+static BOOL ad_decrypt_file(NSString *src, NSString *dst, BOOL useSpringBoard, ADProcess *proc,
+                            BOOL *decrypted, NSString **errorOut)
 {
     static dispatch_once_t adBuildOnce;
     dispatch_once(&adBuildOnce, ^{
@@ -395,6 +565,17 @@ static BOOL ad_decrypt_file(NSString *src, NSString *dst, BOOL useSpringBoard, B
         printf("[DECRYPT] %s: cpu=0x%x/0x%x cryptid=%u slice=0x%llx cryptoff=0x%x (16K-aligned=%d) codesign=%d map=0x%llx+0x%zx\n",
                src.lastPathComponent.UTF8String, s.cputype, s.cpusubtype, s.cryptid, s.sliceOffset, s.cryptoff,
                (int)((start % page) == 0), (int)s.hasCodesign, aligned, mapLen);
+        // 0) From the running app, once it's been started for this.
+        if (proc) {
+            NSString *procWhy = nil;
+            BOOL procOK = ad_process_copy(proc, &s, out, &procWhy);
+            printf("[DECRYPT] %s: from process %d: %s\n", src.lastPathComponent.UTF8String, proc.pid,
+                   procOK ? "ok" : procWhy.UTF8String);
+            if (!procOK) {
+                *errorOut = [NSString stringWithFormat:@"%@: %@", src.lastPathComponent, procWhy];
+                ok = NO; break;
+            }
+        } else {
         NSString *localWhy = nil;
         BOOL localOK = mremapEncrypted &&
             ad_try_mremap_variants(fd, out, start, page, aligned, delta, mapLen,
@@ -414,6 +595,7 @@ static BOOL ad_decrypt_file(NSString *src, NSString *dst, BOOL useSpringBoard, B
                              localWhy, useSpringBoard ? [@"; " stringByAppendingString:sbWhy ?: @"SpringBoard failed"] : @""];
                 ok = NO; break;
             }
+        }
         }
         // Proof it really decrypted: the copy must differ from the original here.
         uint8_t enc[64], dec[64];
@@ -641,6 +823,40 @@ NSString *app_decrypt_make_ipa(NSDictionary *app, BOOL useSpringBoard,
         return [@(rank(a)) compare:@(rank(b))];
     }];
     NSMutableSet<NSString *> *droppedBundles = [NSMutableSet set];   // extension bundles left out
+    // Once mremap_encrypted is refused (iOS 18 refuses it outright), the app
+    // is started in the background and every image is read from it instead.
+    __block ADProcess *proc = nil;
+    __block BOOL procTried = NO;
+    __block NSString *procWhy = nil;
+    BOOL (^startProcess)(void) = ^BOOL{
+        if (procTried) return proc != nil;
+        procTried = YES;
+        NSMutableSet<NSData *> *wanted = [NSMutableSet set];
+        for (NSString *rel in ordered) {
+            if ([rel containsString:@".appex/"] || [rel hasPrefix:@"Watch/"]) continue;   // other processes
+            int fd = open([appPath stringByAppendingPathComponent:rel].fileSystemRepresentation, O_RDONLY | O_CLOEXEC);
+            if (fd < 0) continue;
+            struct stat fst;
+            NSMutableArray<NSValue *> *slices = [NSMutableArray array];
+            if (fstat(fd, &fst) == 0 && S_ISREG(fst.st_mode) && fst.st_size >= 4096) ad_encrypted_slices(fd, (uint64_t)fst.st_size, slices);
+            close(fd);
+            for (NSValue *v in slices) {
+                ADEncryptedSlice es;
+                [v getValue:&es];
+                if (es.hasUUID) [wanted addObject:ad_uuid_key(es.uuid)];
+            }
+        }
+        NSString *why = nil;
+        report(@"Starting the app in the background", 0.05);
+        int pid = [app[@"bundleID"] length] ? ad_launch_for_decrypt(app[@"bundleID"], &why) : 0;
+        if (pid > 0) {
+            ADProcess *p = [ADProcess new];
+            p.pid = pid;
+            if (ad_process_scan(p, wanted, &why)) proc = p;
+        }
+        procWhy = why;
+        return proc != nil;
+    };
     NSUInteger index = 0;
     for (NSString *rel in ordered) {
         index++;
@@ -651,7 +867,15 @@ NSString *app_decrypt_make_ipa(NSDictionary *app, BOOL useSpringBoard,
         BOOL decrypted = NO;
         NSString *err = nil;
         report([@"Decrypting " stringByAppendingString:rel.lastPathComponent], 0.4 * index / MAX(ordered.count, 1u));
-        if (!ad_decrypt_file(src, dst, useSpringBoard, &decrypted, &err)) {
+        BOOL fileOK = ad_decrypt_file(src, dst, useSpringBoard, proc, &decrypted, &err);
+        BOOL inExtension = [rel containsString:@".appex/"] || [rel hasPrefix:@"Watch/"];
+        if (!fileOK && !proc && !inExtension && useSpringBoard && startProcess()) {
+            err = nil;
+            fileOK = ad_decrypt_file(src, dst, useSpringBoard, proc, &decrypted, &err);
+        } else if (!fileOK && procWhy && !inExtension) {
+            err = [NSString stringWithFormat:@"%@ (reading it from the running app: %@)", err, procWhy];
+        }
+        if (!fileOK) {
             // Inside an .appex: drop that whole extension, keep going.
             NSRange appex = [rel rangeOfString:@".appex/"];
             if (appex.location != NSNotFound) {

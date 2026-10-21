@@ -163,7 +163,15 @@ struct VMObject vm_get_object(uint64_t map, uint64_t address)
 }
  
 
+static struct VMShmem vm_create_shmem_with_object_len(struct VMObject *object, uint64_t len);
+
 struct VMShmem vm_create_shmem_with_object(struct VMObject *object)
+{
+    return vm_create_shmem_with_object_len(object, PAGE_SIZE);
+}
+
+// As above, for `len` bytes (a page multiple) instead of one page.
+static struct VMShmem vm_create_shmem_with_object_len(struct VMObject *object, uint64_t len)
 {
     struct VMShmem shmem = {0};
     if (!object || !is_kaddr_valid(object->address)) {
@@ -183,7 +191,7 @@ struct VMShmem vm_create_shmem_with_object(struct VMObject *object)
     // page of the dyld shared cache ask for an 8 GB local allocation, which
     // cannot be satisfied; that is why the launchd persistence anchor failed
     // every time on iOS 17 while SpringBoard, whose objects are small, worked.
-    uint64_t roundedSize = mach_vm_round_page(object->entryOffset + PAGE_SIZE);
+    uint64_t roundedSize = mach_vm_round_page(object->entryOffset + len);
     if (objectSize && roundedSize > objectSize) roundedSize = objectSize;
  
     mach_vm_address_t localAddr = 0;
@@ -305,7 +313,7 @@ struct VMShmem vm_create_shmem_with_object(struct VMObject *object)
     vm_prot_t curProt = VM_PROT_ALL | VM_PROT_IS_MASK;
     vm_prot_t maxProt = VM_PROT_ALL | VM_PROT_IS_MASK;
  
-    ret = mach_vm_map(mach_task_self_, &mappedAddr, PAGE_SIZE, 0,
+    ret = mach_vm_map(mach_task_self_, &mappedAddr, len, 0,
                        VM_FLAGS_ANYWHERE, memoryObject,
                        (memory_object_offset_t)object->entryOffset,
                        FALSE, curProt, maxProt, VM_INHERIT_NONE);
@@ -338,3 +346,46 @@ struct VMShmem vm_map_remote_page(uint64_t vmMap, uint64_t address)
  
     return vm_create_shmem_with_object(&vmObject);
 }
+
+// Entry facts for walking another task's map without re-searching it per
+// page (vm_map_remote_page looks the address up from the first entry every
+// time). NO when the entry can't be read.
+bool vm_map_entry_info(uint64_t entryAddr, struct VMEntryInfo *out)
+{
+    if (!out || !is_kaddr_valid(entryAddr)) return false;
+    struct vm_map_entry entry = {0};
+    uint64_t errorsBefore = krw_op_error_count();
+    kreadbuf(entryAddr, &entry, sizeof(entry));
+    if (krw_op_error_count() != errorsBefore) return false;
+    struct VmPackingParams params = {0};
+    params.vmpp_base  = VM_MIN_KERNEL_ADDRESS;
+    params.vmpp_bits  = VM_PAGE_PACKED_PTR_BITS;
+    params.vmpp_shift = VM_PAGE_PACKED_PTR_SHIFT;
+    params.vmpp_base_relative = VM_PACKING_IS_BASE_RELATIVE(&params) ? 1 : 0;
+    out->start = entry.links.start;
+    out->end = entry.links.end;
+    out->isSubmap = entry.is_sub_map;
+    out->protection = (uint32_t)entry.protection;
+    out->offset = VME_OFFSET(entry.vme_offset);
+    out->object = entry.is_sub_map ? 0 : vm_unpack_pointer((uint64_t)entry.vme_object_or_delta, &params);
+    if (out->object && !is_kaddr_valid(out->object)) out->object = 0;
+    return true;
+}
+
+struct VMShmem vm_map_object_range(uint64_t object, uint64_t objectOffset, uint64_t len)
+{
+    // Absolute object offset with a zero entry offset: the copy entry is
+    // patched with vme_offset = objectOffset (0 here), so the mapping offset
+    // alone selects the bytes.
+    struct VMObject o = { .vmAddress = 0, .address = object, .objectOffset = 0, .entryOffset = objectOffset };
+    return vm_create_shmem_with_object_len(&o, len);
+}
+
+void vm_shmem_release(struct VMShmem *shmem, uint64_t len)
+{
+    if (!shmem) return;
+    if (shmem->localAddress) mach_vm_deallocate(mach_task_self_, (mach_vm_address_t)shmem->localAddress, len);
+    if (shmem->port) mach_port_deallocate(mach_task_self_, (mach_port_name_t)shmem->port);
+    memset(shmem, 0, sizeof(*shmem));
+}
+

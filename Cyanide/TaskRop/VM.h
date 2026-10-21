@@ -86,3 +86,20 @@ struct vm_map_entry {
 };
 
 struct VMShmem vm_map_remote_page(uint64_t vmMap, uint64_t address);
+
+// Walking another task's map (vm_map_iterate_entries) once and mapping its
+// memory objects directly, instead of one map lookup per page.
+struct VMEntryInfo {
+    uint64_t start, end;
+    uint64_t object;      // 0 for a submap or an unreadable object
+    uint64_t offset;      // object offset of `start`
+    uint32_t protection;  // VM_PROT_* bits
+    bool isSubmap;
+};
+void vm_map_iterate_entries(uint64_t vm_map_ptr, void (^itBlock)(uint64_t start, uint64_t end, uint64_t entry, BOOL *stop));
+bool vm_map_entry_info(uint64_t entryAddr, struct VMEntryInfo *out);
+// Maps `len` bytes (page multiple) of `object` at object offset
+// `objectOffset` (page aligned) into this process; release with
+// vm_shmem_release(&shmem, len).
+struct VMShmem vm_map_object_range(uint64_t object, uint64_t objectOffset, uint64_t len);
+void vm_shmem_release(struct VMShmem *shmem, uint64_t len);
