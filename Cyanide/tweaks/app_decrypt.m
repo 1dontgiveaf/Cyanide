@@ -646,7 +646,7 @@ static BOOL ad_sb_write_task_range(uint64_t task, uint64_t header, uint64_t star
 // this iOS build. As a last resort, ask SpringBoard to open the app, SIGSTOP
 // it as soon as RunningBoard reports its pid, read the decrypted range, and
 // kill only the instance we launched.
-static BOOL ad_decrypt_range_in_launched_app(NSString *src, NSString *dst, uint64_t start,
+static BOOL ad_decrypt_range_in_launched_app(NSString *src, NSString *dst, int out, uint64_t start,
                                              const ADEncryptedSlice *s, NSString **why)
 {
     if (s->filetype != MH_EXECUTE) { *why = @"launched app: not an executable"; return NO; }
@@ -681,6 +681,29 @@ static BOOL ad_decrypt_range_in_launched_app(NSString *src, NSString *dst, uint6
 
     // Stop it immediately; the goal is only to read the pages it has mapped.
     r_dlsym_call(R_TIMEOUT, "kill", (uint64_t)pid, SIGSTOP, 0, 0, 0, 0, 0, 0);
+
+    // Try the local task port first (same-user children are sometimes
+    // inspectable without going through SpringBoard).
+    mach_port_t localTask = MACH_PORT_NULL;
+    if (task_for_pid(mach_task_self(), pid, &localTask) == KERN_SUCCESS && localTask != MACH_PORT_NULL) {
+        uint64_t header = ad_task_main_header(localTask);
+        void *buf = header ? malloc(s->cryptsize) : NULL;
+        BOOL localOK = NO;
+        if (buf && ad_task_read(localTask, header + s->cryptoff, buf, s->cryptsize) &&
+            ad_pwrite_all(out, buf, s->cryptsize, (off_t)start)) {
+            printf("[DECRYPT]   launched-app pid %d local task header 0x%llx read 0x%x bytes: ok\n",
+                   pid, header, s->cryptsize);
+            localOK = YES;
+        }
+        free(buf);
+        mach_port_deallocate(mach_task_self(), localTask);
+        if (localOK) {
+            if (launched) r_dlsym_call(R_TIMEOUT, "kill", (uint64_t)pid, SIGKILL, 0, 0, 0, 0, 0, 0);
+            else r_dlsym_call(R_TIMEOUT, "kill", (uint64_t)pid, SIGCONT, 0, 0, 0, 0, 0, 0);
+            return YES;
+        }
+    }
+
     uint64_t taskp = ad_sb_alloc(4);
     uint32_t task = 0;
     BOOL ok = NO;
@@ -774,7 +797,7 @@ static BOOL ad_decrypt_file(NSString *src, NSString *dst, BOOL useSpringBoard, B
             }
             if (!localOK && useSpringBoard) {
                 NSString *launchWhy = nil;
-                localOK = ad_decrypt_range_in_launched_app(src, dst, start, &s, &launchWhy);
+                localOK = ad_decrypt_range_in_launched_app(src, dst, out, start, &s, &launchWhy);
                 if (!localOK)
                     localWhy = [NSString stringWithFormat:@"%@; launch: %@",
                                 localWhy ?: @"spawn failed", launchWhy ?: @"failed"];
