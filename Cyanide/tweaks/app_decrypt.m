@@ -202,35 +202,39 @@ static BOOL ad_decrypt_file(NSString *src, NSString *dst, BOOL *decrypted, NSStr
         ADEncryptedSlice s;
         [v getValue:&s];
         uint64_t start = s.sliceOffset + s.cryptoff;
-        if (start % page) {
-            *errorOut = [NSString stringWithFormat:@"%@: encrypted range isn't page aligned", src.lastPathComponent];
-            ok = NO; break;
-        }
-        void *map = mmap(NULL, s.cryptsize, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, (off_t)start);
-        if (map == MAP_FAILED) map = mmap(NULL, s.cryptsize, PROT_READ, MAP_PRIVATE, fd, (off_t)start);
+        // mmap needs a page-aligned offset, and pages are 16 KB on arm64
+        // while encrypted ranges are only 4 KB aligned (extensions often):
+        // map from the page boundary below and skip `delta` bytes. The pager
+        // decrypts by absolute file offset, so the range itself comes out right.
+        uint64_t aligned = start & ~((uint64_t)page - 1);
+        size_t delta = (size_t)(start - aligned);
+        size_t mapLen = delta + s.cryptsize;
+        void *map = mmap(NULL, mapLen, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, (off_t)aligned);
+        if (map == MAP_FAILED) map = mmap(NULL, mapLen, PROT_READ, MAP_PRIVATE, fd, (off_t)aligned);
         if (map == MAP_FAILED) {
             *errorOut = [NSString stringWithFormat:@"%@: mmap failed (%s)", src.lastPathComponent, strerror(errno)];
             ok = NO; break;
         }
-        if (mremapEncrypted(map, s.cryptsize, s.cryptid, s.cputype, s.cpusubtype) != 0) {
+        if (mremapEncrypted(map, mapLen, s.cryptid, s.cputype, s.cpusubtype) != 0) {
             int e = errno;
-            munmap(map, s.cryptsize);
+            munmap(map, mapLen);
             *errorOut = [NSString stringWithFormat:@"%@: iOS refused to decrypt it (mremap_encrypted: %s)",
                          src.lastPathComponent, strerror(e)];
             ok = NO; break;
         }
+        const uint8_t *plain = (const uint8_t *)map + delta;
         // Proof it really decrypted: the first bytes must differ from the file.
         uint8_t enc[64];
         size_t probe = MIN(sizeof(enc), (size_t)s.cryptsize);
-        if (ad_pread_all(fd, enc, probe, (off_t)start) && memcmp(enc, map, probe) == 0) {
-            munmap(map, s.cryptsize);
+        if (ad_pread_all(fd, enc, probe, (off_t)start) && memcmp(enc, plain, probe) == 0) {
+            munmap(map, mapLen);
             *errorOut = [NSString stringWithFormat:@"%@: the kernel returned still-encrypted data", src.lastPathComponent];
             ok = NO; break;
         }
         uint32_t zero = 0;
-        ok = ad_pwrite_all(out, map, s.cryptsize, (off_t)start) &&
+        ok = ad_pwrite_all(out, plain, s.cryptsize, (off_t)start) &&
              ad_pwrite_all(out, &zero, sizeof(zero), (off_t)s.cryptidFileOffset);
-        munmap(map, s.cryptsize);
+        munmap(map, mapLen);
         if (!ok) { *errorOut = @"Writing the decrypted copy failed."; break; }
         printf("[DECRYPT] %s: slice cpu=0x%x off=0x%llx size=0x%x decrypted\n",
                src.lastPathComponent.UTF8String, s.cputype, start, s.cryptsize);
