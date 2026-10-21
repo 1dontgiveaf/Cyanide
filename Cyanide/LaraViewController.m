@@ -461,7 +461,8 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
         // An alert, not just the footer: that is below the whole app list.
         UIAlertController *ac = [UIAlertController
             alertControllerWithTitle:ipa ? @"IPA Ready" : @"Decryption Failed"
-                             message:ipa ? [NSString stringWithFormat:@"%@ is saved in Decrypted IPAs.", ipa.lastPathComponent] : failure
+                             message:ipa ? [NSString stringWithFormat:@"%@ is saved in Decrypted IPAs.%@", ipa.lastPathComponent,
+                                            error.length ? [@"\n\n" stringByAppendingString:error] : @""] : failure
                       preferredStyle:UIAlertControllerStyleAlert];
         if (ipa) {
             NSString *path = ipa;

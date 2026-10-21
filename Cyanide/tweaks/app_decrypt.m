@@ -262,7 +262,9 @@ static BOOL ad_decrypt_file(NSString *src, NSString *dst, BOOL useSpringBoard, B
         // decrypts by absolute file offset, so the range itself comes out right.
         uint64_t aligned = start & ~((uint64_t)page - 1);
         size_t delta = (size_t)(start - aligned);
-        size_t mapLen = delta + s.cryptsize;
+        // Whole pages: on a 16 KB system the kernel rejects a partial last
+        // page (a 4 KB range in an app extension failed with ENOMEM).
+        size_t mapLen = ((delta + s.cryptsize) + page - 1) & ~(page - 1);
         // 1) Here, in Cyanide.
         NSString *localWhy = nil;
         void *map = mmap(NULL, mapLen, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, (off_t)aligned);
@@ -508,8 +510,21 @@ NSString *app_decrypt_make_ipa(NSDictionary *app, BOOL useSpringBoard,
                       [@"Decrypt-" stringByAppendingString:NSUUID.UUID.UUIDString]];
     [fm createDirectoryAtPath:work withIntermediateDirectories:YES attributes:nil error:nil];
     NSMutableDictionary<NSString *, NSString *> *replaced = [NSMutableDictionary dictionary];
+    // The app's own executable first (if that can't be decrypted, nothing
+    // else matters), then frameworks, then extensions -- an extension that
+    // can't be decrypted is left out of the IPA instead of failing it.
+    NSString *mainExec = [NSDictionary dictionaryWithContentsOfFile:[appPath stringByAppendingPathComponent:@"Info.plist"]][@"CFBundleExecutable"];
+    NSArray<NSString *> *ordered = [files sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+        NSInteger (^rank)(NSString *) = ^NSInteger(NSString *r) {
+            if ([mainExec isKindOfClass:NSString.class] && [r isEqualToString:mainExec]) return 0;
+            if ([r containsString:@".appex/"] || [r hasPrefix:@"Watch/"]) return 2;
+            return 1;
+        };
+        return [@(rank(a)) compare:@(rank(b))];
+    }];
+    NSMutableSet<NSString *> *droppedBundles = [NSMutableSet set];   // extension bundles left out
     NSUInteger index = 0;
-    for (NSString *rel in files) {
+    for (NSString *rel in ordered) {
         index++;
         NSString *src = [appPath stringByAppendingPathComponent:rel];
         struct stat st;
@@ -517,8 +532,19 @@ NSString *app_decrypt_make_ipa(NSDictionary *app, BOOL useSpringBoard,
         NSString *dst = [work stringByAppendingPathComponent:[NSString stringWithFormat:@"%lu.bin", (unsigned long)index]];
         BOOL decrypted = NO;
         NSString *err = nil;
-        report([@"Decrypting " stringByAppendingString:rel.lastPathComponent], 0.4 * index / MAX(files.count, 1u));
-        if (!ad_decrypt_file(src, dst, useSpringBoard, &decrypted, &err)) { errorText = err; break; }
+        report([@"Decrypting " stringByAppendingString:rel.lastPathComponent], 0.4 * index / MAX(ordered.count, 1u));
+        if (!ad_decrypt_file(src, dst, useSpringBoard, &decrypted, &err)) {
+            // Inside an .appex: drop that whole extension, keep going.
+            NSRange appex = [rel rangeOfString:@".appex/"];
+            if (appex.location != NSNotFound) {
+                NSString *bundle = [rel substringToIndex:appex.location + 6];   // ".../Name.appex"
+                [droppedBundles addObject:bundle];
+                log_user("[DECRYPT] Leaving out %s: %s\n", bundle.UTF8String, err.UTF8String);
+                continue;
+            }
+            errorText = err;
+            break;
+        }
         if (decrypted) replaced[rel] = dst;
     }
     if (!errorText && replaced.count == 0) errorText = @"Nothing in this app is encrypted, or it couldn't be read.";
@@ -545,6 +571,10 @@ NSString *app_decrypt_make_ipa(NSDictionary *app, BOOL useSpringBoard,
               [zip addEntry:[prefix stringByAppendingString:@"/"] mode:S_IFDIR | 0755 mtime:time(NULL) size:0 crc:0 body:nil];
     for (NSString *rel in files) {
         if (!ok) break;
+        BOOL dropped = NO;
+        for (NSString *bundle in droppedBundles)
+            if ([rel isEqualToString:bundle] || [rel hasPrefix:[bundle stringByAppendingString:@"/"]]) { dropped = YES; break; }
+        if (dropped) continue;
         NSString *src = [appPath stringByAppendingPathComponent:rel];
         NSString *name = [prefix stringByAppendingPathComponent:rel];
         struct stat st;
@@ -592,6 +622,9 @@ NSString *app_decrypt_make_ipa(NSDictionary *app, BOOL useSpringBoard,
         return nil;
     }
     report(@"Done", 1.0);
+    if (droppedBundles.count && errorOut)   // not an error: tells the caller what was left out
+        *errorOut = [NSString stringWithFormat:@"Left out (couldn't be decrypted): %@",
+                     [[droppedBundles.allObjects valueForKey:@"lastPathComponent"] componentsJoinedByString:@", "]];
     log_user("[DECRYPT] %s: %lu binar%s decrypted -> %s\n", [app[@"name"] UTF8String],
              (unsigned long)replaced.count, replaced.count == 1 ? "y" : "ies", ipa.lastPathComponent.UTF8String);
     return ipa;
