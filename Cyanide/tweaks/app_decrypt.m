@@ -377,6 +377,213 @@ static BOOL ad_decrypt_range_in_spawned_process(NSString *src, int out, uint64_t
     return ok;
 }
 
+// --- SpringBoard spawn fallback --------------------------------------------
+// If Cyanide's sandbox refuses task_for_pid, SpringBoard is the next process
+// that can spawn the executable and read its task. The helpers below use the
+// existing RemoteCall session; no kernel read is involved.
+
+static uint64_t ad_sb_alloc(size_t n)
+{
+    uint64_t p = r_dlsym_call(R_TIMEOUT, "malloc", (uint64_t)n, 0, 0, 0, 0, 0, 0, 0);
+    return r_last_call_ok() ? p : 0;
+}
+
+static void ad_sb_free(uint64_t p)
+{
+    if (p) r_dlsym_call(R_TIMEOUT, "free", p, 0, 0, 0, 0, 0, 0, 0);
+}
+
+static uint64_t ad_sb_dlsym(const char *name)
+{
+    uint64_t s = r_alloc_str(name);
+    if (!s) return 0;
+    uint64_t p = r_dlsym_call(R_TIMEOUT, "dlsym", (uint64_t)(intptr_t)RTLD_DEFAULT, s, 0, 0, 0, 0, 0, 0);
+    r_free(s);
+    return r_last_call_ok() ? p : 0;
+}
+
+static uint64_t ad_sb_task_self(void)
+{
+    uint64_t sym = ad_sb_dlsym("mach_task_self_");
+    uint32_t port = 0;
+    if (!sym || !remote_read(sym, &port, sizeof(port))) return 0;
+    return port;
+}
+
+static uint64_t ad_sb_env(void)
+{
+    uint64_t sym = ad_sb_dlsym("environ");
+    uint64_t envp = 0;
+    if (sym) remote_read(sym, &envp, sizeof(envp));
+    return envp;
+}
+
+static BOOL ad_sb_vm_read(uint64_t task, uint64_t addr, uint64_t scratch, uint64_t gotp, size_t len)
+{
+    remote_write64(gotp, 0);
+    uint64_t kr = r_dlsym_call(R_TIMEOUT, "vm_read_overwrite", task, addr, len, scratch, gotp, 0, 0, 0);
+    uint64_t got = 0;
+    remote_read(gotp, &got, sizeof(got));
+    return (int)kr == 0 && got == len && r_last_call_ok();
+}
+
+static uint64_t ad_sb_main_header(uint64_t task, uint64_t self)
+{
+    uint64_t tdi = ad_sb_alloc(64), tdiCount = ad_sb_alloc(4);
+    uint64_t allImage = 0;
+    if (!tdi || !tdiCount) { ad_sb_free(tdi); ad_sb_free(tdiCount); return 0; }
+    uint32_t tdiC = TASK_DYLD_INFO_COUNT;
+    remote_write(tdiCount, &tdiC, sizeof(tdiC));
+    r_dlsym_call(R_TIMEOUT, "task_info", task, TASK_DYLD_INFO, tdi, tdiCount, 0, 0, 0, 0);
+    remote_read(tdi, &allImage, sizeof(allImage));
+    ad_sb_free(tdi); ad_sb_free(tdiCount);
+    if (allImage) {
+        uint64_t ai = ad_sb_alloc(24), gotp = ad_sb_alloc(8);
+        uint64_t infoArray = 0, header = 0;
+        if (ai && gotp && ad_sb_vm_read(task, allImage, ai, gotp, 24)) {
+            remote_read(ai + 8, &infoArray, sizeof(infoArray));
+            if (infoArray) {
+                uint64_t first = ad_sb_alloc(8);
+                if (first && ad_sb_vm_read(task, infoArray, first, gotp, 8))
+                    remote_read(first, &header, sizeof(header));
+                ad_sb_free(first);
+            }
+        }
+        ad_sb_free(ai); ad_sb_free(gotp);
+        if (header) return header;
+    }
+    // dyld may not have published all_image_infos yet: read the first
+    // suspended thread's stack slots, exactly as the local helper does.
+    uint64_t threadsPtr = ad_sb_alloc(8), countPtr = ad_sb_alloc(4);
+    uint64_t header = 0;
+    if (!threadsPtr || !countPtr) { ad_sb_free(threadsPtr); ad_sb_free(countPtr); return 0; }
+    uint64_t zeroThreads = 0;
+    remote_write(threadsPtr, &zeroThreads, sizeof(zeroThreads));
+    uint32_t zeroCount = 0;
+    remote_write(countPtr, &zeroCount, sizeof(zeroCount));
+    r_dlsym_call(R_TIMEOUT, "task_threads", task, threadsPtr, countPtr, 0, 0, 0, 0, 0);
+    uint64_t threads = 0; uint32_t count = 0;
+    remote_read(threadsPtr, &threads, sizeof(threads));
+    remote_read(countPtr, &count, sizeof(count));
+    if (threads && count) {
+        uint32_t thread = 0;
+        remote_read(threads, &thread, sizeof(thread));
+        uint64_t statep = ad_sb_alloc(512), stateCountp = ad_sb_alloc(4);
+        if (thread && statep && stateCountp) {
+            uint32_t stateCount = ARM_THREAD_STATE64_COUNT;
+            remote_write(stateCountp, &stateCount, sizeof(stateCount));
+            r_dlsym_call(R_TIMEOUT, "thread_get_state", thread, ARM_THREAD_STATE64, statep, stateCountp, 0, 0, 0, 0);
+            arm_thread_state64_t state;
+            if (remote_read(statep, &state, sizeof(state))) {
+                uint64_t sp = (uint64_t)arm_thread_state64_get_sp(state);
+                uint64_t scratch = ad_sb_alloc(32), gotp = ad_sb_alloc(8);
+                if (sp && scratch && gotp && ad_sb_vm_read(task, sp, scratch, gotp, 32)) {
+                    uint64_t slots[4] = {0};
+                    remote_read(scratch, slots, sizeof(slots));
+                    for (int i = 0; i < 4 && !header; i++) {
+                        if (!slots[i]) continue;
+                        uint32_t magic = 0;
+                        if (ad_sb_vm_read(task, slots[i], scratch, gotp, sizeof(magic))) {
+                            remote_read(scratch, &magic, sizeof(magic));
+                            if (magic == MH_MAGIC_64 || magic == MH_MAGIC ||
+                                magic == FAT_MAGIC || magic == FAT_CIGAM ||
+                                magic == FAT_MAGIC_64 || magic == FAT_CIGAM_64)
+                                header = slots[i];
+                        }
+                    }
+                }
+                ad_sb_free(scratch); ad_sb_free(gotp);
+            }
+        }
+        ad_sb_free(statep); ad_sb_free(stateCountp);
+    }
+    ad_sb_free(threadsPtr); ad_sb_free(countPtr);
+    (void)self;
+    return header;
+}
+
+static BOOL ad_decrypt_range_in_springboard_spawn(NSString *src, NSString *dst, uint64_t start,
+                                                  const ADEncryptedSlice *s, NSString **why)
+{
+    if (s->filetype != MH_EXECUTE) { *why = @"SpringBoard: not a spawned executable"; return NO; }
+    if (!s->cryptsize || s->cryptsize > 256u * 1024u * 1024u) {
+        *why = @"SpringBoard: implausible encrypted size";
+        return NO;
+    }
+    uint64_t self = ad_sb_task_self();
+    uint64_t rsrc = r_alloc_str(src.fileSystemRepresentation);
+    uint64_t rdst = r_alloc_str(dst.fileSystemRepresentation);
+    uint64_t argv = ad_sb_alloc(16), pidp = ad_sb_alloc(4), attrp = ad_sb_alloc(64), taskp = ad_sb_alloc(4);
+    uint64_t envp = ad_sb_env();
+    BOOL ok = NO;
+    uint64_t task = 0, scratch = 0, gotp = 0;
+    int fdOut = -1;
+    pid_t pid = 0;
+    do {
+        if (!self || !rsrc || !rdst || !argv || !pidp || !attrp || !taskp) {
+            *why = @"SpringBoard: allocation failed"; break;
+        }
+        remote_write64(argv, rsrc);
+        remote_write64(argv + 8, 0);
+        uint32_t zeroPid = 0;
+        remote_write(pidp, &zeroPid, sizeof(zeroPid));
+        if ((int)r_dlsym_call(R_TIMEOUT, "posix_spawnattr_init", attrp, 0, 0, 0, 0, 0, 0, 0) != 0) {
+            *why = @"SpringBoard: posix_spawnattr_init failed"; break;
+        }
+        r_dlsym_call(R_TIMEOUT, "posix_spawnattr_setflags", attrp, POSIX_SPAWN_START_SUSPENDED, 0, 0, 0, 0, 0, 0);
+        uint64_t rc = r_dlsym_call(R_TIMEOUT, "posix_spawn", pidp, rsrc, 0, attrp, argv, envp, 0, 0);
+        if (!r_last_call_ok() || (int)rc != 0) {
+            *why = [NSString stringWithFormat:@"SpringBoard: posix_spawn failed (%d)", (int)rc]; break;
+        }
+        uint32_t p32 = 0;
+        remote_read(pidp, &p32, sizeof(p32));
+        pid = (pid_t)p32;
+        if (!pid) { *why = @"SpringBoard: posix_spawn returned no pid"; break; }
+        uint32_t zeroTask = 0;
+        remote_write(taskp, &zeroTask, sizeof(zeroTask));
+        uint64_t tfp = r_dlsym_call(R_TIMEOUT, "task_for_pid", self, pid, taskp, 0, 0, 0, 0, 0);
+        uint32_t t32 = 0;
+        remote_read(taskp, &t32, sizeof(t32));
+        task = t32;
+        if (!r_last_call_ok() || (int)tfp != 0 || !task) {
+            *why = [NSString stringWithFormat:@"SpringBoard: task_for_pid failed (%d)", (int)tfp]; break;
+        }
+        uint64_t header = ad_sb_main_header(task, self);
+        if (!header) { *why = @"SpringBoard: no Mach-O header"; break; }
+        scratch = ad_sb_alloc(s->cryptsize);
+        gotp = ad_sb_alloc(8);
+        if (!scratch || !gotp) { *why = @"SpringBoard: no read buffer"; break; }
+        if (!ad_sb_vm_read(task, header + s->cryptoff, scratch, gotp, s->cryptsize)) {
+            *why = @"SpringBoard: reading the task range failed"; break;
+        }
+        fdOut = (int)r_dlsym_call(R_TIMEOUT, "open", rdst, O_WRONLY | O_CLOEXEC, 0, 0, 0, 0, 0, 0);
+        if (fdOut < 0) { *why = @"SpringBoard: opening the working copy failed"; break; }
+        uint64_t done = 0;
+        while (done < s->cryptsize) {
+            size_t chunk = (size_t)MIN((uint64_t)s->cryptsize - done, 1024ULL * 1024ULL);
+            int64_t n = (int64_t)r_dlsym_call(R_TIMEOUT, "pwrite", (uint64_t)fdOut,
+                                              scratch + done, chunk, start + done, 0, 0, 0, 0);
+            if (n <= 0 || !r_last_call_ok()) { *why = @"SpringBoard: writing the range failed"; break; }
+            done += (uint64_t)n;
+        }
+        if (done != s->cryptsize) break;
+        printf("[DECRYPT]   springboard spawn pid %d header 0x%llx read 0x%x bytes: ok\n",
+               pid, header, s->cryptsize);
+        ok = YES;
+    } while (0);
+    if (fdOut >= 0) r_dlsym_call(R_TIMEOUT, "close", (uint64_t)fdOut, 0, 0, 0, 0, 0, 0, 0);
+    if (pid) {
+        r_dlsym_call(R_TIMEOUT, "kill", (uint64_t)pid, SIGKILL, 0, 0, 0, 0, 0, 0);
+        r_dlsym_call(R_TIMEOUT, "waitpid", (uint64_t)pid, 0, 0, 0, 0, 0, 0, 0);
+    }
+    if (task) r_dlsym_call(R_TIMEOUT, "mach_port_deallocate", self, task, 0, 0, 0, 0, 0, 0);
+    ad_sb_free(scratch); ad_sb_free(gotp);
+    ad_sb_free(argv); ad_sb_free(pidp); ad_sb_free(attrp); ad_sb_free(taskp);
+    if (rsrc) r_free(rsrc);
+    if (rdst) r_free(rdst);
+    return ok;
+}
+
 // Writes a copy of `src` with every encrypted slice decrypted and its cryptid
 // cleared to `dst`. *decrypted is NO when the file had nothing encrypted.
 static BOOL ad_decrypt_file(NSString *src, NSString *dst, BOOL useSpringBoard, BOOL *decrypted, NSString **errorOut)
@@ -430,6 +637,13 @@ static BOOL ad_decrypt_file(NSString *src, NSString *dst, BOOL useSpringBoard, B
             NSString *spawnWhy = nil;
             localOK = ad_decrypt_range_in_spawned_process(src, out, start, &s, &spawnWhy);
             if (!localOK) localWhy = [@"spawn: " stringByAppendingString:spawnWhy ?: @"failed"];
+            if (!localOK && useSpringBoard) {
+                NSString *sbSpawnWhy = nil;
+                localOK = ad_decrypt_range_in_springboard_spawn(src, dst, start, &s, &sbSpawnWhy);
+                if (!localOK)
+                    localWhy = [NSString stringWithFormat:@"%@; SpringBoard spawn: %@",
+                                localWhy ?: @"spawn failed", sbSpawnWhy ?: @"failed"];
+            }
         }
         void *map = NULL;
         if (!localOK) {

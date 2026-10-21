@@ -12,6 +12,9 @@ ROOT = Path(__file__).resolve().parents[2]
 SOURCE = (ROOT / "Cyanide/tweaks/app_decrypt.m").read_text()
 
 assert "ad_decrypt_range_in_spawned_process" in SOURCE
+assert "ad_decrypt_range_in_springboard_spawn" in SOURCE
+assert "posix_spawnattr_init" in SOURCE
+assert "task_for_pid" in SOURCE
 assert "POSIX_SPAWN_START_SUSPENDED" in SOURCE
 assert "task_for_pid" in SOURCE
 assert "ad_task_read" in SOURCE
