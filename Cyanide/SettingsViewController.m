@@ -8,6 +8,7 @@
 #import "DaemonsViewController.h"
 #import "SystemInfoViewController.h"
 #import "CleanerViewController.h"
+#import "LaraViewController.h"
 #import "tweaks/daemon_catalog.h"
 #import <dirent.h>
 #import <dlfcn.h>
@@ -7620,6 +7621,54 @@ void settings_tool_needs_exploit(UIViewController *tool, UITableView *tableView,
     settings_offer_exploit_popup(tool, reason, done, 10);
 }
 
+// Runs `work` inside SpringBoard for a tool screen (lara tools): live or saved
+// kernel access, a fresh exploit run only where it can't reboot the device
+// (else kSettingsFullExploitRequiredMessage, for settings_tool_needs_exploit),
+// then the SpringBoard channel, closed again afterwards unless a live tweak
+// still uses it. `completion(ok, message)` on main.
+void settings_springboard_tool_async(const char *tag, BOOL (^work)(void),
+                                     void (^completion)(BOOL ok, NSString *message))
+{
+    void (^finish)(BOOL, NSString *) = ^(BOOL ok, NSString *message) {
+        if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(ok, message); });
+    };
+    if (!settings_device_supported()) { finish(NO, settings_unsupported_message()); return; }
+    NSString *owner = [NSString stringWithUTF8String:tag ?: "Tool"];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        if (!settings_try_claim_actions_lock(owner.UTF8String, "[LARA] Another action is already running.")) {
+            finish(NO, @"Another action is already running. Try again when it has finished.");
+            return;
+        }
+        BOOL ok = NO;
+        NSString *message = nil;
+        @try {
+            BOOL kernelReady = settings_ensure_kexploit_for_read();
+            if (!kernelReady && !settings_tool_may_run_exploit(NO)) {
+                message = kSettingsFullExploitRequiredMessage;
+                return;
+            }
+            if (!kernelReady) kernelReady = settings_ensure_kexploit();
+            if (!kernelReady) {
+                message = @"Kernel access could not be acquired. Check the log.";
+                return;
+            }
+            @synchronized (settings_rc_lock()) {
+                if (!settings_ensure_springboard_remote_call_locked()) {
+                    message = @"SpringBoard could not be reached.";
+                    return;
+                }
+                ok = work ? work() : YES;
+                if (!settings_has_persistent_springboard_remote_call_user() && g_springboard_rc_ready)
+                    settings_destroy_springboard_remote_call_locked_internal_ex(tag ?: "tool", YES, YES);
+            }
+            if (!ok && !message) message = @"It didn't work on this device. Check the log.";
+        } @finally {
+            settings_release_actions_lock();
+            finish(ok, message);
+        }
+    });
+}
+
 // Daemons screen: launchd's disabled.plist. Like the File Browser, only a
 // live or parked kernel session is used unless the user confirmed a full run.
 static BOOL settings_daemons_kernel_ready(BOOL allowFullExploit, NSString **message)
@@ -10140,6 +10189,7 @@ typedef NS_ENUM(NSInteger, RootSection) {
     RootSectionTweakBundles,
     RootSectionInDev,
     RootSectionSystemBundles,
+    RootSectionLara,              // tools ported from lara by rooootdev
     RootSectionAbout,
     RootSectionWarning,
     RootSectionCount,
@@ -14805,6 +14855,17 @@ UIViewController *settings_make_daemons_viewer(void)
     ];
 }
 
+// Settings → Lara: tools ported from lara by rooootdev (with his permission).
+- (NSArray<NSDictionary *> *)laraRows
+{
+    return @[
+        @{ @"title": @"Performance HUD",  @"icon": @"gauge.with.dots.needle.67percent", @"color": [UIColor systemPinkColor],   @"section": @(-1), @"custom": @"lara", @"lara": @(LaraToolPerformanceHUD) },
+        @{ @"title": @"Debug Overlay",    @"icon": @"ladybug.fill",          @"color": [UIColor systemOrangeColor], @"section": @(-1), @"custom": @"lara", @"lara": @(LaraToolDebugOverlay) },
+        @{ @"title": @"Upside Down",      @"icon": @"arrow.up.and.down.circle.fill", @"color": [UIColor systemIndigoColor], @"section": @(-1), @"custom": @"lara", @"lara": @(LaraToolUpsideDown) },
+        @{ @"title": @"Hidden Settings",  @"icon": @"eye.slash.fill",        @"color": [UIColor systemGrayColor],   @"section": @(-1), @"custom": @"lara", @"lara": @(LaraToolHiddenSettings) },
+    ];
+}
+
 - (NSArray<NSDictionary *> *)filterBundles:(NSArray<NSDictionary *> *)bundles
 {
     BOOL experimentalOn = settings_experimental_tweaks_enabled();
@@ -14874,6 +14935,7 @@ UIViewController *settings_make_daemons_viewer(void)
         case RootSectionTweakBundles:   return (NSInteger)self.tweakBundleRows.count;
         case RootSectionInDev:         return (NSInteger)self.inDevBundleRows.count;
         case RootSectionSystemBundles:  return (NSInteger)self.systemBundleRows.count;
+        case RootSectionLara:           return settings_device_supported() ? (NSInteger)self.laraRows.count : 0;
         case RootSectionAbout:          return 5;
         case RootSectionWarning:        return 0;
         case RootSectionCount:          return 0;
@@ -14890,6 +14952,7 @@ UIViewController *settings_make_daemons_viewer(void)
         case RootSectionTweakBundles:   return self.tweakBundleRows.count   > 0 ? @"Tweaks" : nil;
         case RootSectionInDev:         return self.inDevBundleRows.count   > 0 ? @"In Development" : nil;
         case RootSectionSystemBundles:  return self.systemBundleRows.count  > 0 ? @"System" : nil;
+        case RootSectionLara:           return settings_device_supported() ? @"Lara" : nil;
         case RootSectionAbout:          return @"About";
         default:                        return nil;
     }
@@ -15007,6 +15070,7 @@ UIViewController *settings_make_daemons_viewer(void)
         if ((RootSection)section == RootSectionTweakBundles  && self.tweakBundleRows.count  == 0) return CGFLOAT_MIN;
         if ((RootSection)section == RootSectionInDev        && self.inDevBundleRows.count  == 0) return CGFLOAT_MIN;
         if ((RootSection)section == RootSectionSystemBundles && self.systemBundleRows.count == 0) return CGFLOAT_MIN;
+        if ((RootSection)section == RootSectionLara && !settings_device_supported()) return CGFLOAT_MIN;
     }
     return 46.0;
 }
@@ -17288,6 +17352,8 @@ void cyanide_present_contact(UIViewController *host)
                 return [self buildInDevCellWithRow:self.inDevBundleRows[indexPath.row] tableView:tableView];
             case RootSectionSystemBundles:
                 return [self buildBundleCellWithRow:self.systemBundleRows[indexPath.row] tableView:tableView];
+            case RootSectionLara:
+                return [self buildBundleCellWithRow:self.laraRows[indexPath.row] tableView:tableView];
             case RootSectionAbout:
                 return [self buildAboutCellAtRow:indexPath.row tableView:tableView];
             case RootSectionCount:
@@ -18813,6 +18879,12 @@ void cyanide_present_contact(UIViewController *host)
         switch ((RootSection)indexPath.section) {
             case RootSectionWarning:
                 return;
+            case RootSectionLara: {
+                LaraTool tool = (LaraTool)[self.laraRows[indexPath.row][@"lara"] integerValue];
+                [self.navigationController pushViewController:[[LaraViewController alloc] initWithTool:tool]
+                                                     animated:YES];
+                return;
+            }
             case RootSectionChangelog: {
                 if (!self.changelogExpanded) {
                     self.changelogExpanded = YES;

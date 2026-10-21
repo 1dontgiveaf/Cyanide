@@ -279,6 +279,11 @@ BOOL settings_kernel_access_available(void);
 extern NSString * const kSettingsNoKernelAccessHint;
 // Whether settings_tool_needs_exploit already showed its popup on `tool`.
 BOOL settings_tool_exploit_was_offered(UIViewController *tool);
+// Runs `work` inside SpringBoard for a tool screen, with the same kernel-access
+// rules as the other tools (message kSettingsFullExploitRequiredMessage when
+// only a manual run would help). completion(ok, message) on main.
+void settings_springboard_tool_async(const char *tag, BOOL (^work)(void),
+                                     void (^completion)(BOOL ok, NSString *message));
 void settings_tool_needs_exploit(UIViewController *tool, UITableView *tableView, NSString *toolName,
                                  void (^retry)(void));
 // Daemons screen (launchd disabled.plist). `disabled` maps label -> value as
