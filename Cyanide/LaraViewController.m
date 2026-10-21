@@ -417,51 +417,62 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
     if (self.busy) return;
     self.busy = YES;
     self.status = [NSString stringWithFormat:@"Decrypting %@…", app[@"name"]];
-    [self.tableView reloadData];
     // Show the progress where it's visible (the footer is below the list).
     self.navigationItem.prompt = self.status;
+    [self.tableView reloadData];
     // A large app takes a while: keep going for a bit if Cyanide is backgrounded.
     __block UIBackgroundTaskIdentifier bg = [UIApplication.sharedApplication beginBackgroundTaskWithName:@"Decrypt" expirationHandler:^{
         [UIApplication.sharedApplication endBackgroundTask:bg];
         bg = UIBackgroundTaskInvalid;
     }];
     __weak typeof(self) weakSelf = self;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        __block CFAbsoluteTime lastUI = 0;
-        NSString *error = nil;
-        NSString *ipa = app_decrypt_make_ipa(app, ^(NSString *step, double fraction) {
-            CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-            if (now - lastUI < 0.25 && fraction < 1) return;   // don't flood the main queue
-            lastUI = now;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                weakSelf.status = [NSString stringWithFormat:@"%@ — %.0f %%", step, fraction * 100];
-                weakSelf.navigationItem.prompt = [NSString stringWithFormat:@"%.0f %% · %@", fraction * 100, step];
-            });
-        }, &error);
+    __block NSString *ipa = nil, *error = nil;
+    __block CFAbsoluteTime lastUI = 0;
+    void (^progress)(NSString *, double) = ^(NSString *step, double fraction) {
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        if (now - lastUI < 0.25 && fraction < 1) return;   // don't flood the main queue
+        lastUI = now;
         dispatch_async(dispatch_get_main_queue(), ^{
-            if (bg != UIBackgroundTaskInvalid) { [UIApplication.sharedApplication endBackgroundTask:bg]; bg = UIBackgroundTaskInvalid; }
-            typeof(self) me = weakSelf;
-            if (!me) return;
-            me.busy = NO;
-            me.navigationItem.prompt = nil;
-            me.status = ipa ? [NSString stringWithFormat:@"Saved %@.", ipa.lastPathComponent] : (error ?: @"Decryption failed. Check the log.");
-            [me.tableView reloadData];
-            if (!me.view.window) return;
-            // An alert, not just the footer: that is below the whole app list.
-            UIAlertController *ac = [UIAlertController
-                alertControllerWithTitle:ipa ? @"IPA Ready" : @"Decryption Failed"
-                                 message:ipa ? [NSString stringWithFormat:@"%@ is saved in Decrypted IPAs.", ipa.lastPathComponent] : me.status
-                          preferredStyle:UIAlertControllerStyleAlert];
-            if (ipa) {
-                [ac addAction:[UIAlertAction actionWithTitle:@"Share…" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-                    typeof(self) me2 = weakSelf;
-                    UITableViewCell *cell = [me2.tableView cellForRowAtIndexPath:[NSIndexPath indexPathForRow:0 inSection:0]];
-                    if (me2) filebrowser_share_file(me2, ipa, NO, nil, cell, nil);
-                }]];
-            }
-            [ac addAction:[UIAlertAction actionWithTitle:ipa ? @"Done" : @"OK" style:UIAlertActionStyleCancel handler:nil]];
-            [me presentViewController:ac animated:YES completion:nil];
+            weakSelf.status = [NSString stringWithFormat:@"%@ — %.0f %%", step, fraction * 100];
+            weakSelf.navigationItem.prompt = [NSString stringWithFormat:@"%.0f %% · %@", fraction * 100, step];
         });
+    };
+    // Inside a SpringBoard session: when iOS won't decrypt in Cyanide,
+    // SpringBoard does it (same kernel-access rules as the other tools).
+    settings_springboard_tool_async("App Decrypt", ^BOOL{
+        ipa = app_decrypt_make_ipa(app, YES, progress, &error);
+        return ipa != nil;
+    }, ^(BOOL ok, NSString *message) {
+        if (bg != UIBackgroundTaskInvalid) { [UIApplication.sharedApplication endBackgroundTask:bg]; bg = UIBackgroundTaskInvalid; }
+        typeof(self) me = weakSelf;
+        if (!me) return;
+        me.busy = NO;
+        me.navigationItem.prompt = nil;
+        if ([message isEqualToString:kSettingsFullExploitRequiredMessage]) {
+            me.status = kSettingsNoKernelAccessHint;
+            [me.tableView reloadData];
+            settings_tool_needs_exploit(me, me.tableView, @"App Decrypt", ^{ [weakSelf decrypt:app]; });
+            return;
+        }
+        NSString *failure = error ?: message ?: @"Decryption failed. Check the log.";
+        me.status = ipa ? [NSString stringWithFormat:@"Saved %@.", ipa.lastPathComponent] : failure;
+        [me.tableView reloadData];
+        if (!me.view.window) return;
+        // An alert, not just the footer: that is below the whole app list.
+        UIAlertController *ac = [UIAlertController
+            alertControllerWithTitle:ipa ? @"IPA Ready" : @"Decryption Failed"
+                             message:ipa ? [NSString stringWithFormat:@"%@ is saved in Decrypted IPAs.", ipa.lastPathComponent] : failure
+                      preferredStyle:UIAlertControllerStyleAlert];
+        if (ipa) {
+            NSString *path = ipa;
+            [ac addAction:[UIAlertAction actionWithTitle:@"Share…" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                typeof(self) me2 = weakSelf;
+                UITableViewCell *cell = [me2.tableView cellForRowAtIndexPath:[NSIndexPath indexPathForRow:0 inSection:0]];
+                if (me2) filebrowser_share_file(me2, path, NO, nil, cell, nil);
+            }]];
+        }
+        [ac addAction:[UIAlertAction actionWithTitle:ipa ? @"Done" : @"OK" style:UIAlertActionStyleCancel handler:nil]];
+        [me presentViewController:ac animated:YES completion:nil];
     });
 }
 

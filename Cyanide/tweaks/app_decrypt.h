@@ -23,5 +23,7 @@ NSString *app_decrypt_output_dir(void);
 
 // Builds <output dir>/<Name>_<version>_decrypted.ipa. `progress(step, 0…1)` is
 // called on the calling thread. Returns the IPA path, or nil with *errorOut.
-NSString *app_decrypt_make_ipa(NSDictionary *app, void (^progress)(NSString *step, double fraction),
-                               NSString **errorOut);
+// useSpringBoard: a SpringBoard session is open (caller holds it); when iOS
+// won't decrypt inside Cyanide, SpringBoard does it.
+NSString *app_decrypt_make_ipa(NSDictionary *app, BOOL useSpringBoard,
+                               void (^progress)(NSString *step, double fraction), NSString **errorOut);

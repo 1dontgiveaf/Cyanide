@@ -14,6 +14,8 @@
 #import "app_decrypt.h"
 #import "../FBAppContainers.h"
 #import "../LogTextView.h"
+#import "remote_objc.h"
+#import "../TaskRop/RemoteCall.h"
 #import <UIKit/UIKit.h>
 #import <mach-o/loader.h>
 #import <mach-o/fat.h>
@@ -168,9 +170,61 @@ static BOOL ad_encrypted_slices(int fd, uint64_t fileSize, NSMutableArray<NSValu
 
 typedef int (*ADMremapEncrypted)(void *addr, size_t len, uint32_t cryptid, uint32_t cputype, uint32_t cpusubtype);
 
+// errno inside SpringBoard after a failed call.
+static int ad_sb_errno(void)
+{
+    uint64_t p = r_dlsym_call(R_TIMEOUT, "__error", 0, 0, 0, 0, 0, 0, 0, 0);
+    int e = 0;
+    if (p && !remote_read(p, &e, sizeof(e))) e = 0;
+    return e;
+}
+
+// The same decryption done by SpringBoard (unsandboxed; a crash there is only
+// a respring): it maps `src`, has the kernel decrypt the range and writes the
+// plaintext into `dst` (Cyanide's working copy) at the same offset. Needs an
+// open SpringBoard session.
+static BOOL ad_decrypt_range_in_springboard(NSString *src, NSString *dst, uint64_t aligned, size_t mapLen,
+                                            size_t delta, uint64_t start, const void *slicePtr, NSString **why)
+{
+    const ADEncryptedSlice *s = slicePtr;
+    uint64_t rsrc = r_alloc_str(src.fileSystemRepresentation), rdst = r_alloc_str(dst.fileSystemRepresentation);
+    int fdIn = -1, fdOut = -1;
+    uint64_t map = 0;
+    BOOL ok = NO;
+    do {
+        if (!rsrc || !rdst) { *why = @"SpringBoard: no memory for the paths"; break; }
+        fdIn = (int)r_dlsym_call(R_TIMEOUT, "open", rsrc, O_RDONLY | O_CLOEXEC, 0, 0, 0, 0, 0, 0);
+        if (fdIn < 0) { *why = [NSString stringWithFormat:@"SpringBoard: open failed (%s)", strerror(ad_sb_errno())]; break; }
+        map = r_dlsym_call(R_TIMEOUT, "mmap", 0, mapLen, PROT_READ, MAP_PRIVATE, (uint64_t)fdIn, aligned, 0, 0);
+        if (!map || map == (uint64_t)-1) {
+            map = 0;
+            *why = [NSString stringWithFormat:@"SpringBoard: mmap failed (%s)", strerror(ad_sb_errno())];
+            break;
+        }
+        int r = (int)r_dlsym_call(R_TIMEOUT, "mremap_encrypted", map, mapLen, s->cryptid, s->cputype, s->cpusubtype, 0, 0, 0);
+        if (r != 0) { *why = [NSString stringWithFormat:@"SpringBoard: mremap_encrypted failed (%s)", strerror(ad_sb_errno())]; break; }
+        fdOut = (int)r_dlsym_call(R_TIMEOUT, "open", rdst, O_WRONLY | O_CLOEXEC, 0, 0, 0, 0, 0, 0);
+        if (fdOut < 0) { *why = [NSString stringWithFormat:@"SpringBoard: can't write the copy (%s)", strerror(ad_sb_errno())]; break; }
+        uint64_t done = 0, size = s->cryptsize;
+        ok = YES;
+        while (done < size) {
+            uint64_t chunk = MIN(size - done, 8ULL * 1024 * 1024);   // keeps each call short
+            int64_t n = (int64_t)r_dlsym_call(R_TIMEOUT, "pwrite", (uint64_t)fdOut, map + delta + done, chunk, start + done, 0, 0, 0, 0);
+            if (n <= 0 || !r_last_call_ok()) { *why = @"SpringBoard: writing the decrypted bytes failed"; ok = NO; break; }
+            done += (uint64_t)n;
+        }
+    } while (0);
+    if (map) r_dlsym_call(R_TIMEOUT, "munmap", map, mapLen, 0, 0, 0, 0, 0, 0);
+    if (fdIn >= 0) r_dlsym_call(R_TIMEOUT, "close", (uint64_t)fdIn, 0, 0, 0, 0, 0, 0, 0);
+    if (fdOut >= 0) r_dlsym_call(R_TIMEOUT, "close", (uint64_t)fdOut, 0, 0, 0, 0, 0, 0, 0);
+    if (rsrc) r_free(rsrc);
+    if (rdst) r_free(rdst);
+    return ok;
+}
+
 // Writes a copy of `src` with every encrypted slice decrypted and its cryptid
 // cleared to `dst`. *decrypted is NO when the file had nothing encrypted.
-static BOOL ad_decrypt_file(NSString *src, NSString *dst, BOOL *decrypted, NSString **errorOut)
+static BOOL ad_decrypt_file(NSString *src, NSString *dst, BOOL useSpringBoard, BOOL *decrypted, NSString **errorOut)
 {
     *decrypted = NO;
     static ADMremapEncrypted mremapEncrypted;
@@ -184,7 +238,7 @@ static BOOL ad_decrypt_file(NSString *src, NSString *dst, BOOL *decrypted, NSStr
     NSMutableArray<NSValue *> *slices = [NSMutableArray array];
     ad_encrypted_slices(fd, (uint64_t)st.st_size, slices);
     if (!slices.count) { close(fd); return YES; }
-    if (!mremapEncrypted) { close(fd); *errorOut = @"This iOS version has no mremap_encrypted."; return NO; }
+    if (!mremapEncrypted && !useSpringBoard) { close(fd); *errorOut = @"This iOS version has no mremap_encrypted."; return NO; }
 
     NSError *err = nil;
     [NSFileManager.defaultManager removeItemAtPath:dst error:nil];
@@ -193,7 +247,7 @@ static BOOL ad_decrypt_file(NSString *src, NSString *dst, BOOL *decrypted, NSStr
         *errorOut = [NSString stringWithFormat:@"%@: copy failed (%@)", src.lastPathComponent, err.localizedDescription];
         return NO;
     }
-    int out = open(dst.fileSystemRepresentation, O_WRONLY | O_CLOEXEC);
+    int out = open(dst.fileSystemRepresentation, O_RDWR | O_CLOEXEC);
     if (out < 0) { close(fd); *errorOut = @"The working copy can't be written."; return NO; }
 
     size_t page = (size_t)getpagesize();
@@ -209,32 +263,48 @@ static BOOL ad_decrypt_file(NSString *src, NSString *dst, BOOL *decrypted, NSStr
         uint64_t aligned = start & ~((uint64_t)page - 1);
         size_t delta = (size_t)(start - aligned);
         size_t mapLen = delta + s.cryptsize;
+        // 1) Here, in Cyanide.
+        NSString *localWhy = nil;
         void *map = mmap(NULL, mapLen, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, (off_t)aligned);
         if (map == MAP_FAILED) map = mmap(NULL, mapLen, PROT_READ, MAP_PRIVATE, fd, (off_t)aligned);
+        BOOL localOK = NO;
         if (map == MAP_FAILED) {
-            *errorOut = [NSString stringWithFormat:@"%@: mmap failed (%s)", src.lastPathComponent, strerror(errno)];
-            ok = NO; break;
+            localWhy = [NSString stringWithFormat:@"mmap: %s", strerror(errno)];
+            map = NULL;
+        } else if (!mremapEncrypted) {
+            localWhy = @"no mremap_encrypted";
+        } else if (mremapEncrypted(map, mapLen, s.cryptid, s.cputype, s.cpusubtype) != 0) {
+            localWhy = [NSString stringWithFormat:@"mremap_encrypted: %s", strerror(errno)];
+        } else {
+            localOK = ad_pwrite_all(out, (const uint8_t *)map + delta, s.cryptsize, (off_t)start);
+            if (!localOK) localWhy = @"writing the copy failed";
         }
-        if (mremapEncrypted(map, mapLen, s.cryptid, s.cputype, s.cpusubtype) != 0) {
-            int e = errno;
-            munmap(map, mapLen);
-            *errorOut = [NSString stringWithFormat:@"%@: iOS refused to decrypt it (mremap_encrypted: %s)",
-                         src.lastPathComponent, strerror(e)];
-            ok = NO; break;
+        if (map) munmap(map, mapLen);
+        printf("[DECRYPT] %s: off=0x%llx size=0x%x delta=0x%zx local=%s\n", src.lastPathComponent.UTF8String,
+               start, s.cryptsize, delta, localOK ? "ok" : localWhy.UTF8String);
+        // 2) In SpringBoard, when Cyanide may not decrypt itself.
+        if (!localOK) {
+            NSString *sbWhy = nil;
+            BOOL sbOK = useSpringBoard &&
+                ad_decrypt_range_in_springboard(src, dst, aligned, mapLen, delta, start, &s, &sbWhy);
+            printf("[DECRYPT] %s: springboard=%s\n", src.lastPathComponent.UTF8String,
+                   !useSpringBoard ? "not available" : sbOK ? "ok" : sbWhy.UTF8String);
+            if (!sbOK) {
+                *errorOut = [NSString stringWithFormat:@"%@: iOS refused to decrypt it (Cyanide: %@%@)", src.lastPathComponent,
+                             localWhy, useSpringBoard ? [@"; " stringByAppendingString:sbWhy ?: @"SpringBoard failed"] : @""];
+                ok = NO; break;
+            }
         }
-        const uint8_t *plain = (const uint8_t *)map + delta;
-        // Proof it really decrypted: the first bytes must differ from the file.
-        uint8_t enc[64];
+        // Proof it really decrypted: the copy must differ from the original here.
+        uint8_t enc[64], dec[64];
         size_t probe = MIN(sizeof(enc), (size_t)s.cryptsize);
-        if (ad_pread_all(fd, enc, probe, (off_t)start) && memcmp(enc, plain, probe) == 0) {
-            munmap(map, mapLen);
+        if (ad_pread_all(fd, enc, probe, (off_t)start) && pread(out, dec, probe, (off_t)start) == (ssize_t)probe &&
+            memcmp(enc, dec, probe) == 0) {
             *errorOut = [NSString stringWithFormat:@"%@: the kernel returned still-encrypted data", src.lastPathComponent];
             ok = NO; break;
         }
         uint32_t zero = 0;
-        ok = ad_pwrite_all(out, plain, s.cryptsize, (off_t)start) &&
-             ad_pwrite_all(out, &zero, sizeof(zero), (off_t)s.cryptidFileOffset);
-        munmap(map, mapLen);
+        ok = ad_pwrite_all(out, &zero, sizeof(zero), (off_t)s.cryptidFileOffset);
         if (!ok) { *errorOut = @"Writing the decrypted copy failed."; break; }
         printf("[DECRYPT] %s: slice cpu=0x%x off=0x%llx size=0x%x decrypted\n",
                src.lastPathComponent.UTF8String, s.cputype, start, s.cryptsize);
@@ -402,7 +472,8 @@ static NSString *ad_safe_name(NSString *s)
     return [[s componentsSeparatedByCharactersInSet:bad] componentsJoinedByString:@"_"];
 }
 
-NSString *app_decrypt_make_ipa(NSDictionary *app, void (^progress)(NSString *, double), NSString **errorOut)
+NSString *app_decrypt_make_ipa(NSDictionary *app, BOOL useSpringBoard,
+                               void (^progress)(NSString *, double), NSString **errorOut)
 {
     NSString *appPath = app[@"path"];
     NSFileManager *fm = NSFileManager.defaultManager;
@@ -447,7 +518,7 @@ NSString *app_decrypt_make_ipa(NSDictionary *app, void (^progress)(NSString *, d
         BOOL decrypted = NO;
         NSString *err = nil;
         report([@"Decrypting " stringByAppendingString:rel.lastPathComponent], 0.4 * index / MAX(files.count, 1u));
-        if (!ad_decrypt_file(src, dst, &decrypted, &err)) { errorText = err; break; }
+        if (!ad_decrypt_file(src, dst, useSpringBoard, &decrypted, &err)) { errorText = err; break; }
         if (decrypted) replaced[rel] = dst;
     }
     if (!errorText && replaced.count == 0) errorText = @"Nothing in this app is encrypted, or it couldn't be read.";
