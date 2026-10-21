@@ -9,7 +9,8 @@
 //  kernel's FairPlay pager to decrypt that mapping (mremap_encrypted, as
 //  flexdecrypt does). A range that isn't 16 KB aligned cannot use mremap;
 //  that executable is started suspended, its decrypted pages are read from
-//  the task, and it is killed before it can run its UI.
+//  the task, and it is killed before it can run its UI. If iOS refuses the
+//  direct spawn, SpringBoard opens it briefly and it is stopped immediately.
 //
 
 #import "app_decrypt.h"
@@ -596,6 +597,117 @@ static BOOL ad_decrypt_range_in_springboard_spawn(NSString *src, NSString *dst, 
     return ok;
 }
 
+// pid of a running app as SpringBoard's RunningBoard sees it.
+static int ad_sb_pid_for_bundle(uint64_t bundleStr)
+{
+    uint64_t clsPred = r_class("RBSProcessPredicate");
+    uint64_t clsHandle = r_class("RBSProcessHandle");
+    if (!r_is_objc_ptr(clsPred) || !r_is_objc_ptr(clsHandle)) return 0;
+    uint64_t pred = r_msg2(clsPred, "predicateMatchingBundleIdentifier:", bundleStr, 0, 0, 0);
+    if (!r_is_objc_ptr(pred)) return 0;
+    uint64_t handle = r_msg2(clsHandle, "handleForPredicate:error:", pred, 0, 0, 0);
+    if (!r_is_objc_ptr(handle)) return 0;
+    return (int)(r_msg2(handle, "rbs_pid", 0, 0, 0, 0) & 0xffffffffULL);
+}
+
+static BOOL ad_sb_write_task_range(uint64_t task, uint64_t header, uint64_t start,
+                                   NSString *dst, const ADEncryptedSlice *s, uint64_t *outTask, NSString **why)
+{
+    uint64_t scratch = ad_sb_alloc(s->cryptsize), gotp = ad_sb_alloc(8);
+    if (!scratch || !gotp) { ad_sb_free(scratch); ad_sb_free(gotp); *why = @"SpringBoard: no read buffer"; return NO; }
+    BOOL ok = NO;
+    if (!ad_sb_vm_read(task, header + s->cryptoff, scratch, gotp, s->cryptsize)) {
+        *why = @"SpringBoard: reading the task range failed";
+    } else {
+        uint64_t rdst = r_alloc_str(dst.fileSystemRepresentation);
+        int fdOut = rdst ? (int)r_dlsym_call(R_TIMEOUT, "open", rdst, O_WRONLY | O_CLOEXEC, 0, 0, 0, 0, 0, 0) : -1;
+        if (fdOut < 0) {
+            *why = @"SpringBoard: opening the working copy failed";
+        } else {
+            uint64_t done = 0;
+            ok = YES;
+            while (done < s->cryptsize) {
+                size_t chunk = (size_t)MIN((uint64_t)s->cryptsize - done, 1024ULL * 1024ULL);
+                int64_t n = (int64_t)r_dlsym_call(R_TIMEOUT, "pwrite", (uint64_t)fdOut,
+                                                  scratch + done, chunk, start + done, 0, 0, 0, 0);
+                if (n <= 0 || !r_last_call_ok()) { *why = @"SpringBoard: writing the range failed"; ok = NO; break; }
+                done += (uint64_t)n;
+            }
+            r_dlsym_call(R_TIMEOUT, "close", (uint64_t)fdOut, 0, 0, 0, 0, 0, 0, 0);
+            if (ok && outTask) *outTask = task;
+        }
+        if (rdst) r_free(rdst);
+    }
+    ad_sb_free(scratch); ad_sb_free(gotp);
+    return ok;
+}
+
+// Direct posix_spawn of an App Store executable is refused with EPERM on
+// this iOS build. As a last resort, ask SpringBoard to open the app, SIGSTOP
+// it as soon as RunningBoard reports its pid, read the decrypted range, and
+// kill only the instance we launched.
+static BOOL ad_decrypt_range_in_launched_app(NSString *src, NSString *dst, uint64_t start,
+                                             const ADEncryptedSlice *s, NSString **why)
+{
+    if (s->filetype != MH_EXECUTE) { *why = @"launched app: not an executable"; return NO; }
+    if ([src rangeOfString:@".appex/"].location != NSNotFound) {
+        *why = @"launched app: extension needs a host"; return NO;
+    }
+    NSString *appPath = src;
+    while (appPath.length > 1 && ![appPath.pathExtension isEqualToString:@"app"])
+        appPath = appPath.stringByDeletingLastPathComponent;
+    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+                          [appPath stringByAppendingPathComponent:@"Info.plist"]];
+    NSString *bundleID = [info[@"CFBundleIdentifier"] isKindOfClass:NSString.class] ? info[@"CFBundleIdentifier"] : nil;
+    if (!bundleID.length) { *why = @"launched app: no bundle identifier"; return NO; }
+    uint64_t self = ad_sb_task_self();
+    uint64_t bundleStr = r_nsstr_retained(bundleID.UTF8String);
+    if (!self || !bundleStr) { if (bundleStr) r_release(bundleStr); *why = @"launched app: setup failed"; return NO; }
+    int pid = ad_sb_pid_for_bundle(bundleStr);
+    BOOL launched = NO;
+    if (pid <= 0) {
+        uint64_t cls = r_class("LSApplicationWorkspace");
+        uint64_t ws = r_is_objc_ptr(cls) ? r_msg2(cls, "defaultWorkspace", 0, 0, 0, 0) : 0;
+        if (!r_is_objc_ptr(ws)) { r_release(bundleStr); *why = @"launched app: no LSApplicationWorkspace"; return NO; }
+        r_msg2_main(ws, "openApplicationWithBundleID:", bundleStr, 0, 0, 0);
+        launched = YES;
+        for (int i = 0; i < 25 && pid <= 0; i++) {
+            usleep(200000);
+            pid = ad_sb_pid_for_bundle(bundleStr);
+        }
+    }
+    r_release(bundleStr);
+    if (pid <= 0) { *why = @"launched app: it did not start"; return NO; }
+
+    // Stop it immediately; the goal is only to read the pages it has mapped.
+    r_dlsym_call(R_TIMEOUT, "kill", (uint64_t)pid, SIGSTOP, 0, 0, 0, 0, 0, 0);
+    uint64_t taskp = ad_sb_alloc(4);
+    uint32_t task = 0;
+    BOOL ok = NO;
+    if (taskp) {
+        uint64_t zeroTask = 0;
+        remote_write(taskp, &zeroTask, sizeof(zeroTask));
+        uint64_t tfp = r_dlsym_call(R_TIMEOUT, "task_for_pid", self, pid, taskp, 0, 0, 0, 0, 0);
+        remote_read(taskp, &task, sizeof(task));
+        if ((int)tfp == 0 && task) {
+            uint64_t header = ad_sb_main_header(task, self);
+            if (header) {
+                NSString *readWhy = nil;
+                ok = ad_sb_write_task_range(task, header, start, dst, s, NULL, &readWhy);
+                if (!ok) *why = readWhy ?: @"launched app: reading failed";
+                else printf("[DECRYPT]   launched-app pid %d header 0x%llx read 0x%x bytes: ok\n",
+                            pid, header, s->cryptsize);
+            } else *why = @"launched app: no Mach-O header";
+        } else *why = [NSString stringWithFormat:@"launched app: task_for_pid failed (%d)", (int)tfp];
+        ad_sb_free(taskp);
+    } else *why = @"launched app: no task buffer";
+
+    if (launched) r_dlsym_call(R_TIMEOUT, "kill", (uint64_t)pid, SIGKILL, 0, 0, 0, 0, 0, 0);
+    else r_dlsym_call(R_TIMEOUT, "kill", (uint64_t)pid, SIGCONT, 0, 0, 0, 0, 0, 0);
+    if (task) r_dlsym_call(R_TIMEOUT, "mach_port_deallocate", self, task, 0, 0, 0, 0, 0, 0);
+    return ok;
+}
+
 // Writes a copy of `src` with every encrypted slice decrypted and its cryptid
 // cleared to `dst`. *decrypted is NO when the file had nothing encrypted.
 static BOOL ad_decrypt_file(NSString *src, NSString *dst, BOOL useSpringBoard, BOOL *decrypted, NSString **errorOut)
@@ -659,6 +771,13 @@ static BOOL ad_decrypt_file(NSString *src, NSString *dst, BOOL useSpringBoard, B
                 if (!localOK)
                     localWhy = [NSString stringWithFormat:@"%@; SpringBoard spawn: %@",
                                 localWhy ?: @"spawn failed", sbSpawnWhy ?: @"failed"];
+            }
+            if (!localOK && useSpringBoard) {
+                NSString *launchWhy = nil;
+                localOK = ad_decrypt_range_in_launched_app(src, dst, start, &s, &launchWhy);
+                if (!localOK)
+                    localWhy = [NSString stringWithFormat:@"%@; launch: %@",
+                                localWhy ?: @"spawn failed", launchWhy ?: @"failed"];
             }
         }
         void *map = NULL;

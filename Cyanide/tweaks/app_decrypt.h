@@ -9,7 +9,8 @@
 //  own FairPlay pager through mremap_encrypted. A range that isn't 16 KB
 //  aligned cannot use mremap_encrypted; that executable is started suspended,
 //  its already-decrypted pages are read from the task, and it is killed before
-//  it can run its UI.
+//  it can run its UI. If iOS refuses the direct spawn, the app is opened
+//  briefly through SpringBoard and stopped as soon as its pid exists.
 //
 //  Needs filesystem access (sandbox lifted). Blocking; run off-main.
 //
