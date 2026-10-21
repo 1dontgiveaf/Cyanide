@@ -19,6 +19,7 @@
 #import "../LogTextView.h"
 #import "../FBAppContainers.h"
 #import <errno.h>
+#import <sys/xattr.h>
 #import <stdio.h>
 #import <unistd.h>
 
@@ -353,6 +354,41 @@ NSArray<NSDictionary *> *lara_jit_candidate_apps(void)
                            : ([info[@"CFBundleDisplayName"] isKindOfClass:NSString.class] ? info[@"CFBundleDisplayName"]
                            : item.stringByDeletingPathExtension);
             NSMutableDictionary *app = [@{ @"name": name, @"bundleID": bid, @"path": appPath } mutableCopy];
+            if (c.icon) app[@"icon"] = c.icon;
+            [apps addObject:app];
+        }
+    }
+    [apps sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [a[@"name"] localizedCaseInsensitiveCompare:b[@"name"]];
+    }];
+    return apps;
+}
+
+#pragma mark - 3-app limit
+
+const char *const kLaraFreeProfileXattr = "com.apple.installd.validatedByFreeProfile";
+
+NSArray<NSDictionary *> *lara_sideloaded_apps(void)
+{
+    NSString *root = @"/var/containers/Bundle/Application";
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSMutableArray *apps = [NSMutableArray array];
+    for (NSString *uuid in [fm contentsOfDirectoryAtPath:root error:nil]) {
+        NSString *container = [root stringByAppendingPathComponent:uuid];
+        for (NSString *item in [fm contentsOfDirectoryAtPath:container error:nil]) {
+            if (![item.pathExtension isEqualToString:@"app"]) continue;
+            NSString *appPath = [container stringByAppendingPathComponent:item];
+            if (![fm fileExistsAtPath:[appPath stringByAppendingPathComponent:@"embedded.mobileprovision"]]) continue;
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[appPath stringByAppendingPathComponent:@"Info.plist"]];
+            NSString *bid = [info[@"CFBundleIdentifier"] isKindOfClass:NSString.class] ? info[@"CFBundleIdentifier"] : @"";
+            errno = 0;
+            ssize_t size = getxattr(appPath.fileSystemRepresentation, kLaraFreeProfileXattr, NULL, 0, 0, XATTR_NOFOLLOW);
+            int marked = size >= 0 ? 1 : (errno == ENOATTR ? 0 : -1);
+            FBAppContainer *c = fb_container_for_path(container, NO);
+            NSString *name = c.displayName.length ? c.displayName
+                           : ([info[@"CFBundleDisplayName"] isKindOfClass:NSString.class] ? info[@"CFBundleDisplayName"]
+                           : item.stringByDeletingPathExtension);
+            NSMutableDictionary *app = [@{ @"name": name, @"bundleID": bid, @"path": appPath, @"marked": @(marked) } mutableCopy];
             if (c.icon) app[@"icon"] = c.icon;
             [apps addObject:app];
         }

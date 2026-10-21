@@ -68,6 +68,8 @@ extern NSString * const kSettingsFileBrowserRootAccess;
 // the entries returned are a prefix, not the whole folder.
 NSArray<NSDictionary *> *settings_root_list_directory(NSString *path, BOOL *incompleteOut, NSString **errorOut);
 NSData *settings_root_read_file(NSString *path, NSUInteger maxBytes, BOOL *truncatedOut, NSString **errorOut);
+// removexattr as root (through launchd); a missing attribute counts as removed.
+BOOL settings_root_remove_xattr(NSString *path, const char *name, NSString **errorOut);
 extern NSString * const kSettingsA18ExploitPath;
 extern NSString * const kSettingsA18Interleave;
 extern NSString * const kSettingsA18MemoryShaping;

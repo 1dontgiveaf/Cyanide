@@ -27,7 +27,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
 @property (nonatomic, copy) NSString *status;        // shown in the first footer
 @property (nonatomic) int hudMode;                   // -1 off, -2 unknown
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *prefStates;   // index -> 0/1
-@property (nonatomic, copy) NSArray<NSDictionary *> *jitApps;   // nil until listed
+@property (nonatomic, copy) NSArray<NSDictionary *> *jitApps;   // nil until listed (JIT / app limit)
 @end
 
 @implementation LaraViewController
@@ -45,6 +45,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             case LaraToolUpsideDown:     self.title = @"Upside Down"; break;
             case LaraToolHiddenSettings: self.title = @"Hidden Settings"; break;
             case LaraToolJIT:            self.title = @"JIT Enabler"; break;
+            case LaraToolAppLimit:       self.title = @"3-App Limit"; break;
         }
     }
     return self;
@@ -55,7 +56,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
     [super viewDidLoad];
     self.navigationItem.largeTitleDisplayMode = UINavigationItemLargeTitleDisplayModeNever;
     if (self.tool == LaraToolPerformanceHUD || self.tool == LaraToolHiddenSettings) [self readState];
-    if (self.tool == LaraToolJIT) [self listJITApps];
+    if (self.tool == LaraToolJIT || self.tool == LaraToolAppLimit) [self listJITApps];
 }
 
 // Apps signed with get-task-allow; needs the filesystem sandbox lifted.
@@ -77,14 +78,18 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             if (needsRun) settings_tool_needs_exploit(me, me.tableView, @"JIT Enabler", ^{ [weakSelf listJITApps]; });
             return;
         }
+        BOOL limit = me.tool == LaraToolAppLimit;
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-            NSArray *apps = lara_jit_candidate_apps();
+            NSArray *apps = limit ? lara_sideloaded_apps() : lara_jit_candidate_apps();
             dispatch_async(dispatch_get_main_queue(), ^{
                 typeof(self) me2 = weakSelf;
                 if (!me2) return;
                 me2.busy = NO;
                 me2.jitApps = apps;
-                me2.status = apps.count ? nil
+                // Keep a result message set while the list reloaded.
+                BOOL placeholder = [me2.status isEqualToString:@"Looking for apps…"];
+                me2.status = apps.count ? (placeholder ? nil : me2.status)
+                    : limit ? @"No sideloaded apps found."
                     : @"No app here can get JIT. It only works for apps installed with a development profile (get-task-allow), e.g. sideloaded with a developer certificate.";
                 [me2.tableView reloadData];
             });
@@ -145,8 +150,21 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
 
 #pragma mark Table
 
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView
+{
+    return self.tool == LaraToolAppLimit ? 2 : 1;   // app limit: action, then the apps
+}
+
+- (NSUInteger)markedAppCount
+{
+    NSUInteger n = 0;
+    for (NSDictionary *app in self.jitApps) if ([app[@"marked"] intValue] == 1) n++;
+    return n;
+}
+
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
 {
+    if (self.tool == LaraToolAppLimit) return section == 0 ? (self.jitApps ? 1 : 0) : (NSInteger)self.jitApps.count;
     switch (self.tool) {
         case LaraToolPerformanceHUD: return kLaraHUDModeCount;
         case LaraToolDebugOverlay:
@@ -157,12 +175,20 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             return n;
         }
         case LaraToolJIT: return (NSInteger)self.jitApps.count;
+        case LaraToolAppLimit: return 0;
     }
     return 0;
 }
 
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section
+{
+    if (self.tool != LaraToolAppLimit || section != 1 || !self.jitApps.count) return nil;
+    return @"Sideloaded Apps";
+}
+
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section
 {
+    if (section != [self numberOfSectionsInTableView:tableView] - 1) return nil;
     NSString *about = nil;
     switch (self.tool) {
         case LaraToolPerformanceHUD:
@@ -176,6 +202,9 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             break;
         case LaraToolHiddenSettings:
             about = @"Hidden iOS preferences. Most take effect after a respring and stay until you turn them off.";
+            break;
+        case LaraToolAppLimit:
+            about = @"With a free Apple ID, iOS allows only 3 sideloaded apps: installd marks each one, and only marked apps count. Removing the marks frees the slots. Run it again after installing or refreshing (re-signing) an app, which marks it again.";
             break;
         case LaraToolJIT:
             about = @"Tap an app to open it with JIT (for emulators and similar apps). Only apps signed with a development profile can get it. JIT lasts until the app quits; some apps can't tell it's on.";
@@ -224,6 +253,25 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
             break;
         }
+        case LaraToolAppLimit: {
+            if (indexPath.section == 0) {
+                NSUInteger marked = [self markedAppCount];
+                c.text = marked ? [NSString stringWithFormat:@"Remove Limit Marks (%lu)", (unsigned long)marked]
+                                : @"No App Counts Toward the Limit";
+                c.textProperties.color = (marked && !self.busy) ? UIColor.systemBlueColor : UIColor.secondaryLabelColor;
+                break;
+            }
+            NSDictionary *app = self.jitApps[indexPath.row];
+            int marked = [app[@"marked"] intValue];
+            c.text = app[@"name"];
+            c.secondaryText = marked == 1 ? @"Counts toward the limit" : marked == 0 ? @"Not counted" : @"Unknown";
+            c.secondaryTextProperties.color = marked == 1 ? UIColor.systemOrangeColor : UIColor.secondaryLabelColor;
+            c.image = app[@"icon"] ?: [UIImage systemImageNamed:@"app.dashed"];
+            c.imageProperties.maximumSize = CGSizeMake(36, 36);
+            c.imageProperties.cornerRadius = 8;
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            break;
+        }
         case LaraToolJIT: {
             NSDictionary *app = self.jitApps[indexPath.row];
             c.text = app[@"name"];
@@ -264,6 +312,9 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
         }
         case LaraToolHiddenSettings:
             break;
+        case LaraToolAppLimit:
+            if (indexPath.section == 0 && [self markedAppCount] > 0) [self removeLimitMarks];
+            break;
         case LaraToolJIT: {
             NSDictionary *app = self.jitApps[indexPath.row];
             NSString *bid = app[@"bundleID"], *name = app[@"name"];
@@ -279,6 +330,38 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             break;
         }
     }
+}
+
+// Removes installd's free-profile mark from every counted app, as root
+// through launchd (the bundles stay owned by installd), then rescans.
+- (void)removeLimitMarks
+{
+    NSMutableArray<NSString *> *paths = [NSMutableArray array];
+    for (NSDictionary *app in self.jitApps) if ([app[@"marked"] intValue] == 1) [paths addObject:app[@"path"]];
+    if (!paths.count || self.busy) return;
+    self.busy = YES;
+    self.status = @"Removing the marks…";
+    [self.tableView reloadData];
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSUInteger done = 0;
+        NSString *lastError = nil;
+        for (NSString *path in paths) {
+            NSString *err = nil;
+            if (settings_root_remove_xattr(path, kLaraFreeProfileXattr, &err)) done++;
+            else lastError = err;
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) me = weakSelf;
+            if (!me) return;
+            me.busy = NO;
+            [me listJITApps];
+            me.status = done == paths.count
+                ? [NSString stringWithFormat:@"Removed the mark from %lu app%@.", (unsigned long)done, done == 1 ? @"" : @"s"]
+                : [NSString stringWithFormat:@"Removed %lu of %lu: %@", (unsigned long)done, (unsigned long)paths.count,
+                                             lastError ?: @"see the log"];
+        });
+    });
 }
 
 - (void)prefSwitched:(UISwitch *)sw

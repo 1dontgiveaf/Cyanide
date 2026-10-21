@@ -54,3 +54,12 @@ int lara_jit_enable_in_session(NSString *bundleID);
 // get-task-allow). Each: @{ name, bundleID, path, (icon) }. Needs filesystem
 // access (sandbox lifted); blocking.
 NSArray<NSDictionary *> *lara_jit_candidate_apps(void);
+
+// The free-account 3-app limit: installd marks every app installed with a
+// free (non-paid) profile with this extended attribute, and only marked apps
+// count. Sideloaded apps (with an embedded.mobileprovision), each:
+// @{ name, bundleID, path, (icon), marked: @1 counted / @0 not / @-1 unknown }.
+// Needs filesystem access; blocking.
+extern const char *const kLaraFreeProfileXattr;
+NSArray<NSDictionary *> *lara_sideloaded_apps(void);
+

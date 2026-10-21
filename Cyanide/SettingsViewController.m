@@ -14,6 +14,7 @@
 #import <dlfcn.h>
 #import <fcntl.h>
 #import <sys/stat.h>
+#import <sys/xattr.h>
 #import "AppDelegate.h"   // round 31: cyanide_launch_trace
 #import "VPhoneDebug.h"
 #import "kexploit/kexploit_opa334.h"
@@ -12847,6 +12848,46 @@ NSData *settings_root_read_file(NSString *path, NSUInteger maxBytes, BOOL *trunc
     return out;
 }
 
+// removexattr(path, name) run by launchd, i.e. as root: for attributes on
+// files mobile doesn't own (e.g. installd's marks on app bundles). Never
+// follows a symlink. A missing attribute counts as removed.
+BOOL settings_root_remove_xattr(NSString *path, const char *name, NSString **errorOut)
+{
+    if (!pm_root_path_ok(path) || !name || !name[0] || strlen(name) >= 256) {
+        if (errorOut) *errorOut = @"Invalid path or attribute name.";
+        return NO;
+    }
+    __block BOOL removed = NO;
+    __block NSString *error = nil;
+    pm_with_launchd_session("remove xattr", &error, ^(RemoteCallSession *s) {
+        BOOL ok;
+        uint64_t buf = pm_root_call(s, 1000, "malloc", PM_ROOT_DATA_OFF + 256, 0, 0, &ok);
+        if (!ok || !buf) { error = ok ? @"launchd could not allocate a buffer." : kPMRootTransportError; return; }
+        uint64_t nameBuf = buf + PM_ROOT_DATA_OFF;
+        if (![s remoteWriteString:buf value:path.fileSystemRepresentation] ||
+            ![s remoteWriteString:nameBuf value:name]) {
+            error = kPMRootTransportError;
+        } else {
+            int rc = (int)pm_root_call(s, 1000, "removexattr", buf, nameBuf, XATTR_NOFOLLOW, &ok);
+            if (!ok) {
+                error = kPMRootTransportError;
+            } else if (rc == 0) {
+                removed = YES;
+            } else {
+                BOOL ok2 = NO;
+                uint64_t errPtr = pm_root_call(s, 100, "__error", 0, 0, 0, &ok2);
+                int err = 0;
+                if (ok2 && errPtr) (void)[s remoteRead:errPtr to:&err size:sizeof(err)];
+                if (err == ENOATTR) removed = YES;
+                else error = [NSString stringWithFormat:@"removexattr: %s", err > 0 ? strerror(err) : "failed"];
+            }
+        }
+        pm_root_call(s, 1000, "free", buf, 0, 0, &ok);
+    });
+    if (!removed && errorOut) *errorOut = error ?: @"The attribute could not be removed.";
+    return removed;
+}
+
 - (int)pmForceKillViaLaunchdLocked:(int)pid expectedName:(NSString *)expectedName
                      expectedKproc:(uint64_t)expectedKproc
                       allowRebuild:(BOOL)allowRebuild
@@ -14864,6 +14905,7 @@ UIViewController *settings_make_daemons_viewer(void)
         @{ @"title": @"Upside Down",      @"icon": @"arrow.up.and.down.circle.fill", @"color": [UIColor systemIndigoColor], @"section": @(-1), @"custom": @"lara", @"lara": @(LaraToolUpsideDown) },
         @{ @"title": @"Hidden Settings",  @"icon": @"eye.slash.fill",        @"color": [UIColor systemGrayColor],   @"section": @(-1), @"custom": @"lara", @"lara": @(LaraToolHiddenSettings) },
         @{ @"title": @"JIT Enabler",      @"icon": @"bolt.horizontal.fill",  @"color": [UIColor systemYellowColor], @"section": @(-1), @"custom": @"lara", @"lara": @(LaraToolJIT) },
+        @{ @"title": @"3-App Limit",      @"icon": @"square.stack.3d.up.fill", @"color": [UIColor systemTealColor], @"section": @(-1), @"custom": @"lara", @"lara": @(LaraToolAppLimit) },
     ];
 }
 
