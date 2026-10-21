@@ -17,6 +17,7 @@
 #import <pwd.h>
 #import <sys/stat.h>
 #import <sys/file.h>
+#import <sys/clonefile.h>
 #import <stdatomic.h>
 
 // The pending-changes popup bar is hosted by the tab bar controller above
@@ -1396,7 +1397,8 @@ static NSUInteger fb_hex_line_chars(NSUInteger digits, NSUInteger per)
 // Shares the file's CONTENTS (a symlink's target, never the link itself) as a
 // regular file in a per-share temp folder, so the receiving app never needs
 // access to the original location. Runs off-main: a root read can wait for
-// the launchd warm-up and transfer up to 64 MB.
+// the launchd warm-up and transfer up to 64 MB (root reads go through
+// memory; files Cyanide can read itself have no limit).
 static const NSUInteger kFBMaxShareBytes = 64 * 1024 * 1024;
 
 // A marker is held open and flocked for the whole operation, including while
@@ -1554,32 +1556,32 @@ static BOOL fb_share_copy_regular(FBShareOperation *op, NSString *path, NSString
 {
     if ([op isCancelled]) { if (failure) *failure = @"Sharing was cancelled."; return NO; }
     int in = filebrowser_open_regular(path);
+    if (in < 0) { *failure = @"Only regular files can be shared."; return NO; }
+    // An APFS clone: instant and takes no space, whatever the size (a
+    // decrypted IPA is easily hundreds of MB). Cloned from the open fd, so
+    // it's the file that was checked, never a swapped-in link.
+    if (fclonefileat(in, AT_FDCWD, op.stagedPath.fileSystemRepresentation, 0) == 0) {
+        close(in);
+        return YES;
+    }
+    // Otherwise a streamed copy (no size limit: nothing is held in memory),
+    // when there is room for it.
     struct stat inSt;
-    BOOL tooLarge = in >= 0 && fstat(in, &inSt) == 0 && inSt.st_size > (off_t)kFBMaxShareBytes;
-    int out = (in < 0 || tooLarge) ? -1
-            : open(op.stagedPath.fileSystemRepresentation, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0644);
-    if (in < 0) {
-        if (failure) *failure = @"Only regular files can be shared.";
-    } else if (tooLarge) {
-        if (failure) *failure = @"The file is larger than 64 MB. Sharing files that large is not supported.";
-    } else if (out < 0) {
-        if (failure) *failure = @"The copy could not be created.";
+    NSDictionary *fsAttrs = [NSFileManager.defaultManager attributesOfFileSystemForPath:op.stagedPath.stringByDeletingLastPathComponent error:nil];
+    unsigned long long freeBytes = [fsAttrs[NSFileSystemFreeSize] unsignedLongLongValue];
+    int out = -1;
+    if (fstat(in, &inSt) == 0 && freeBytes && (unsigned long long)inSt.st_size + 50ULL * 1024 * 1024 > freeBytes) {
+        *failure = @"There isn't enough free space to share a copy of this file.";
     } else {
+        out = open(op.stagedPath.fileSystemRepresentation, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0644);
+        if (out < 0) *failure = @"The copy could not be created.";
+    }
+    if (out >= 0) {
         char buf[64 * 1024];
-        unsigned long long copied = 0;
         ssize_t n;
         while (!*failure) {
             if ([op isCancelled]) { *failure = @"Sharing was cancelled."; break; }
-            if (copied >= kFBMaxShareBytes) {
-                n = read(in, buf, 1); // distinguish exactly-at-limit EOF from growth
-                if (n > 0) *failure = @"The file grew beyond the 64 MB sharing limit.";
-                else if (n < 0 && errno != EINTR) *failure = @"The file could not be read.";
-                if (!*failure && n == 0) break;
-                if (n < 0 && errno == EINTR) continue;
-                break;
-            }
-            size_t want = (size_t)MIN((unsigned long long)sizeof(buf), kFBMaxShareBytes - copied);
-            n = read(in, buf, want);
+            n = read(in, buf, sizeof(buf));
             if (n < 0 && errno == EINTR) continue;
             if (n < 0) { *failure = @"The file could not be read."; break; }
             if (n == 0) break;
@@ -1591,10 +1593,9 @@ static BOOL fb_share_copy_regular(FBShareOperation *op, NSString *path, NSString
                 if (w <= 0) { *failure = @"The copy could not be written."; break; }
                 done += (size_t)w;
             }
-            copied += (unsigned long long)n;
         }
     }
-    if (in >= 0) close(in);
+    close(in);
     if (out >= 0) close(out);
     if (*failure) [NSFileManager.defaultManager removeItemAtPath:op.stagedPath error:nil];
     return !*failure;
