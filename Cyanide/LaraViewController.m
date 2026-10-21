@@ -32,6 +32,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *prefStates;   // index -> 0/1
 @property (nonatomic, copy) NSArray<NSDictionary *> *jitApps;   // nil until listed (JIT / app limit / cards)
 @property (nonatomic, strong) NSDictionary *pickingCard;          // card whose image is being picked
+@property (nonatomic, strong) UIProgressView *progressBar;        // under the navigation bar while decrypting
 @end
 
 @implementation LaraViewController
@@ -419,6 +420,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
     self.status = [NSString stringWithFormat:@"Decrypting %@…", app[@"name"]];
     // Show the progress where it's visible (the footer is below the list).
     self.navigationItem.prompt = self.status;
+    [self showProgressBar];
     [self.tableView reloadData];
     // A large app takes a while: keep going for a bit if Cyanide is backgrounded.
     __block UIBackgroundTaskIdentifier bg = [UIApplication.sharedApplication beginBackgroundTaskWithName:@"Decrypt" expirationHandler:^{
@@ -435,6 +437,9 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
         dispatch_async(dispatch_get_main_queue(), ^{
             weakSelf.status = [NSString stringWithFormat:@"%@ — %.0f %%", step, fraction * 100];
             weakSelf.navigationItem.prompt = [NSString stringWithFormat:@"%.0f %% · %@", fraction * 100, step];
+            // Never backwards: retries restart a step at a lower fraction.
+            UIProgressView *bar = weakSelf.progressBar;
+            if (fraction > bar.progress) [bar setProgress:(float)fraction animated:YES];
         });
     };
     // Inside a SpringBoard session: when iOS won't decrypt in Cyanide,
@@ -448,6 +453,8 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
         if (!me) return;
         me.busy = NO;
         me.navigationItem.prompt = nil;
+        [me.progressBar removeFromSuperview];
+        me.progressBar = nil;
         if ([message isEqualToString:kSettingsFullExploitRequiredMessage]) {
             me.status = kSettingsNoKernelAccessHint;
             [me.tableView reloadData];
@@ -475,6 +482,35 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
         [ac addAction:[UIAlertAction actionWithTitle:ipa ? @"Done" : @"OK" style:UIAlertActionStyleCancel handler:nil]];
         [me presentViewController:ac animated:YES completion:nil];
     });
+}
+
+- (void)showProgressBar
+{
+    [self.progressBar removeFromSuperview];
+    UINavigationBar *navBar = self.navigationController.navigationBar;
+    if (!navBar) return;
+    UIProgressView *bar = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleBar];
+    bar.translatesAutoresizingMaskIntoConstraints = NO;
+    [navBar addSubview:bar];
+    [NSLayoutConstraint activateConstraints:@[
+        [bar.leadingAnchor constraintEqualToAnchor:navBar.leadingAnchor],
+        [bar.trailingAnchor constraintEqualToAnchor:navBar.trailingAnchor],
+        [bar.bottomAnchor constraintEqualToAnchor:navBar.bottomAnchor],
+    ]];
+    self.progressBar = bar;
+}
+
+- (void)viewWillDisappear:(BOOL)animated
+{
+    [super viewWillDisappear:animated];
+    // The bar lives on the shared navigation bar: don't leave it on other screens.
+    self.progressBar.hidden = YES;
+}
+
+- (void)viewWillAppear:(BOOL)animated
+{
+    [super viewWillAppear:animated];
+    self.progressBar.hidden = NO;
 }
 
 #pragma mark Wallet card art

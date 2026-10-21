@@ -371,8 +371,9 @@ static BOOL ad_try_mremap_variants(int fd, int out, uint64_t start, size_t page,
 @interface ADProcess : NSObject
 @property (nonatomic) int pid;
 @property (nonatomic) uint64_t vmMap;
-@property (nonatomic, strong) NSMutableData *entries;                    // struct VMEntryInfo[], executable only
+@property (nonatomic, strong) NSMutableData *entries;                    // struct VMEntryInfo[], user space
 @property (nonatomic, strong) NSMutableDictionary<NSData *, NSNumber *> *bases;   // LC_UUID -> load address of the slice
+@property (nonatomic, copy) void (^copyProgress)(double fraction);      // within the slice being copied
 @end
 @implementation ADProcess
 @end
@@ -388,27 +389,81 @@ static int ad_pid_for_bundle(uint64_t bundleStr)
 
 static NSData *ad_uuid_key(const uint8_t uuid[16]) { return [NSData dataWithBytes:uuid length:16]; }
 
-// LC_UUID of the Mach-O header at the start of `page` (one mapped page).
-static BOOL ad_header_uuid(const uint8_t *page, size_t len, uint8_t uuid[16])
+// LC_UUID of the Mach-O header at the start of `buf` (`len` mapped bytes).
+// Large apps have more load commands than fit in one page: when LC_UUID
+// wasn't reached, *need is how many bytes the header takes.
+static BOOL ad_header_uuid(const uint8_t *buf, size_t len, uint8_t uuid[16], size_t *need)
 {
+    *need = 0;
     if (len < sizeof(struct mach_header_64)) return NO;
-    const struct mach_header_64 *mh = (const void *)page;
-    if (mh->magic != MH_MAGIC_64 || sizeof(*mh) + mh->sizeofcmds > len) return NO;
-    const uint8_t *p = page + sizeof(*mh), *end = p + mh->sizeofcmds;
+    const struct mach_header_64 *mh = (const void *)buf;
+    if (mh->magic != MH_MAGIC_64) return NO;
+    const uint8_t *p = buf + sizeof(*mh), *end = p + mh->sizeofcmds, *limit = buf + len;
     for (uint32_t i = 0; i < mh->ncmds && p + sizeof(struct load_command) <= end; i++) {
         const struct load_command *lc = (const void *)p;
+        if (p + sizeof(*lc) > limit) break;
         if (lc->cmdsize < sizeof(*lc) || p + lc->cmdsize > end) return NO;
+        if (p + lc->cmdsize > limit) break;
         if (lc->cmd == LC_UUID && lc->cmdsize >= sizeof(struct uuid_command)) {
             memcpy(uuid, ((const struct uuid_command *)(const void *)p)->uuid, 16);
             return YES;
         }
         p += lc->cmdsize;
     }
+    if (end > limit) *need = sizeof(*mh) + mh->sizeofcmds;
     return NO;
 }
 
-// Collects the app's executable map entries and finds where each wanted
-// image (by UUID) starts. Kernel reads only on the app's own map entries.
+// Collects the app's map entries and finds where each wanted image (by
+// UUID) starts. Kernel reads only on the app's own map entries.
+static void ad_process_scan_once(ADProcess *proc, NSSet<NSData *> *wanted, BOOL verbose, NSUInteger *execCount)
+{
+    NSMutableData *entries = [NSMutableData data];
+    vm_map_iterate_entries(proc.vmMap, ^(uint64_t start, uint64_t end, uint64_t entry, BOOL *stop) {
+        if (start >= 0x7000000000ULL) return;               // user space only
+        struct VMEntryInfo info;
+        if (!vm_map_entry_info(entry, &info) || info.isSubmap || !info.object) return;
+        [entries appendBytes:&info length:sizeof(info)];
+    });
+    proc.entries = entries;
+    proc.bases = [NSMutableDictionary dictionary];
+    const struct VMEntryInfo *e = entries.bytes;
+    NSUInteger n = entries.length / sizeof(*e), logged = 0;
+    size_t page = (size_t)getpagesize();
+    *execCount = 0;
+    for (NSUInteger i = 0; i < n; i++) {
+        BOOL exec = (e[i].protection & VM_PROT_EXECUTE) != 0;
+        if (exec) (*execCount)++;
+        if (proc.bases.count >= wanted.count) continue;
+        // A header starts code, or the read-only part right in front of it.
+        BOOL beforeExec = i + 1 < n && e[i + 1].start == e[i].end && (e[i + 1].protection & VM_PROT_EXECUTE);
+        if ((!exec && !beforeExec) || e[i].offset % page) continue;
+        uint64_t size = e[i].end - e[i].start;
+        size_t len = page, need = 0;
+        uint8_t uuid[16];
+        BOOL isImage = NO, mapped = NO;
+        for (int pass = 0; pass < 2 && !isImage; pass++) {
+            struct VMShmem m = vm_map_object_range(e[i].object, e[i].offset, len);
+            if (!m.used) break;
+            mapped = YES;
+            isImage = ad_header_uuid((const uint8_t *)m.localAddress, len, uuid, &need);
+            vm_shmem_release(&m, len);
+            if (isImage || need <= len || need > size || need > (1u << 20)) break;
+            len = (need + page - 1) & ~(page - 1);   // the whole header, then look again
+        }
+        BOOL hit = isImage && [wanted containsObject:ad_uuid_key(uuid)];
+        if (verbose && logged < 60) {
+            logged++;
+            printf("[DECRYPT]   entry 0x%llx-0x%llx prot=%x off=0x%llx %s\n", e[i].start, e[i].end, e[i].protection,
+                   e[i].offset, !mapped ? "unreadable" : hit ? "wanted image" : isImage ? "other image" :
+                   need ? "header too large" : "no header");
+        }
+        // The header sits at the entry's start: that's the slice's offset 0.
+        NSData *key = isImage ? ad_uuid_key(uuid) : nil;
+        if (hit && !proc.bases[key]) proc.bases[key] = @(e[i].start);
+    }
+}
+
 static BOOL ad_process_scan(ADProcess *proc, NSSet<NSData *> *wanted, NSString **why)
 {
     if (!kexploit_krw_ready()) { *why = @"kernel access isn't active"; return NO; }
@@ -422,33 +477,16 @@ static BOOL ad_process_scan(ADProcess *proc, NSSet<NSData *> *wanted, NSString *
     proc.vmMap = task ? task_get_vm_map(task) : 0;
     if (!proc.vmMap) { *why = @"the app's memory map wasn't found"; return NO; }
 
-    NSMutableData *entries = [NSMutableData data];
-    vm_map_iterate_entries(proc.vmMap, ^(uint64_t start, uint64_t end, uint64_t entry, BOOL *stop) {
-        if (start >= 0x7000000000ULL) return;               // user space only
-        struct VMEntryInfo info;
-        if (!vm_map_entry_info(entry, &info) || info.isSubmap || !info.object) return;
-        if (!(info.protection & VM_PROT_EXECUTE)) return;   // code only
-        [entries appendBytes:&info length:sizeof(info)];
-    });
-    proc.entries = entries;
-    proc.bases = [NSMutableDictionary dictionary];
-    const struct VMEntryInfo *e = entries.bytes;
-    NSUInteger n = entries.length / sizeof(*e);
-    size_t page = (size_t)getpagesize();
-    for (NSUInteger i = 0; i < n && proc.bases.count < wanted.count; i++) {
-        if (e[i].offset % page) continue;
-        struct VMShmem m = vm_map_object_range(e[i].object, e[i].offset, page);
-        if (!m.used) continue;
-        uint8_t uuid[16];
-        BOOL isImage = ad_header_uuid((const uint8_t *)m.localAddress, page, uuid);
-        vm_shmem_release(&m, page);
-        if (!isImage) continue;
-        NSData *key = ad_uuid_key(uuid);
-        // The header sits at the entry's start: that's the slice's offset 0.
-        if ([wanted containsObject:key] && !proc.bases[key]) proc.bases[key] = @(e[i].start);
+    NSUInteger execCount = 0;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        // Still starting up: give dyld a moment, then look again (with the
+        // entries in the log on the last try).
+        if (attempt) usleep(1500000);
+        ad_process_scan_once(proc, wanted, attempt == 2, &execCount);
+        if (proc.bases.count >= wanted.count) break;
     }
     printf("[DECRYPT] process %d (%s): %lu executable entries, %lu of %lu images found\n", proc.pid, comm,
-           (unsigned long)n, (unsigned long)proc.bases.count, (unsigned long)wanted.count);
+           (unsigned long)execCount, (unsigned long)proc.bases.count, (unsigned long)wanted.count);
     if (!proc.bases.count) { *why = @"the app's code wasn't found in its memory"; return NO; }
     return YES;
 }
@@ -483,6 +521,7 @@ static BOOL ad_process_copy(ADProcess *proc, const ADEncryptedSlice *s, int out,
         vm_shmem_release(&m, chunk);
         if (!wrote) { *why = @"writing the copy failed"; return NO; }
         pos += take;
+        if (proc.copyProgress) proc.copyProgress((double)(pos - fileStart) / (double)(fileEnd - fileStart));
     }
     return YES;
 }
@@ -823,6 +862,15 @@ NSString *app_decrypt_make_ipa(NSDictionary *app, BOOL useSpringBoard,
         return [@(rank(a)) compare:@(rank(b))];
     }];
     NSMutableSet<NSString *> *droppedBundles = [NSMutableSet set];   // extension bundles left out
+    // Progress: 5-45 % decrypting (by file size: the big executables take
+    // the time), 45-100 % packing.
+    __block uint64_t doneBytes = 0;
+    __block uint64_t fileBytes = 0;
+    __block NSString *fileName = nil;
+    void (^fileProgress)(double) = ^(double f) {
+        report([@"Decrypting " stringByAppendingString:fileName ?: @""],
+               0.05 + 0.4 * ((double)doneBytes + f * (double)fileBytes) / (double)MAX(totalBytes, 1ULL));
+    };
     // Once mremap_encrypted is refused (iOS 18 refuses it outright), the app
     // is started in the background and every image is read from it instead.
     __block ADProcess *proc = nil;
@@ -852,6 +900,7 @@ NSString *app_decrypt_make_ipa(NSDictionary *app, BOOL useSpringBoard,
         if (pid > 0) {
             ADProcess *p = [ADProcess new];
             p.pid = pid;
+            p.copyProgress = fileProgress;
             if (ad_process_scan(p, wanted, &why)) proc = p;
         }
         procWhy = why;
@@ -862,11 +911,15 @@ NSString *app_decrypt_make_ipa(NSDictionary *app, BOOL useSpringBoard,
         index++;
         NSString *src = [appPath stringByAppendingPathComponent:rel];
         struct stat st;
-        if (lstat(src.fileSystemRepresentation, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 4096) continue;
+        if (lstat(src.fileSystemRepresentation, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        doneBytes += fileBytes;
+        fileBytes = (uint64_t)st.st_size;
+        fileName = rel.lastPathComponent;
+        if (st.st_size < 4096) continue;
         NSString *dst = [work stringByAppendingPathComponent:[NSString stringWithFormat:@"%lu.bin", (unsigned long)index]];
         BOOL decrypted = NO;
         NSString *err = nil;
-        report([@"Decrypting " stringByAppendingString:rel.lastPathComponent], 0.4 * index / MAX(ordered.count, 1u));
+        fileProgress(0);
         BOOL fileOK = ad_decrypt_file(src, dst, useSpringBoard, proc, &decrypted, &err);
         BOOL inExtension = [rel containsString:@".appex/"] || [rel hasPrefix:@"Watch/"];
         if (!fileOK && !proc && !inExtension && useSpringBoard && startProcess()) {
@@ -939,7 +992,7 @@ NSString *app_decrypt_make_ipa(NSDictionary *app, BOOL useSpringBoard,
                 ok = NO; break;
             }
             report([@"Packing " stringByAppendingString:rel.lastPathComponent],
-                   0.4 + 0.6 * (double)packed / (double)MAX(totalBytes, 1ULL));
+                   0.45 + 0.55 * (double)packed / (double)MAX(totalBytes, 1ULL));
             ok = [zip addEntry:name mode:st.st_mode mtime:st.st_mtime size:(uint64_t)fs.st_size crc:crc body:^BOOL{
                 uint64_t written = 0;
                 BOOL copied = ad_copy_into(zip.fd, from, &written) && written == (uint64_t)fs.st_size;
