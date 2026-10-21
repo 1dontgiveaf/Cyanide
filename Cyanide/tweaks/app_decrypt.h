@@ -8,7 +8,7 @@
 //  refuses mremap_encrypted outside the app itself, so the app is started
 //  suspended in the background and its decrypted pages are read through the
 //  kernel from the FairPlay pager objects in its VM map. Encrypted app
-//  extensions aren't loaded by the app and are left out.
+//  extensions and Watch apps aren't loaded by the app and are left out.
 //
 //  Needs filesystem access (sandbox lifted). Blocking; run off-main.
 //

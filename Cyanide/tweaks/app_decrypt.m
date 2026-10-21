@@ -912,8 +912,12 @@ NSString *app_decrypt_make_ipa(NSDictionary *app, BOOL useSpringBoard,
         NSString *src = [appPath stringByAppendingPathComponent:rel];
         struct stat st;
         if (lstat(src.fileSystemRepresentation, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        BOOL inDropped = NO;   // the rest of a bundle already left out
+        for (NSString *bundle in droppedBundles)
+            if ([rel hasPrefix:[bundle stringByAppendingString:@"/"]]) { inDropped = YES; break; }
         doneBytes += fileBytes;
         fileBytes = (uint64_t)st.st_size;
+        if (inDropped) continue;
         fileName = rel.lastPathComponent;
         if (st.st_size < 4096) continue;
         NSString *dst = [work stringByAppendingPathComponent:[NSString stringWithFormat:@"%lu.bin", (unsigned long)index]];
@@ -929,10 +933,13 @@ NSString *app_decrypt_make_ipa(NSDictionary *app, BOOL useSpringBoard,
             err = [NSString stringWithFormat:@"%@ (reading it from the running app: %@)", err, procWhy];
         }
         if (!fileOK) {
-            // Inside an .appex: drop that whole extension, keep going.
+            // Inside the Watch app or an .appex: drop that whole bundle (the
+            // Watch folder, the extension), keep going.
             NSRange appex = [rel rangeOfString:@".appex/"];
-            if (appex.location != NSNotFound) {
-                NSString *bundle = [rel substringToIndex:appex.location + 6];   // ".../Name.appex"
+            NSString *bundle = [rel hasPrefix:@"Watch/"] ? @"Watch"
+                             : appex.location != NSNotFound ? [rel substringToIndex:appex.location + 6]   // ".../Name.appex"
+                             : nil;
+            if (bundle) {
                 [droppedBundles addObject:bundle];
                 log_user("[DECRYPT] Leaving out %s: %s\n", bundle.UTF8String, err.UTF8String);
                 continue;
@@ -1017,9 +1024,12 @@ NSString *app_decrypt_make_ipa(NSDictionary *app, BOOL useSpringBoard,
         return nil;
     }
     report(@"Done", 1.0);
-    if (droppedBundles.count && errorOut)   // not an error: tells the caller what was left out
-        *errorOut = [NSString stringWithFormat:@"Left out (couldn't be decrypted): %@",
-                     [[droppedBundles.allObjects valueForKey:@"lastPathComponent"] componentsJoinedByString:@", "]];
+    if (droppedBundles.count && errorOut) {   // not an error: tells the caller what was left out
+        NSMutableArray<NSString *> *names = [NSMutableArray array];
+        for (NSString *bundle in droppedBundles)
+            [names addObject:[bundle isEqualToString:@"Watch"] ? @"the Watch app" : bundle.lastPathComponent];
+        *errorOut = [NSString stringWithFormat:@"Left out (couldn't be decrypted): %@", [names componentsJoinedByString:@", "]];
+    }
     log_user("[DECRYPT] %s: %lu binar%s decrypted -> %s\n", [app[@"name"] UTF8String],
              (unsigned long)replaced.count, replaced.count == 1 ? "y" : "ies", ipa.lastPathComponent.UTF8String);
     return ipa;
