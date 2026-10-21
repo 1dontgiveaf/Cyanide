@@ -332,8 +332,15 @@ static BOOL ad_decrypt_range_in_spawned_process(NSString *src, int out, uint64_t
     int rc = posix_spawn(&pid, path, NULL, &attr, argv, environ);
     posix_spawnattr_destroy(&attr);
     if (rc != 0 || pid <= 0) {
-        *why = [NSString stringWithFormat:@"posix_spawn: %s", strerror(rc)];
-        return NO;
+        // Some app executables refuse the suspended flag but can still be
+        // started normally; kill it immediately after the read.
+        printf("[DECRYPT]   spawn with STOPPED: %s; retrying without the attribute\n", strerror(rc));
+        pid = 0;
+        rc = posix_spawn(&pid, path, NULL, NULL, argv, environ);
+        if (rc != 0 || pid <= 0) {
+            *why = [NSString stringWithFormat:@"posix_spawn: %s", strerror(rc)];
+            return NO;
+        }
     }
     mach_port_t task = MACH_PORT_NULL;
     kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
@@ -534,6 +541,10 @@ static BOOL ad_decrypt_range_in_springboard_spawn(NSString *src, NSString *dst, 
         r_dlsym_call(R_TIMEOUT, "posix_spawnattr_setflags", attrp, POSIX_SPAWN_START_SUSPENDED, 0, 0, 0, 0, 0, 0);
         uint64_t rc = r_dlsym_call(R_TIMEOUT, "posix_spawn", pidp, rsrc, 0, attrp, argv, envp, 0, 0);
         if (!r_last_call_ok() || (int)rc != 0) {
+            printf("[DECRYPT]   SpringBoard spawn with STOPPED: %d; retrying without it\n", (int)rc);
+            rc = r_dlsym_call(R_TIMEOUT, "posix_spawn", pidp, rsrc, 0, 0, argv, envp, 0, 0);
+        }
+        if (!r_last_call_ok() || (int)rc != 0) {
             *why = [NSString stringWithFormat:@"SpringBoard: posix_spawn failed (%d)", (int)rc]; break;
         }
         uint32_t p32 = 0;
@@ -655,10 +666,11 @@ static BOOL ad_decrypt_file(NSString *src, NSString *dst, BOOL useSpringBoard, B
             map = mmap(NULL, mapLen, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, (off_t)aligned);
             if (map == MAP_FAILED) map = mmap(NULL, mapLen, PROT_READ, MAP_PRIVATE, fd, (off_t)aligned);
             if (map == MAP_FAILED) {
-                localWhy = [NSString stringWithFormat:@"mmap: %s", strerror(errno)];
+                NSString *why = [NSString stringWithFormat:@"mmap: %s", strerror(errno)];
+                localWhy = localWhy ? [localWhy stringByAppendingFormat:@"; %@", why] : why;
                 map = NULL;
             } else if (!mremapEncrypted) {
-                localWhy = @"no mremap_encrypted";
+                localWhy = localWhy ? [localWhy stringByAppendingString:@"; no mremap_encrypted"] : @"no mremap_encrypted";
             } else {
                 // Diagnostics for the device log: what the kernel is being asked.
                 printf("[DECRYPT] %s: cpu=0x%x/0x%x cryptid=%u slice=0x%llx cryptoff=0x%x (16K-aligned=%d) map=0x%llx+0x%zx\n",
@@ -673,10 +685,12 @@ static BOOL ad_decrypt_file(NSString *src, NSString *dst, BOOL useSpringBoard, B
                     printf("[DECRYPT]   local variant %d (subtype 0x%x): %s\n", v, subtypes[v], r == 0 ? "ok" : strerror(e));
                 }
                 if (r != 0) {
-                    localWhy = [NSString stringWithFormat:@"mremap_encrypted: %s", strerror(e)];
+                    NSString *why = [NSString stringWithFormat:@"mremap_encrypted: %s", strerror(e)];
+                    localWhy = localWhy ? [localWhy stringByAppendingFormat:@"; %@", why] : why;
                 } else {
                     localOK = ad_pwrite_all(out, (const uint8_t *)map + delta, s.cryptsize, (off_t)start);
-                    if (!localOK) localWhy = @"writing the copy failed";
+                    if (!localOK) localWhy = localWhy ? [localWhy stringByAppendingString:@"; writing the copy failed"]
+                                                       : @"writing the copy failed";
                 }
             }
         }
