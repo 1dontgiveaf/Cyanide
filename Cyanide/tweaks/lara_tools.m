@@ -14,6 +14,7 @@
 //
 
 #import "lara_tools.h"
+#import <UIKit/UIKit.h>
 #import "remote_objc.h"
 #import "../TaskRop/RemoteCall.h"
 #import "../LogTextView.h"
@@ -397,5 +398,109 @@ NSArray<NSDictionary *> *lara_sideloaded_apps(void)
         return [a[@"name"] localizedCaseInsensitiveCompare:b[@"name"]];
     }];
     return apps;
+}
+
+#pragma mark - Wallet card art
+
+static NSArray<NSString *> *lara_card_image_names(void)
+{
+    return @[ @"cardBackgroundCombined@2x.png", @"cardBackground@2x.png", @"cardBackgroundCombined-watch@2x.png" ];
+}
+
+static NSString *lara_card_image_in(NSString *dir)
+{
+    NSFileManager *fm = NSFileManager.defaultManager;
+    for (NSString *name in lara_card_image_names()) {
+        NSString *path = [dir stringByAppendingPathComponent:name];
+        if ([fm fileExistsAtPath:path]) return path;
+    }
+    return nil;
+}
+
+static NSString *lara_card_name(NSString *dir)
+{
+    NSData *json = [NSData dataWithContentsOfFile:[dir stringByAppendingPathComponent:@"pass.json"]];
+    NSDictionary *pass = json ? [NSJSONSerialization JSONObjectWithData:json options:0 error:nil] : nil;
+    if ([pass isKindOfClass:NSDictionary.class]) {
+        for (NSString *key in @[ @"description", @"organizationName", @"logoText" ]) {
+            id v = pass[key];
+            if ([v isKindOfClass:NSString.class] && [v length]) return v;
+        }
+    }
+    return dir.lastPathComponent.stringByDeletingPathExtension;
+}
+
+NSArray<NSDictionary *> *lara_wallet_cards(void)
+{
+    NSString *root = @"/var/mobile/Library/Passes/Cards";
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSMutableArray *cards = [NSMutableArray array];
+    for (NSString *entry in [fm contentsOfDirectoryAtPath:root error:nil]) {
+        NSString *dir = [root stringByAppendingPathComponent:entry];
+        NSMutableArray<NSString *> *dirs = [NSMutableArray arrayWithObject:dir];
+        // Some iOS versions nest the card bundles one level deeper.
+        if (!lara_card_image_in(dir))
+            for (NSString *nested in [fm contentsOfDirectoryAtPath:dir error:nil])
+                [dirs addObject:[dir stringByAppendingPathComponent:nested]];
+        for (NSString *d in dirs) {
+            NSString *image = lara_card_image_in(d);
+            if (!image) continue;
+            NSString *backup = [image stringByAppendingString:@".backup"];
+            NSMutableDictionary *card = [@{ @"name": lara_card_name(d), @"dir": d, @"imagePath": image,
+                                            @"hasBackup": @([fm fileExistsAtPath:backup]) } mutableCopy];
+            UIImage *preview = [UIImage imageWithContentsOfFile:image];
+            if (preview) card[@"preview"] = preview;
+            [cards addObject:card];
+        }
+    }
+    return cards;
+}
+
+// Wallet keeps a rendered copy next to the card bundle; drop it so the new
+// art is used.
+static void lara_card_clear_cache(NSString *dir)
+{
+    NSString *cache = [dir.pathExtension.lowercaseString isEqualToString:@"pkpass"]
+        ? [dir.stringByDeletingPathExtension stringByAppendingPathExtension:@"cache"]
+        : [dir stringByAppendingString:@".cache"];
+    [NSFileManager.defaultManager removeItemAtPath:cache error:nil];
+}
+
+BOOL lara_wallet_card_set_image(NSDictionary *card, NSData *png, NSString **errorOut)
+{
+    NSString *image = card[@"imagePath"], *dir = card[@"dir"];
+    if (!image.length || png.length == 0) { if (errorOut) *errorOut = @"Nothing to write."; return NO; }
+    NSString *backup = [image stringByAppendingString:@".backup"];
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSError *error = nil;
+    // Back up the original once; never overwrite an existing backup.
+    if (![fm fileExistsAtPath:backup] && ![fm copyItemAtPath:image toPath:backup error:&error]) {
+        if (errorOut) *errorOut = [NSString stringWithFormat:@"Backup failed: %@", error.localizedDescription];
+        return NO;
+    }
+    if (![png writeToFile:image options:NSDataWritingAtomic error:&error]) {
+        if (errorOut) *errorOut = error.localizedDescription ?: @"The image could not be written.";
+        return NO;
+    }
+    lara_card_clear_cache(dir);
+    printf("[LARA] card art replaced: %s\n", image.UTF8String);
+    return YES;
+}
+
+BOOL lara_wallet_card_restore(NSDictionary *card, NSString **errorOut)
+{
+    NSString *image = card[@"imagePath"], *dir = card[@"dir"];
+    NSString *backup = [image stringByAppendingString:@".backup"];
+    NSData *original = [NSData dataWithContentsOfFile:backup];
+    if (original.length == 0) { if (errorOut) *errorOut = @"No backup of the original image."; return NO; }
+    NSError *error = nil;
+    if (![original writeToFile:image options:NSDataWritingAtomic error:&error]) {
+        if (errorOut) *errorOut = error.localizedDescription ?: @"The original could not be restored.";
+        return NO;
+    }
+    [NSFileManager.defaultManager removeItemAtPath:backup error:nil];
+    lara_card_clear_cache(dir);
+    printf("[LARA] card art restored: %s\n", image.UTF8String);
+    return YES;
 }
 

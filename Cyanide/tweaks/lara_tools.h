@@ -63,3 +63,13 @@ NSArray<NSDictionary *> *lara_jit_candidate_apps(void);
 extern const char *const kLaraFreeProfileXattr;
 NSArray<NSDictionary *> *lara_sideloaded_apps(void);
 
+// Wallet card art (cosmetic). Cards under /var/mobile/Library/Passes/Cards,
+// each: @{ name, dir, imagePath, hasBackup: @YES/@NO, (preview: UIImage) }.
+// Needs filesystem access (sandbox lifted; the folder belongs to mobile).
+NSArray<NSDictionary *> *lara_wallet_cards(void);
+// PNG data for the card, scaled to the original image's pixel size. The
+// original is backed up once (.backup next to it); Wallet's cached rendering
+// is removed. Respring (or reopen Wallet) to see it.
+BOOL lara_wallet_card_set_image(NSDictionary *card, NSData *png, NSString **errorOut);
+BOOL lara_wallet_card_restore(NSDictionary *card, NSString **errorOut);
+

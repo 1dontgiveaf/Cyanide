@@ -11,6 +11,7 @@
 #import "SettingsViewController.h"
 #import "tweaks/lara_tools.h"
 #import <errno.h>
+#import <PhotosUI/PhotosUI.h>
 
 static NSString * const kLaraCredit = @"Ported from lara by rooootdev.";
 
@@ -21,13 +22,14 @@ static const LaraHUDMode kLaraHUDModes[] = {
 };
 static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraHUDModes[0]);
 
-@interface LaraViewController ()
+@interface LaraViewController () <PHPickerViewControllerDelegate>
 @property (nonatomic) LaraTool tool;
 @property (nonatomic) BOOL busy;
 @property (nonatomic, copy) NSString *status;        // shown in the first footer
 @property (nonatomic) int hudMode;                   // -1 off, -2 unknown
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *prefStates;   // index -> 0/1
-@property (nonatomic, copy) NSArray<NSDictionary *> *jitApps;   // nil until listed (JIT / app limit)
+@property (nonatomic, copy) NSArray<NSDictionary *> *jitApps;   // nil until listed (JIT / app limit / cards)
+@property (nonatomic, strong) NSDictionary *pickingCard;          // card whose image is being picked
 @end
 
 @implementation LaraViewController
@@ -46,6 +48,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             case LaraToolHiddenSettings: self.title = @"Hidden Settings"; break;
             case LaraToolJIT:            self.title = @"JIT Enabler"; break;
             case LaraToolAppLimit:       self.title = @"3-App Limit"; break;
+            case LaraToolCards:          self.title = @"Wallet Card Art"; break;
         }
     }
     return self;
@@ -56,7 +59,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
     [super viewDidLoad];
     self.navigationItem.largeTitleDisplayMode = UINavigationItemLargeTitleDisplayModeNever;
     if (self.tool == LaraToolPerformanceHUD || self.tool == LaraToolHiddenSettings) [self readState];
-    if (self.tool == LaraToolJIT || self.tool == LaraToolAppLimit) [self listJITApps];
+    if (self.tool == LaraToolJIT || self.tool == LaraToolAppLimit || self.tool == LaraToolCards) [self listJITApps];
 }
 
 // Apps signed with get-task-allow; needs the filesystem sandbox lifted.
@@ -78,9 +81,9 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             if (needsRun) settings_tool_needs_exploit(me, me.tableView, @"JIT Enabler", ^{ [weakSelf listJITApps]; });
             return;
         }
-        BOOL limit = me.tool == LaraToolAppLimit;
+        BOOL limit = me.tool == LaraToolAppLimit, cards = me.tool == LaraToolCards;
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-            NSArray *apps = limit ? lara_sideloaded_apps() : lara_jit_candidate_apps();
+            NSArray *apps = cards ? lara_wallet_cards() : limit ? lara_sideloaded_apps() : lara_jit_candidate_apps();
             dispatch_async(dispatch_get_main_queue(), ^{
                 typeof(self) me2 = weakSelf;
                 if (!me2) return;
@@ -89,6 +92,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
                 // Keep a result message set while the list reloaded.
                 BOOL placeholder = [me2.status isEqualToString:@"Looking for apps…"];
                 me2.status = apps.count ? (placeholder ? nil : me2.status)
+                    : cards ? @"No cards found in Wallet."
                     : limit ? @"No sideloaded apps found."
                     : @"No app here can get JIT. It only works for apps installed with a development profile (get-task-allow), e.g. sideloaded with a developer certificate.";
                 [me2.tableView reloadData];
@@ -176,6 +180,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
         }
         case LaraToolJIT: return (NSInteger)self.jitApps.count;
         case LaraToolAppLimit: return 0;
+        case LaraToolCards: return (NSInteger)self.jitApps.count;
     }
     return 0;
 }
@@ -202,6 +207,9 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             break;
         case LaraToolHiddenSettings:
             about = @"Hidden iOS preferences. Most take effect after a respring and stay until you turn them off.";
+            break;
+        case LaraToolCards:
+            about = @"Replace the picture of a card in Wallet with your own (cosmetic only). The original is backed up and can be restored. Respring or reopen Wallet to see the change.";
             break;
         case LaraToolAppLimit:
             about = @"With a free Apple ID, iOS allows only 3 sideloaded apps: installd marks each one, and only marked apps count. Removing the marks frees the slots. Run it again after installing or refreshing (re-signing) an app, which marks it again.";
@@ -251,6 +259,16 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             [sw addTarget:self action:@selector(prefSwitched:) forControlEvents:UIControlEventValueChanged];
             cell.accessoryView = sw;
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            break;
+        }
+        case LaraToolCards: {
+            NSDictionary *card = self.jitApps[indexPath.row];
+            c.text = card[@"name"];
+            c.secondaryText = [card[@"hasBackup"] boolValue] ? @"Custom image — tap to change or restore" : @"Original image";
+            c.secondaryTextProperties.color = UIColor.secondaryLabelColor;
+            c.image = card[@"preview"] ?: [UIImage systemImageNamed:@"creditcard"];
+            c.imageProperties.maximumSize = CGSizeMake(64, 41);
+            c.imageProperties.cornerRadius = 4;
             break;
         }
         case LaraToolAppLimit: {
@@ -315,6 +333,9 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
         case LaraToolAppLimit:
             if (indexPath.section == 0 && [self markedAppCount] > 0) [self removeLimitMarks];
             break;
+        case LaraToolCards:
+            [self cardTapped:self.jitApps[indexPath.row] at:indexPath];
+            break;
         case LaraToolJIT: {
             NSDictionary *app = self.jitApps[indexPath.row];
             NSString *bid = app[@"bundleID"], *name = app[@"name"];
@@ -330,6 +351,78 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             break;
         }
     }
+}
+
+#pragma mark Wallet card art
+
+- (void)cardTapped:(NSDictionary *)card at:(NSIndexPath *)indexPath
+{
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:card[@"name"] message:nil
+                                                         preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) weakSelf = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"Choose Image…" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        [weakSelf pickImageForCard:card];
+    }]];
+    if ([card[@"hasBackup"] boolValue]) {
+        [ac addAction:[UIAlertAction actionWithTitle:@"Restore Original" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+            NSString *err = nil;
+            BOOL ok = lara_wallet_card_restore(card, &err);
+            weakSelf.status = ok ? @"Original restored. Respring or reopen Wallet to see it." : err;
+            [weakSelf listJITApps];
+        }]];
+    }
+    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    UITableViewCell *cell = [self.tableView cellForRowAtIndexPath:indexPath];
+    ac.popoverPresentationController.sourceView = cell ?: self.view;
+    ac.popoverPresentationController.sourceRect = cell ? cell.bounds : self.view.bounds;
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)pickImageForCard:(NSDictionary *)card
+{
+    self.pickingCard = card;
+    PHPickerConfiguration *cfg = [[PHPickerConfiguration alloc] init];
+    cfg.filter = PHPickerFilter.imagesFilter;
+    cfg.selectionLimit = 1;
+    PHPickerViewController *picker = [[PHPickerViewController alloc] initWithConfiguration:cfg];
+    picker.delegate = self;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results
+{
+    [picker dismissViewControllerAnimated:YES completion:nil];
+    NSDictionary *card = self.pickingCard;
+    self.pickingCard = nil;
+    NSItemProvider *provider = results.firstObject.itemProvider;
+    if (!card || ![provider canLoadObjectOfClass:UIImage.class]) return;
+    __weak typeof(self) weakSelf = self;
+    [provider loadObjectOfClass:UIImage.class completionHandler:^(id<NSItemProviderReading> object, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if ([object isKindOfClass:UIImage.class]) [weakSelf applyImage:(UIImage *)object toCard:card];
+        });
+    }];
+}
+
+// Scales the picture to fill the original card image (same pixel size, so
+// Wallet lays it out exactly like the original), then writes it.
+- (void)applyImage:(UIImage *)picked toCard:(NSDictionary *)card
+{
+    UIImage *original = [UIImage imageWithContentsOfFile:card[@"imagePath"]];
+    CGSize px = original ? CGSizeMake(original.size.width * original.scale, original.size.height * original.scale)
+                         : CGSizeMake(1536, 969);
+    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
+    fmt.scale = 1;
+    fmt.opaque = YES;
+    UIImage *scaled = [[[UIGraphicsImageRenderer alloc] initWithSize:px format:fmt] imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        CGFloat k = MAX(px.width / picked.size.width, px.height / picked.size.height);
+        CGSize s = CGSizeMake(picked.size.width * k, picked.size.height * k);
+        [picked drawInRect:CGRectMake((px.width - s.width) / 2, (px.height - s.height) / 2, s.width, s.height)];
+    }];
+    NSString *err = nil;
+    BOOL ok = lara_wallet_card_set_image(card, UIImagePNGRepresentation(scaled), &err);
+    self.status = ok ? @"Card image replaced. Respring or reopen Wallet to see it." : err;
+    [self listJITApps];
 }
 
 // Removes installd's free-profile mark from every counted app, as root

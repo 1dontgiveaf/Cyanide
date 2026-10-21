@@ -14906,6 +14906,7 @@ UIViewController *settings_make_daemons_viewer(void)
         @{ @"title": @"Hidden Settings",  @"icon": @"eye.slash.fill",        @"color": [UIColor systemGrayColor],   @"section": @(-1), @"custom": @"lara", @"lara": @(LaraToolHiddenSettings) },
         @{ @"title": @"JIT Enabler",      @"icon": @"bolt.horizontal.fill",  @"color": [UIColor systemYellowColor], @"section": @(-1), @"custom": @"lara", @"lara": @(LaraToolJIT) },
         @{ @"title": @"3-App Limit",      @"icon": @"square.stack.3d.up.fill", @"color": [UIColor systemTealColor], @"section": @(-1), @"custom": @"lara", @"lara": @(LaraToolAppLimit) },
+        @{ @"title": @"Wallet Card Art",  @"icon": @"creditcard.fill",       @"color": [UIColor systemGreenColor],  @"section": @(-1), @"custom": @"lara", @"lara": @(LaraToolCards) },
     ];
 }
 
