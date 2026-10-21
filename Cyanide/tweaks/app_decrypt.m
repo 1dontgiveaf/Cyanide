@@ -209,8 +209,12 @@ static BOOL ad_decrypt_range_in_springboard(NSString *src, NSString *dst, uint64
         uint32_t subtypes[2] = { s->cpusubtype, s->cpusubtype & ~(uint32_t)CPU_SUBTYPE_MASK };
         for (size_t i = 0; i < sizeof(variants) / sizeof(variants[0]) && !ok; i++) {
             size_t mapSize = variants[i].mapOff + mapLen;
-            if (!variants[i].len || variants[i].addrOff + variants[i].len > mapSize ||
-                variants[i].readOff + s->cryptsize > mapSize) continue;
+            if (variants[i].addrOff + variants[i].len > mapSize)
+                mapSize = variants[i].addrOff + variants[i].len;
+            if (variants[i].readOff + s->cryptsize > mapSize)
+                mapSize = variants[i].readOff + s->cryptsize;
+            mapSize = (mapSize + getpagesize() - 1) & ~(size_t)(getpagesize() - 1);
+            if (!variants[i].len) continue;
             uint64_t map = r_dlsym_call(R_TIMEOUT, "mmap", 0, mapSize, PROT_READ, MAP_PRIVATE,
                                         (uint64_t)fdIn, variants[i].mapOff, 0, 0);
             if (!map || map == (uint64_t)-1) {
@@ -286,8 +290,12 @@ static BOOL ad_try_mremap_variants(int fd, int out, uint64_t start, size_t page,
     uint32_t subtypes[2] = { s->cpusubtype, s->cpusubtype & ~(uint32_t)CPU_SUBTYPE_MASK };
     for (size_t i = 0; i < sizeof(variants) / sizeof(variants[0]); i++) {
         size_t mapSize = variants[i].mapOff + mapLen;
-        if (!variants[i].len || variants[i].addrOff + variants[i].len > mapSize ||
-            variants[i].readOff + s->cryptsize > mapSize) continue;
+        if (variants[i].addrOff + variants[i].len > mapSize)
+            mapSize = variants[i].addrOff + variants[i].len;
+        if (variants[i].readOff + s->cryptsize > mapSize)
+            mapSize = variants[i].readOff + s->cryptsize;
+        mapSize = (mapSize + page - 1) & ~(page - 1);
+        if (!variants[i].len) continue;
         void *map = mmap(NULL, mapSize, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, (off_t)variants[i].mapOff);
         if (map == MAP_FAILED) map = mmap(NULL, mapSize, PROT_READ, MAP_PRIVATE, fd, (off_t)variants[i].mapOff);
         if (map == MAP_FAILED) {
