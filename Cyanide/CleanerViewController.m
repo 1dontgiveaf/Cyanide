@@ -690,6 +690,8 @@ typedef NS_ENUM(NSInteger, CYCleanerPhase) {
     CYCleanerPhaseLogs,        // measuring CrashReporter folders
 };
 static NSString * const kCleanerSortKey = @"CleanerSort";
+// "Select Large Caches": the size worth clearing (small caches refill at once).
+static const unsigned long long kCleanerLargeCacheBytes = 50ULL * 1024 * 1024;
 // The explanation version the user acknowledged; bump to show it again.
 static NSString * const kCleanerIntroAcceptedKey = @"CleanerIntroAcceptedVersion";
 static const NSInteger kCleanerIntroVersion = 3;
@@ -1074,11 +1076,20 @@ static BOOL cleaner_intro_accepted(void)
                                               image:[UIImage systemImageNamed:allSelected ? @"circle" : @"checkmark.circle"]
                                          identifier:nil handler:^(UIAction *x) { [weakSelf toggleSelectAll:nil]; }];
     if (busy || !self.processListAvailable || selectable == 0) selectAll.attributes = UIMenuElementAttributesDisabled;
+    NSUInteger large = 0;
+    for (CYCleanerItem *item in self.items)
+        if (!item.active && !item.systemApp && item.totalBytes >= kCleanerLargeCacheBytes) large++;
+    UIAction *selectLarge = [UIAction actionWithTitle:@"Select Large Caches (50 MB+)"
+                                                image:[UIImage systemImageNamed:@"externaldrive.badge.checkmark"]
+                                           identifier:nil handler:^(UIAction *x) { [weakSelf selectLargeCaches:nil]; }];
+    selectLarge.subtitle = large ? [NSString stringWithFormat:@"%lu app%@", (unsigned long)large, large == 1 ? @"" : @"s"]
+                                 : @"None this large";
+    if (busy || !self.processListAvailable || large == 0) selectLarge.attributes = UIMenuElementAttributesDisabled;
     UIAction *folders = [UIAction actionWithTitle:@"Review Folders" image:[UIImage systemImageNamed:@"folder"]
                                        identifier:nil handler:^(UIAction *x) { [weakSelf showSelectedFolders:nil]; }];
     if (busy || count == 0) folders.attributes = UIMenuElementAttributesDisabled;
     UIMenu *menu = [UIMenu menuWithChildren:@[
-        [UIMenu menuWithTitle:@"" image:nil identifier:nil options:UIMenuOptionsDisplayInline children:@[ selectAll, folders ]],
+        [UIMenu menuWithTitle:@"" image:nil identifier:nil options:UIMenuOptionsDisplayInline children:@[ selectAll, selectLarge, folders ]],
         [UIMenu menuWithTitle:@"Sort By" image:nil identifier:nil options:UIMenuOptionsDisplayInline children:@[
             sortAction(@"Size", CYCleanerSortSize), sortAction(@"Name", CYCleanerSortName),
         ]],
@@ -1397,6 +1408,20 @@ static BOOL cleaner_intro_accepted(void)
     [self updateControls];
 }
 
+// Only the big caches (the ones worth clearing): selects every selectable
+// app at or above kCleanerLargeCacheBytes and deselects the rest.
+- (void)selectLargeCaches:(id)sender
+{
+    (void)sender;
+    if (self.loading || self.cleaning || !self.processListAvailable) return;
+    for (CYCleanerItem *item in self.items) {
+        if (item.active || item.systemApp || item.totalBytes == 0) continue;
+        item.selected = item.totalBytes >= kCleanerLargeCacheBytes;
+    }
+    [self.tableView reloadData];
+    [self updateControls];
+}
+
 - (void)showSelectedFolders:(id)sender
 {
     (void)sender;
@@ -1656,6 +1681,9 @@ static BOOL cleaner_intro_accepted(void)
                     [result appendString:@" Cleaning stopped at a safety limit or background expiration; results are partial."];
                 if (processUnavailable)
                     [result appendString:@" Stopped: active-app detection was unavailable; remaining roots were not cleaned."];
+                // Users read a refill minutes later as "it didn't work".
+                if (freed > 0)
+                    [result appendString:@" Apps rebuild their caches as you use them, so some of this space will be used again."];
                 self.resultText = result;
                 NSMutableDictionary<NSString *, CYCleanerItem *> *results = [NSMutableDictionary dictionary];
                 CYCleanerItem *logsResult = nil;
