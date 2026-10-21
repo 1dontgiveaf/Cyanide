@@ -588,6 +588,10 @@ static BOOL ad_decrypt_range_in_springboard_spawn(NSString *src, NSString *dst, 
 // cleared to `dst`. *decrypted is NO when the file had nothing encrypted.
 static BOOL ad_decrypt_file(NSString *src, NSString *dst, BOOL useSpringBoard, BOOL *decrypted, NSString **errorOut)
 {
+    static dispatch_once_t adBuildOnce;
+    dispatch_once(&adBuildOnce, ^{
+        printf("[DECRYPT] spawn fallback active (compiled %s %s)\n", __DATE__, __TIME__);
+    });
     *decrypted = NO;
     static ADMremapEncrypted mremapEncrypted;
     static dispatch_once_t once;
