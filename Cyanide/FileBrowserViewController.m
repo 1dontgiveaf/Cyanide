@@ -797,6 +797,7 @@ static NSArray<NSString *> *fb_bounded_directory_names(NSString *path, BOOL *inc
 @property (nonatomic, assign) BOOL viaRoot;   // listed/readable only through launchd root
 @property (nonatomic, assign) BOOL rootUnlocked;   // not readable as mobile, opened through root
 @property (nonatomic, strong) FBAppContainer *container;   // app container folders: whose it is
+@property (nonatomic, copy) NSString *searchLocation;      // subfolder search: folder it was found in
 @end
 
 @implementation FBEntry
@@ -1808,9 +1809,129 @@ void filebrowser_sweep_stale_share_staging(void)
 
 @end
 
+#pragma mark - Image viewer
+
+static BOOL fb_is_image_path(NSString *path)
+{
+    static NSSet *exts;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        exts = [NSSet setWithArray:@[ @"png", @"jpg", @"jpeg", @"gif", @"heic", @"heif", @"webp",
+                                      @"tif", @"tiff", @"bmp", @"ico" ]];
+    });
+    return [exts containsObject:path.pathExtension.lowercaseString];
+}
+
+static const NSUInteger kFBMaxImageBytes = 64 * 1024 * 1024;
+
+// A zoomable image with a share button. Loads off-main (through launchd for
+// root-only files); anything UIImage can't decode falls back to the
+// Text / Hex / Info viewer.
+@interface FBImageViewController : UIViewController <UIScrollViewDelegate>
+- (instancetype)initWithPath:(NSString *)path image:(UIImage *)image viaRoot:(BOOL)viaRoot;
+@end
+
+@implementation FBImageViewController {
+    NSString *_path;
+    UIImage *_image;
+    BOOL _viaRoot;
+    UIScrollView *_scroll;
+    UIImageView *_imageView;
+}
+
+- (instancetype)initWithPath:(NSString *)path image:(UIImage *)image viaRoot:(BOOL)viaRoot
+{
+    self = [super initWithNibName:nil bundle:nil];
+    if (self) { _path = [path copy]; _image = image; _viaRoot = viaRoot; }
+    return self;
+}
+
+- (void)viewDidLoad
+{
+    [super viewDidLoad];
+    self.title = _path.lastPathComponent;
+    self.navigationItem.largeTitleDisplayMode = UINavigationItemLargeTitleDisplayModeNever;
+    self.view.backgroundColor = UIColor.systemBackgroundColor;
+    _scroll = [[UIScrollView alloc] initWithFrame:self.view.bounds];
+    _scroll.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    _scroll.delegate = self;
+    _scroll.maximumZoomScale = 8;
+    [self.view addSubview:_scroll];
+    _imageView = [[UIImageView alloc] initWithImage:_image];
+    _imageView.contentMode = UIViewContentModeScaleAspectFit;
+    [_scroll addSubview:_imageView];
+    __weak typeof(self) weakSelf = self;
+    UIBarButtonItem *share = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemAction primaryAction:nil];
+    __weak UIBarButtonItem *weakShare = share;
+    share.primaryAction = [UIAction actionWithHandler:^(UIAction *a) {
+        typeof(self) me = weakSelf;
+        if (!me) return;
+        weakShare.enabled = NO;
+        filebrowser_share_file(me, me->_path, me->_viaRoot, nil, weakShare, ^{ weakShare.enabled = YES; });
+    }];
+    self.navigationItem.rightBarButtonItem = share;
+    NSString *dims = [NSString stringWithFormat:@"%.0f × %.0f px", _image.size.width * _image.scale, _image.size.height * _image.scale];
+    self.navigationItem.prompt = dims;
+}
+
+- (void)viewDidLayoutSubviews
+{
+    [super viewDidLayoutSubviews];
+    if (_scroll.zoomScale != 1) return;
+    _imageView.frame = _scroll.bounds;
+    _scroll.contentSize = _scroll.bounds.size;
+}
+
+- (UIView *)viewForZoomingInScrollView:(UIScrollView *)scrollView { return _imageView; }
+
+@end
+
+#pragma mark - Clipboard
+
+// One item at a time, shared by every File Browser screen. Cut moves on
+// paste and is then cleared; Copy can be pasted repeatedly.
+static NSString *g_fb_clip_path;
+static BOOL g_fb_clip_cut;
+
+#pragma mark - Subfolder search
+
+static const NSUInteger kFBSearchMaxResults = 300;
+static const NSUInteger kFBSearchMaxVisited = 50000;
+static const double kFBSearchMaxSeconds = 8.0;
+
+// Names containing `query` below `root` (never following symlinked folders).
+// Stops at the limits above or when `stillWanted` says the search is stale.
+static NSArray<FBEntry *> *fb_search_tree(NSString *root, NSString *query, BOOL showHidden,
+                                          BOOL (^stillWanted)(void), BOOL *truncated)
+{
+    *truncated = NO;
+    NSURL *rootURL = [NSURL fileURLWithPath:root isDirectory:YES];
+    NSDirectoryEnumerationOptions opts = showHidden ? 0 : NSDirectoryEnumerationSkipsHiddenFiles;
+    NSDirectoryEnumerator *en = [NSFileManager.defaultManager enumeratorAtURL:rootURL includingPropertiesForKeys:nil
+                                                                      options:opts
+                                                                 errorHandler:^BOOL(NSURL *u, NSError *e) { return YES; }];
+    NSMutableArray<FBEntry *> *found = [NSMutableArray array];
+    NSUInteger visited = 0;
+    double deadline = CFAbsoluteTimeGetCurrent() + kFBSearchMaxSeconds;
+    NSString *base = [root hasSuffix:@"/"] ? root : [root stringByAppendingString:@"/"];
+    for (NSURL *url in en) {
+        if (++visited % 256 == 0 && (!stillWanted() || CFAbsoluteTimeGetCurrent() > deadline)) { *truncated = YES; break; }
+        if (visited > kFBSearchMaxVisited) { *truncated = YES; break; }
+        NSString *name = url.lastPathComponent;
+        if ([name rangeOfString:query options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
+        NSString *dir = url.path.stringByDeletingLastPathComponent;
+        FBEntry *e = fb_entry_at(dir, name);
+        NSString *rel = [dir hasPrefix:base] ? [dir substringFromIndex:base.length] : @"";
+        e.searchLocation = rel.length ? rel : @".";
+        [found addObject:e];
+        if (found.count >= kFBSearchMaxResults) { *truncated = YES; break; }
+    }
+    return found;
+}
+
 #pragma mark - Directory list
 
-@interface FileBrowserViewController () <UISearchResultsUpdating, UIDocumentPickerDelegate>
+@interface FileBrowserViewController () <UISearchResultsUpdating, UISearchBarDelegate, UIDocumentPickerDelegate>
 @property (nonatomic, copy) NSString *path;
 @property (nonatomic, strong) NSArray<FBEntry *> *entries;
 @property (nonatomic, strong) NSArray<FBEntry *> *shown;
@@ -1825,7 +1946,13 @@ void filebrowser_sweep_stale_share_staging(void)
 @property (nonatomic, assign) BOOL listingIncomplete;        // root listing was cut short
 @property (nonatomic, strong) FBAppContainer *container;     // the app container this folder is in
 @property (nonatomic, strong) FBAppContainer *relatedContainer;   // its bundle <-> data counterpart
+@property (nonatomic, strong) NSArray<FBEntry *> *searchResults;   // subfolder search (nil: none)
+@property (nonatomic, assign) NSUInteger searchRequest;            // newest subfolder search
+@property (nonatomic, assign) BOOL searchTruncated;
+@property (nonatomic, assign) BOOL searching;
 @end
+
+static NSString * const kFBSortKey = @"FileBrowserSort";   // 0 name, 1 date, 2 size
 
 // In the folders holding app containers: name each UUID folder after its app
 // and sort by that name. Off the main thread (reads metadata).
@@ -1875,6 +2002,8 @@ static NSString *fb_related_title(FBAppContainer *c)
     self.searchCtrl.searchResultsUpdater = self;
     self.searchCtrl.obscuresBackgroundDuringPresentation = NO;
     self.searchCtrl.searchBar.placeholder = @"Filter this folder";
+    self.searchCtrl.searchBar.scopeButtonTitles = @[ @"This Folder", @"Subfolders" ];
+    self.searchCtrl.searchBar.delegate = (id<UISearchBarDelegate>)self;
     self.navigationItem.searchController = self.searchCtrl;
     self.navigationItem.hidesSearchBarWhenScrolling = NO;
     self.definesPresentationContext = YES;
@@ -2027,6 +2156,21 @@ static NSString *fb_related_title(FBAppContainer *c)
                       options:UIMenuOptionsDisplayInline children:appItems],
         [UIAction actionWithTitle:@"Go to Folder…" image:[UIImage systemImageNamed:@"arrow.right.circle"]
                        identifier:nil handler:^(UIAction *x) { [weakOptions goToPath]; }],
+        [UIMenu menuWithTitle:@"Sort By" image:[UIImage systemImageNamed:@"arrow.up.arrow.down"] identifier:nil options:0 children:({
+            NSMutableArray *sorts = [NSMutableArray array];
+            NSArray *titles = @[ @"Name", @"Date Modified", @"Size" ];
+            NSInteger current = [d integerForKey:kFBSortKey];
+            for (NSInteger i = 0; i < 3; i++) {
+                UIAction *a = [UIAction actionWithTitle:titles[i] image:nil identifier:nil handler:^(UIAction *x) {
+                    [d setInteger:i forKey:kFBSortKey];
+                    [weakOptions updateBarButtons];
+                    [weakOptions applyFilter];
+                }];
+                a.state = current == i ? UIMenuElementStateOn : UIMenuElementStateOff;
+                [sorts addObject:a];
+            }
+            sorts;
+        })],
         [UIMenu menuWithTitle:@"Show" image:nil identifier:nil options:UIMenuOptionsDisplayInline children:@[
             option(@"Hidden Files", kSettingsFileBrowserShowHidden),
             option(@"Inaccessible Items", kSettingsFileBrowserShowInaccessible),
@@ -2055,6 +2199,15 @@ static NSString *fb_related_title(FBAppContainer *c)
             [UIAction actionWithTitle:@"Import from Files…" image:[UIImage systemImageNamed:@"square.and.arrow.down"]
                            identifier:nil handler:^(UIAction *a) { [weakSelf importFromFiles]; }],
         ]];
+        if (g_fb_clip_path.length) {
+            NSString *title = [NSString stringWithFormat:@"%@ \"%@\" Here", g_fb_clip_cut ? @"Move" : @"Paste",
+                               g_fb_clip_path.lastPathComponent];
+            UIAction *paste = [UIAction actionWithTitle:title image:[UIImage systemImageNamed:@"doc.on.clipboard"]
+                                             identifier:nil handler:^(UIAction *a) { [weakSelf paste]; }];
+            menu = [UIMenu menuWithChildren:[@[ [UIMenu menuWithTitle:@"" image:nil identifier:nil
+                                                              options:UIMenuOptionsDisplayInline children:@[ paste ]] ]
+                                             arrayByAddingObjectsFromArray:menu.children]];
+        }
         [items addObject:[[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"plus"] menu:menu]];
     }
     self.navigationItem.rightBarButtonItems = items;
@@ -2204,6 +2357,76 @@ static NSString *fb_related_title(FBAppContainer *c)
             // A symlink is removed itself, never what it points to.
             return [NSFileManager.defaultManager removeItemAtPath:e.path error:err];
         } failureTitle:@"Couldn't Delete"];
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)setClipboard:(FBEntry *)e cut:(BOOL)cut
+{
+    g_fb_clip_path = [e.path copy];
+    g_fb_clip_cut = cut;
+    [self updateBarButtons];
+}
+
+// Pastes the clipboard item into this folder: a copy, or for Cut a move
+// (then the clipboard is cleared). Never into itself or below itself.
+- (void)paste
+{
+    NSString *src = g_fb_clip_path;
+    BOOL cut = g_fb_clip_cut;
+    if (!src.length) return;
+    NSString *dir = self.path;
+    NSString *srcSlash = [fb_canonical_path(src) stringByAppendingString:@"/"];
+    if ([[fb_canonical_path(dir) stringByAppendingString:@"/"] hasPrefix:srcSlash]) {
+        fb_alert(self, @"Can't Paste", @"A folder can't be pasted into itself.");
+        return;
+    }
+    __weak typeof(self) weakSelf = self;
+    [self perform:^BOOL(NSError **err) {
+        struct stat st;
+        if (lstat(src.fileSystemRepresentation, &st) != 0) {
+            if (err) *err = [NSError errorWithDomain:NSPOSIXErrorDomain code:ENOENT
+                                   userInfo:@{ NSLocalizedDescriptionKey: @"The copied item no longer exists." }];
+            return NO;
+        }
+        // Moving within the same folder would only rename it to "name 2".
+        if (cut && [fb_canonical_path(src.stringByDeletingLastPathComponent) isEqualToString:fb_canonical_path(dir)]) return YES;
+        NSString *target = fb_unique_path(dir, src.lastPathComponent);
+        NSFileManager *fm = NSFileManager.defaultManager;
+        BOOL ok = cut ? [fm moveItemAtPath:src toPath:target error:err] : [fm copyItemAtPath:src toPath:target error:err];
+        if (ok && cut) dispatch_async(dispatch_get_main_queue(), ^{
+            if ([g_fb_clip_path isEqualToString:src]) g_fb_clip_path = nil;
+            [weakSelf updateBarButtons];
+        });
+        return ok;
+    } failureTitle:cut ? @"Couldn't Move" : @"Couldn't Paste"];
+}
+
+// chmod for items mobile owns (mobile can't change anyone else's).
+- (void)promptPermissions:(FBEntry *)e
+{
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Permissions"
+        message:[NSString stringWithFormat:@"%@\nCurrent: %@ (%03o). Enter the new mode in octal, e.g. 644 or 755.",
+                 e.name, fb_mode_string(e.mode, e.isSymlink), e.mode & 07777]
+        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.text = [NSString stringWithFormat:@"%03o", e.mode & 07777];
+        tf.keyboardType = UIKeyboardTypeNumberPad;
+    }];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"Apply" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        NSString *text = ac.textFields.firstObject.text;
+        unsigned long long value = 0;
+        BOOL octal = text.length >= 3 && text.length <= 4 &&
+                     [text rangeOfCharacterFromSet:[[NSCharacterSet characterSetWithCharactersInString:@"01234567"] invertedSet]].location == NSNotFound;
+        if (!octal) { fb_alert(self, @"Invalid Mode", @"Enter 3 or 4 octal digits, e.g. 644."); return; }
+        for (NSUInteger i = 0; i < text.length; i++) value = value * 8 + (unsigned)([text characterAtIndex:i] - '0');
+        mode_t mode = (mode_t)(value & 07777);
+        [self performForEntry:e operation:^BOOL(NSError **err) {
+            if (chmod(e.path.fileSystemRepresentation, mode) == 0) return YES;
+            if (err) *err = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:nil];
+            return NO;
+        } failureTitle:@"Couldn't Change Permissions"];
     }]];
     [self presentViewController:ac animated:YES completion:nil];
 }
@@ -2434,11 +2657,53 @@ static NSString *fb_related_title(FBAppContainer *c)
     });
 }
 
+- (BOOL)searchingSubfolders
+{
+    return self.searchCtrl.searchBar.selectedScopeButtonIndex == 1 &&
+           [self.filter stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet].length > 0;
+}
+
+// Folders first, then by the chosen order (name keeps the listing's order,
+// which in app-container folders is by app name).
+- (NSArray<FBEntry *> *)sorted:(NSArray<FBEntry *> *)entries
+{
+    NSInteger sort = [NSUserDefaults.standardUserDefaults integerForKey:kFBSortKey];
+    if (sort == 0) return entries;
+    return [entries sortedArrayUsingComparator:^NSComparisonResult(FBEntry *a, FBEntry *b) {
+        if (a.isDirectory != b.isDirectory) return a.isDirectory ? NSOrderedAscending : NSOrderedDescending;
+        if (sort == 1) {
+            NSComparisonResult r = [b.modified ?: NSDate.distantPast compare:a.modified ?: NSDate.distantPast];
+            if (r != NSOrderedSame) return r;
+        } else if (a.size != b.size) {
+            return a.size > b.size ? NSOrderedAscending : NSOrderedDescending;
+        }
+        return [a.name localizedStandardCompare:b.name];
+    }];
+}
+
 - (void)applyFilter
 {
     NSString *q = [self.filter stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+    if ([self searchingSubfolders]) {
+        self.shown = [self sorted:self.searchResults ?: @[]];
+        UILabel *note = nil;
+        if (self.searchTruncated && self.shown.count) {
+            note = [UILabel new];
+            note.text = [NSString stringWithFormat:@"Showing the first %lu matches (search stops at %lu results, %lu entries or %.0f s). Narrow the search or start deeper.",
+                         (unsigned long)self.shown.count, (unsigned long)kFBSearchMaxResults,
+                         (unsigned long)kFBSearchMaxVisited, kFBSearchMaxSeconds];
+            note.font = [UIFont systemFontOfSize:13];
+            note.textColor = UIColor.secondaryLabelColor;
+            note.numberOfLines = 0;
+            note.textAlignment = NSTextAlignmentCenter;
+            note.frame = CGRectMake(0, 0, self.tableView.bounds.size.width, 64);
+        }
+        self.tableView.tableFooterView = note;
+        [self.tableView reloadData];
+        return;
+    }
     if (!q.length) {
-        self.shown = self.entries;
+        self.shown = [self sorted:self.entries];
     } else {
         NSPredicate *p = [NSPredicate predicateWithBlock:^BOOL(FBEntry *e, NSDictionary *b) {
             if ([e.name rangeOfString:q options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
@@ -2447,7 +2712,7 @@ static NSString *fb_related_title(FBAppContainer *c)
             return [e.container.displayName rangeOfString:q options:NSCaseInsensitiveSearch].location != NSNotFound ||
                    [e.container.identifier rangeOfString:q options:NSCaseInsensitiveSearch].location != NSNotFound;
         }];
-        self.shown = [self.entries filteredArrayUsingPredicate:p];
+        self.shown = [self sorted:[self.entries filteredArrayUsingPredicate:p]];
     }
     // A cut-short listing is a prefix of the folder, not all of it.
     if (self.listingIncomplete && self.entries.count) {
@@ -2469,7 +2734,47 @@ static NSString *fb_related_title(FBAppContainer *c)
 - (void)updateSearchResultsForSearchController:(UISearchController *)searchController
 {
     self.filter = searchController.searchBar.text ?: @"";
+    if ([self searchingSubfolders]) [self startSubfolderSearch];
+    else { self.searchResults = nil; self.searching = NO; }
     [self applyFilter];
+}
+
+- (void)searchBar:(UISearchBar *)searchBar selectedScopeButtonIndexDidChange:(NSInteger)selectedScope
+{
+    searchBar.placeholder = selectedScope == 1 ? @"Search this folder and below" : @"Filter this folder";
+    [self updateSearchResultsForSearchController:self.searchCtrl];
+}
+
+// Debounced, off-main; only the newest search may publish.
+- (void)startSubfolderSearch
+{
+    NSString *q = [self.filter stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+    NSUInteger request = ++self.searchRequest;
+    self.searching = YES;
+    self.searchResults = nil;
+    if (self.loadedViaRoot) {   // the walk runs as mobile; a root-only folder can't be searched
+        self.searching = NO;
+        self.searchResults = @[];   // shown as "No matches"; the walk can't read root-only folders
+        return;
+    }
+    NSString *root = self.path;
+    BOOL showHidden = [NSUserDefaults.standardUserDefaults boolForKey:kSettingsFileBrowserShowHidden];
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+        if (weakSelf.searchRequest != request) return;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            BOOL truncated = NO;
+            NSArray *found = fb_search_tree(root, q, showHidden, ^BOOL{ return weakSelf.searchRequest == request; }, &truncated);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                typeof(self) me = weakSelf;
+                if (!me || me.searchRequest != request) return;
+                me.searching = NO;
+                me.searchResults = found;
+                me.searchTruncated = truncated;
+                [me applyFilter];
+            });
+        });
+    });
 }
 
 - (void)goToPath
@@ -2510,7 +2815,9 @@ static NSString *fb_related_title(FBAppContainer *c)
     cell.textLabel.textColor = UIColor.labelColor;
 
     if (!self.shown.count) {
-        cell.textLabel.text = self.status ?: (self.filter.length ? @"No matches." : @"Loading…");
+        cell.textLabel.text = [self searchingSubfolders]
+            ? (self.searching ? @"Searching…" : @"No matches in this folder or below.")
+            : (self.status ?: (self.filter.length ? @"No matches." : @"Loading…"));
         cell.textLabel.numberOfLines = 0;
         cell.textLabel.textColor = UIColor.secondaryLabelColor;
         cell.detailTextLabel.text = nil;
@@ -2536,7 +2843,9 @@ static NSString *fb_related_title(FBAppContainer *c)
         cell.selectionStyle = UITableViewCellSelectionStyleDefault;
         return cell;
     }
-    if (e.statFailed) {
+    if (e.searchLocation) {
+        cell.detailTextLabel.text = [@"in " stringByAppendingString:e.searchLocation];
+    } else if (e.statFailed) {
         cell.detailTextLabel.text = @"(no information)";
     } else {
         NSString *size = e.isDirectory ? @"" : [fb_size_string(e.size) stringByAppendingString:@"  "];
@@ -2598,11 +2907,18 @@ static NSString *fb_related_title(FBAppContainer *c)
         } else if (e.readable && fb_looks_like_plist(path)) {
             doc = [PlistEditorViewController documentForFileAtPath:path];
         }
+        UIImage *image = nil;
+        if (!doc && fb_is_image_path(path) && (e.readable || viaRoot) && e.size <= (off_t)kFBMaxImageBytes) {
+            NSData *data = viaRoot ? settings_root_read_file(path, kFBMaxImageBytes, NULL, NULL)
+                                   : [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
+            image = data ? [UIImage imageWithData:data] : nil;
+        }
         dispatch_async(dispatch_get_main_queue(), ^{
             tableView.userInteractionEnabled = YES;
             // The user may have navigated away (Back/tab) meanwhile.
             if (!self.view.window || self.navigationController.topViewController != self) return;
             UIViewController *vc = doc ? [PlistEditorViewController editorWithDocument:doc] : nil;
+            if (!vc && image) vc = [[FBImageViewController alloc] initWithPath:path image:image viaRoot:viaRoot];
             if (!vc) vc = [[FBFileViewController alloc] initWithEntry:e];
             [self.navigationController pushViewController:vc animated:YES];
         });
@@ -2676,16 +2992,41 @@ static NSString *fb_related_title(FBAppContainer *c)
                 UIPasteboard.generalPasteboard.string = c.identifier;
             }]];
         }
+        if (e.searchLocation) {
+            NSString *folder = e.path.stringByDeletingLastPathComponent;
+            [items insertObject:[UIAction actionWithTitle:@"Show in Folder" image:[UIImage systemImageNamed:@"folder"]
+                                               identifier:nil handler:^(UIAction *a) {
+                [self.navigationController pushViewController:[[FileBrowserViewController alloc] initWithPath:folder]
+                                                     animated:YES];
+            }] atIndex:0];
+        }
+        // Copy works without write mode (pasting needs it); a root-only item
+        // can't be copied as mobile.
+        NSMutableArray<UIMenuElement *> *clip = [NSMutableArray array];
+        if (!e.viaRoot && e.readable && !self.loadedViaRoot)
+            [clip addObject:[UIAction actionWithTitle:@"Copy" image:[UIImage systemImageNamed:@"doc.on.doc.fill"]
+                                           identifier:nil handler:^(UIAction *a) { [self setClipboard:e cut:NO]; }]];
+        if (filebrowser_write_enabled() && !self.loadedViaRoot && !e.viaRoot) {
+            [clip addObject:[UIAction actionWithTitle:@"Cut" image:[UIImage systemImageNamed:@"scissors"]
+                                           identifier:nil handler:^(UIAction *a) { [self setClipboard:e cut:YES]; }]];
+        }
+        if (clip.count)
+            [items addObject:[UIMenu menuWithTitle:@"" image:nil identifier:nil options:UIMenuOptionsDisplayInline children:clip]];
         if (filebrowser_write_enabled() && !self.loadedViaRoot && !e.viaRoot) {
             UIAction *ren = [UIAction actionWithTitle:@"Rename" image:[UIImage systemImageNamed:@"pencil"]
                                            identifier:nil handler:^(UIAction *a) { [self promptRename:e]; }];
             UIAction *dup = [UIAction actionWithTitle:@"Duplicate" image:[UIImage systemImageNamed:@"plus.square.on.square"]
                                            identifier:nil handler:^(UIAction *a) { [self duplicate:e]; }];
+            NSMutableArray *edit = [NSMutableArray arrayWithObjects:ren, dup, nil];
+            if (!e.statFailed && e.uid == getuid() && !e.isSymlink)
+                [edit addObject:[UIAction actionWithTitle:@"Permissions…" image:[UIImage systemImageNamed:@"lock.shield"]
+                                               identifier:nil handler:^(UIAction *a) { [self promptPermissions:e]; }]];
             UIAction *del = [UIAction actionWithTitle:@"Delete" image:[UIImage systemImageNamed:@"trash"]
                                            identifier:nil handler:^(UIAction *a) { [self confirmDelete:e]; }];
             del.attributes = UIMenuElementAttributesDestructive;
+            [edit addObject:del];
             [items addObject:[UIMenu menuWithTitle:@"" image:nil identifier:nil
-                                           options:UIMenuOptionsDisplayInline children:@[ ren, dup, del ]]];
+                                           options:UIMenuOptionsDisplayInline children:edit]];
         }
         return [UIMenu menuWithTitle:c ? [NSString stringWithFormat:@"%@\n%@", c.displayName, e.path] : e.path
                             children:items];
