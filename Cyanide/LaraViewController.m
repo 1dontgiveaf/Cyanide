@@ -220,7 +220,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             about = @"Hidden iOS preferences. Most take effect after a respring and stay until you turn them off.";
             break;
         case LaraToolDecrypt:
-            about = @"Makes a decrypted IPA of an App Store app on this device, e.g. to inject a tweak into it and sideload it. The app, its frameworks and extensions are decrypted by iOS itself. If an executable's encrypted range isn't 16 KB-aligned, it is started suspended just long enough to read the decrypted pages, then killed before its UI appears. If iOS refuses the direct spawn, the app is opened briefly and stopped immediately. IPAs stay on this device (Documents/Decrypted) until you share them. Use it only for apps you own; removing copy protection may be restricted where you live.";
+            about = @"Makes a decrypted IPA of an App Store app on this device, e.g. to inject a tweak into it and sideload it. The app, its frameworks and extensions are decrypted by iOS itself. If an executable's encrypted range isn't 16 KB-aligned, Cyanide tries alternate decryption mappings; it does not launch the app. IPAs stay on this device (Documents/Decrypted) until you share them. Use it only for apps you own; removing copy protection may be restricted where you live.";
             break;
         case LaraToolCards:
             about = @"Replace the picture of a card in Wallet with your own (cosmetic only). The original is backed up and can be restored. Respring or reopen Wallet to see the change.";

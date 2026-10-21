@@ -5,12 +5,10 @@
 //  Decrypted IPAs of installed App Store apps. Idea from lara by rooootdev
 //  (kexploit/decrypt.m); implemented differently: lara launches the app and
 //  walks its vm_map with kernel reads, and leaves app extensions encrypted.
-//  Here every Mach-O is decrypted by mapping it into Cyanide and asking the
-//  kernel's FairPlay pager to decrypt that mapping (mremap_encrypted, as
-//  flexdecrypt does). A range that isn't 16 KB aligned cannot use mremap;
-//  that executable is started suspended, its decrypted pages are read from
-//  the task, and it is killed before it can run its UI. If iOS refuses the
-//  direct spawn, SpringBoard opens it briefly and it is stopped immediately.
+//  Here every Mach-O in the bundle is decrypted by mapping it into Cyanide and
+//  asking the kernel's FairPlay pager to decrypt that mapping
+//  (mremap_encrypted, as flexdecrypt does): no app launch, no RemoteCall into
+//  the app, no kernel memory walking -- and extensions work the same way.
 //
 
 #import "app_decrypt.h"
@@ -23,12 +21,6 @@
 #import <mach-o/fat.h>
 #import <dlfcn.h>
 #import <fcntl.h>
-#import <spawn.h>
-#import <sys/wait.h>
-#import <mach/mach.h>
-#import <mach/task_info.h>
-#import <mach/thread_act.h>
-#import <mach/arm/thread_status.h>
 #import <sys/mman.h>
 #import <sys/stat.h>
 #import <unistd.h>
@@ -83,7 +75,6 @@ typedef struct {
     uint32_t cputype, cpusubtype;
     uint32_t cryptoff, cryptsize, cryptid;
     uint64_t cryptidFileOffset;   // where to write cryptid = 0
-    uint32_t filetype;            // MH_EXECUTE for apps/extensions
 } ADEncryptedSlice;
 
 static BOOL ad_pread_all(int fd, void *buf, size_t len, off_t off)
@@ -127,7 +118,6 @@ static BOOL ad_parse_slice(int fd, uint64_t off, uint64_t fileSize, ADEncryptedS
             out->sliceOffset = off;
             out->cputype = (uint32_t)mh.cputype;
             out->cpusubtype = (uint32_t)mh.cpusubtype;
-            out->filetype = (uint32_t)mh.filetype;
             out->cryptoff = e->cryptoff;
             out->cryptsize = e->cryptsize;
             out->cryptid = e->cryptid;
@@ -199,41 +189,69 @@ static BOOL ad_decrypt_range_in_springboard(NSString *src, NSString *dst, uint64
     const ADEncryptedSlice *s = slicePtr;
     uint64_t rsrc = r_alloc_str(src.fileSystemRepresentation), rdst = r_alloc_str(dst.fileSystemRepresentation);
     int fdIn = -1, fdOut = -1;
-    uint64_t map = 0;
     BOOL ok = NO;
     do {
         if (!rsrc || !rdst) { *why = @"SpringBoard: no memory for the paths"; break; }
         fdIn = (int)r_dlsym_call(R_TIMEOUT, "open", rsrc, O_RDONLY | O_CLOEXEC, 0, 0, 0, 0, 0, 0);
         if (fdIn < 0) { *why = [NSString stringWithFormat:@"SpringBoard: open failed (%s)", strerror(ad_sb_errno())]; break; }
-        map = r_dlsym_call(R_TIMEOUT, "mmap", 0, mapLen, PROT_READ, MAP_PRIVATE, (uint64_t)fdIn, aligned, 0, 0);
-        if (!map || map == (uint64_t)-1) {
-            map = 0;
-            *why = [NSString stringWithFormat:@"SpringBoard: mmap failed (%s)", strerror(ad_sb_errno())];
-            break;
-        }
-        // Same variants as in Cyanide: subtype as in the header, then without
-        // its capability bits.
-        uint32_t subtypes[2] = { s->cpusubtype, s->cpusubtype & ~(uint32_t)CPU_SUBTYPE_MASK };
-        int r = -1, e = 0;
-        for (int v = 0; v < 2 && r != 0; v++) {
-            if (v == 1 && subtypes[1] == subtypes[0]) break;
-            r = (int)r_dlsym_call(R_TIMEOUT, "mremap_encrypted", map, mapLen, s->cryptid, s->cputype, subtypes[v], 0, 0, 0);
-            if (r != 0) e = ad_sb_errno();
-            printf("[DECRYPT]   springboard variant %d (subtype 0x%x): %s\n", v, subtypes[v], r == 0 ? "ok" : strerror(e));
-        }
-        if (r != 0) { *why = [NSString stringWithFormat:@"SpringBoard: mremap_encrypted failed (%s)", strerror(e)]; break; }
         fdOut = (int)r_dlsym_call(R_TIMEOUT, "open", rdst, O_WRONLY | O_CLOEXEC, 0, 0, 0, 0, 0, 0);
         if (fdOut < 0) { *why = [NSString stringWithFormat:@"SpringBoard: can't write the copy (%s)", strerror(ad_sb_errno())]; break; }
-        uint64_t done = 0, size = s->cryptsize;
-        ok = YES;
-        while (done < size) {
-            uint64_t chunk = MIN(size - done, 8ULL * 1024 * 1024);   // keeps each call short
-            int64_t n = (int64_t)r_dlsym_call(R_TIMEOUT, "pwrite", (uint64_t)fdOut, map + delta + done, chunk, start + done, 0, 0, 0, 0);
-            if (n <= 0 || !r_last_call_ok()) { *why = @"SpringBoard: writing the decrypted bytes failed"; ok = NO; break; }
-            done += (uint64_t)n;
+        struct { const char *name; size_t addrOff, len; } variants[] = {
+            { "page-range",  0,     mapLen },
+            { "crypt-range", delta, mapLen > delta ? mapLen - delta : 0 },
+            { "crypt-exact", delta, s->cryptsize },
+            { "page-exact",  0,     s->cryptsize },
+            { "crypt-page",  delta, mapLen > delta + getpagesize() ? getpagesize() : 0 },
+        };
+        uint32_t subtypes[2] = { s->cpusubtype, s->cpusubtype & ~(uint32_t)CPU_SUBTYPE_MASK };
+        for (size_t i = 0; i < sizeof(variants) / sizeof(variants[0]) && !ok; i++) {
+            if (!variants[i].len || variants[i].addrOff + variants[i].len > mapLen) continue;
+            uint64_t map = r_dlsym_call(R_TIMEOUT, "mmap", 0, mapLen, PROT_READ, MAP_PRIVATE,
+                                        (uint64_t)fdIn, aligned, 0, 0);
+            if (!map || map == (uint64_t)-1) {
+                *why = [NSString stringWithFormat:@"SpringBoard: mmap failed (%s)", strerror(ad_sb_errno())];
+                break;
+            }
+            uint64_t addr = map + variants[i].addrOff;
+            int r = -1, e = 0;
+            for (int v = 0; v < 2 && r != 0; v++) {
+                if (v == 1 && subtypes[1] == subtypes[0]) break;
+                r = (int)r_dlsym_call(R_TIMEOUT, "mremap_encrypted", addr, variants[i].len,
+                                      s->cryptid, s->cputype, subtypes[v], 0, 0, 0);
+                if (r != 0) e = ad_sb_errno();
+            }
+            printf("[DECRYPT]   springboard %s addr=+0x%zx len=0x%zx: %s\n",
+                   variants[i].name, variants[i].addrOff, variants[i].len,
+                   r == 0 ? "ok" : strerror(e));
+            if (r == 0) {
+                uint64_t done = 0;
+                BOOL wrote = YES;
+                while (done < s->cryptsize) {
+                    uint64_t chunk = MIN((uint64_t)s->cryptsize - done, 8ULL * 1024 * 1024);
+                    int64_t n = (int64_t)r_dlsym_call(R_TIMEOUT, "pwrite", (uint64_t)fdOut,
+                                                      map + delta + done, chunk, start + done, 0, 0, 0, 0);
+                    if (n <= 0 || !r_last_call_ok()) { wrote = NO; break; }
+                    done += (uint64_t)n;
+                }
+                if (wrote) {
+                    // Compare the written bytes locally; a successful mremap of
+                    // the wrong page leaves the encrypted bytes unchanged.
+                    uint8_t a[64], b[64];
+                    int fsrc = open(src.fileSystemRepresentation, O_RDONLY | O_CLOEXEC);
+                    int fdst = open(dst.fileSystemRepresentation, O_RDONLY | O_CLOEXEC);
+                    BOOL differs = NO;
+                    if (fsrc >= 0 && fdst >= 0 && pread(fsrc, a, sizeof(a), (off_t)start) == (ssize_t)sizeof(a) &&
+                        pread(fdst, b, sizeof(b), (off_t)start) == (ssize_t)sizeof(b))
+                        differs = memcmp(a, b, sizeof(a)) != 0;
+                    if (fsrc >= 0) close(fsrc);
+                    if (fdst >= 0) close(fdst);
+                    if (differs) ok = YES;
+                }
+            }
+            r_dlsym_call(R_TIMEOUT, "munmap", map, mapLen, 0, 0, 0, 0, 0, 0);
         }
+        if (!ok) *why = @"SpringBoard: no accepted mremap variant";
     } while (0);
-    if (map) r_dlsym_call(R_TIMEOUT, "munmap", map, mapLen, 0, 0, 0, 0, 0, 0);
     if (fdIn >= 0) r_dlsym_call(R_TIMEOUT, "close", (uint64_t)fdIn, 0, 0, 0, 0, 0, 0, 0);
     if (fdOut >= 0) r_dlsym_call(R_TIMEOUT, "close", (uint64_t)fdOut, 0, 0, 0, 0, 0, 0, 0);
     if (rsrc) r_free(rsrc);
@@ -241,494 +259,63 @@ static BOOL ad_decrypt_range_in_springboard(NSString *src, NSString *dst, uint64
     return ok;
 }
 
-// Read a range from a freshly spawned (suspended) task.
-static BOOL ad_task_read(task_t task, uint64_t addr, void *buf, size_t len)
+// mremap_encrypted has no cryptoff parameter: it decrypts the pages at the
+// address it is given. For a 4 KB encrypted range inside a 16 KB file page,
+// try the plausible address/length pairs. All mappings start at the 16 KB
+// file boundary; the address is moved by `delta` for the crypt-range variants.
+static BOOL ad_try_mremap_variants(int fd, int out, uint64_t start, size_t page,
+                                   uint64_t aligned, size_t delta, size_t mapLen,
+                                   const ADEncryptedSlice *s, ADMremapEncrypted fn,
+                                   NSString **why)
 {
-    vm_size_t got = 0;
-    kern_return_t kr = vm_read_overwrite(task, (vm_address_t)addr,
-        (vm_size_t)len, (vm_address_t)(uintptr_t)buf, &got);
-    return kr == KERN_SUCCESS && got == (vm_size_t)len;
-}
-
-// The main executable's Mach-O header in a suspended task. dyld's
-// all_image_infos is available once the process is mapped; the stack slot is
-// the fallback flexdecrypt uses.
-static uint64_t ad_task_main_header(task_t task)
-{
-    struct task_dyld_info tdi;
-    mach_msg_type_number_t tdiCount = TASK_DYLD_INFO_COUNT;
-    if (task_info(task, TASK_DYLD_INFO, (task_info_t)&tdi, &tdiCount) == KERN_SUCCESS &&
-        tdi.all_image_info_addr) {
-        struct {
-            uint32_t version;
-            uint32_t count;
-            uint64_t infoArray;
-        } ai = {0};
-        if (ad_task_read(task, tdi.all_image_info_addr, &ai, sizeof(ai)) &&
-            ai.infoArray && ai.count) {
-            uint64_t firstImage = 0;
-            if (ad_task_read(task, ai.infoArray, &firstImage, sizeof(firstImage)) &&
-                firstImage) return firstImage;
-        }
-    }
-    thread_act_array_t threads = NULL;
-    mach_msg_type_number_t threadCount = 0;
-    if (task_threads(task, &threads, &threadCount) != KERN_SUCCESS) return 0;
-    uint64_t header = 0;
-    if (threads && threadCount) {
-        arm_thread_state64_t state;
-        mach_msg_type_number_t stateCount = ARM_THREAD_STATE64_COUNT;
-        if (thread_get_state(threads[0], ARM_THREAD_STATE64,
-                             (thread_state_t)&state, &stateCount) == KERN_SUCCESS) {
-            uint64_t sp = (uint64_t)arm_thread_state64_get_sp(state);
-            uint64_t slots[4] = {0};
-            if (ad_task_read(task, sp, slots, sizeof(slots))) {
-                for (int i = 0; i < 4 && !header; i++) {
-                    uint32_t magic = 0;
-                    if (slots[i] && ad_task_read(task, slots[i], &magic, sizeof(magic)) &&
-                        (magic == MH_MAGIC_64 || magic == MH_MAGIC ||
-                         magic == FAT_MAGIC || magic == FAT_CIGAM ||
-                         magic == FAT_MAGIC_64 || magic == FAT_CIGAM_64))
-                        header = slots[i];
-                }
-            }
-        }
-    }
-    if (threads) {
-        for (mach_msg_type_number_t i = 0; i < threadCount; i++)
-            mach_port_deallocate(mach_task_self(), threads[i]);
-        vm_deallocate(mach_task_self(), (vm_address_t)threads,
-                      (vm_size_t)threadCount * sizeof(thread_act_t));
-    }
-    return header;
-}
-
-// For an executable whose encrypted range starts off a 16 KB boundary,
-// mremap_encrypted cannot work: mmap and mremap both require 16 KB alignment.
-// Flexdecrypt handles this case by launching the app suspended, letting the
-// kernel decrypt its pages, and reading the encrypted range back from the
-// task. We do the same locally; if the sandbox refuses task_for_pid, the
-// caller falls back to the existing SpringBoard path.
-static BOOL ad_decrypt_range_in_spawned_process(NSString *src, int out, uint64_t start,
-                                                const ADEncryptedSlice *s, NSString **why)
-{
-    if (s->filetype != MH_EXECUTE) {
-        *why = @"not a spawned executable";
-        return NO;
-    }
-    if (!s->cryptsize || s->cryptsize > 256u * 1024u * 1024u) {
-        *why = @"implausible encrypted size";
-        return NO;
-    }
-    const char *path = src.fileSystemRepresentation;
-    posix_spawnattr_t attr;
-    if (posix_spawnattr_init(&attr) != 0) { *why = @"posix_spawnattr_init failed"; return NO; }
-    sigset_t empty;
-    sigemptyset(&empty);
-    posix_spawnattr_setsigmask(&attr, &empty);
-    posix_spawnattr_setflags(&attr, POSIX_SPAWN_START_SUSPENDED | POSIX_SPAWN_SETPGROUP);
-    extern char **environ;
-    char *argv[] = { (char *)path, NULL };
-    pid_t pid = 0;
-    int rc = posix_spawn(&pid, path, NULL, &attr, argv, environ);
-    posix_spawnattr_destroy(&attr);
-    if (rc != 0 || pid <= 0) {
-        // Some app executables refuse the suspended flag but can still be
-        // started normally; kill it immediately after the read.
-        printf("[DECRYPT]   spawn with STOPPED: %s; retrying without the attribute\n", strerror(rc));
-        pid = 0;
-        rc = posix_spawn(&pid, path, NULL, NULL, argv, environ);
-        if (rc != 0 || pid <= 0) {
-            *why = [NSString stringWithFormat:@"posix_spawn: %s", strerror(rc)];
+    struct { const char *name; size_t addrOff, len; } variants[] = {
+        { "page-range",  0,     mapLen },
+        { "crypt-range", delta, mapLen > delta ? mapLen - delta : 0 },
+        { "crypt-exact", delta, s->cryptsize },
+        { "page-exact",  0,     s->cryptsize },
+        { "crypt-page",  delta, page },
+    };
+    uint32_t subtypes[2] = { s->cpusubtype, s->cpusubtype & ~(uint32_t)CPU_SUBTYPE_MASK };
+    for (size_t i = 0; i < sizeof(variants) / sizeof(variants[0]); i++) {
+        if (!variants[i].len || variants[i].addrOff + variants[i].len > mapLen) continue;
+        void *map = mmap(NULL, mapLen, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, (off_t)aligned);
+        if (map == MAP_FAILED) map = mmap(NULL, mapLen, PROT_READ, MAP_PRIVATE, fd, (off_t)aligned);
+        if (map == MAP_FAILED) {
+            if (why) *why = [NSString stringWithFormat:@"mmap: %s", strerror(errno)];
             return NO;
         }
-    }
-    mach_port_t task = MACH_PORT_NULL;
-    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
-    if (kr != KERN_SUCCESS || task == MACH_PORT_NULL) {
-        kill(pid, SIGKILL);
-        waitpid(pid, NULL, 0);
-        *why = [NSString stringWithFormat:@"task_for_pid: 0x%x", kr];
-        return NO;
-    }
-    uint64_t header = ad_task_main_header(task);
-    BOOL ok = NO;
-    void *buf = NULL;
-    if (!header) {
-        *why = @"no Mach-O header in the spawned task";
-    } else {
-        struct mach_header_64 mh;
-        if (!ad_task_read(task, header, &mh, sizeof(mh)) ||
-            mh.magic != MH_MAGIC_64) {
-            *why = @"spawned task header is not a thin 64-bit Mach-O";
-        } else if ((uint32_t)mh.cputype != s->cputype) {
-            *why = @"spawned task runs a different CPU slice";
-        } else {
-            buf = malloc(s->cryptsize);
-            if (!buf) {
-                *why = @"no memory for the decrypted range";
-            } else if (!ad_task_read(task, header + s->cryptoff, buf, s->cryptsize)) {
-                *why = @"reading the spawned task's encrypted range failed";
-            } else if (!ad_pwrite_all(out, buf, s->cryptsize, (off_t)start)) {
-                *why = @"writing the spawned task's plaintext failed";
-            } else {
-                printf("[DECRYPT]   spawn pid %d header 0x%llx read 0x%x bytes at 0x%llx: ok\n",
-                       pid, header, s->cryptsize, header + s->cryptoff);
-                ok = YES;
+        uint64_t addr = (uint64_t)map + variants[i].addrOff;
+        int r = -1, e = 0;
+        for (int v = 0; v < 2 && r != 0; v++) {
+            if (v == 1 && subtypes[1] == subtypes[0]) break;
+            r = fn((void *)(uintptr_t)addr, variants[i].len, s->cryptid, s->cputype, subtypes[v]);
+            if (r != 0) e = errno;
+        }
+        printf("[DECRYPT]   variant %s addr=+0x%zx len=0x%zx: %s\n",
+               variants[i].name, variants[i].addrOff, variants[i].len,
+               r == 0 ? "ok" : strerror(e));
+        if (r == 0) {
+            // Only accept bytes that actually differ from the encrypted file.
+            uint8_t enc[64], dec[64];
+            size_t probe = MIN(sizeof(enc), (size_t)s->cryptsize);
+            if (!ad_pread_all(fd, enc, probe, (off_t)start)) {
+                munmap(map, mapLen);
+                if (why) *why = @"reading the encrypted probe failed";
+                return NO;
+            }
+            memcpy(dec, (const uint8_t *)map + delta, probe);
+            if (memcmp(enc, dec, probe) != 0) {
+                BOOL wrote = ad_pwrite_all(out, (const uint8_t *)map + delta,
+                                           s->cryptsize, (off_t)start);
+                munmap(map, mapLen);
+                if (!wrote) { if (why) *why = @"writing the copy failed"; return NO; }
+                return YES;
             }
         }
+        munmap(map, mapLen);
     }
-    free(buf);
-    kill(pid, SIGKILL);
-    waitpid(pid, NULL, 0);
-    mach_port_deallocate(mach_task_self(), task);
-    return ok;
-}
-
-// --- SpringBoard spawn fallback --------------------------------------------
-// If Cyanide's sandbox refuses task_for_pid, SpringBoard is the next process
-// that can spawn the executable and read its task. The helpers below use the
-// existing RemoteCall session; no kernel read is involved.
-
-static uint64_t ad_sb_alloc(size_t n)
-{
-    uint64_t p = r_dlsym_call(R_TIMEOUT, "malloc", (uint64_t)n, 0, 0, 0, 0, 0, 0, 0);
-    return r_last_call_ok() ? p : 0;
-}
-
-static void ad_sb_free(uint64_t p)
-{
-    if (p) r_dlsym_call(R_TIMEOUT, "free", p, 0, 0, 0, 0, 0, 0, 0);
-}
-
-static uint64_t ad_sb_dlsym(const char *name)
-{
-    uint64_t s = r_alloc_str(name);
-    if (!s) return 0;
-    uint64_t p = r_dlsym_call(R_TIMEOUT, "dlsym", (uint64_t)(intptr_t)RTLD_DEFAULT, s, 0, 0, 0, 0, 0, 0);
-    r_free(s);
-    return r_last_call_ok() ? p : 0;
-}
-
-static uint64_t ad_sb_task_self(void)
-{
-    uint64_t sym = ad_sb_dlsym("mach_task_self_");
-    uint32_t port = 0;
-    if (!sym || !remote_read(sym, &port, sizeof(port))) return 0;
-    return port;
-}
-
-static uint64_t ad_sb_env(void)
-{
-    uint64_t sym = ad_sb_dlsym("environ");
-    uint64_t envp = 0;
-    if (sym) remote_read(sym, &envp, sizeof(envp));
-    return envp;
-}
-
-static BOOL ad_sb_vm_read(uint64_t task, uint64_t addr, uint64_t scratch, uint64_t gotp, size_t len)
-{
-    remote_write64(gotp, 0);
-    uint64_t kr = r_dlsym_call(R_TIMEOUT, "vm_read_overwrite", task, addr, len, scratch, gotp, 0, 0, 0);
-    uint64_t got = 0;
-    remote_read(gotp, &got, sizeof(got));
-    return (int)kr == 0 && got == len && r_last_call_ok();
-}
-
-static uint64_t ad_sb_main_header(uint64_t task, uint64_t self)
-{
-    uint64_t tdi = ad_sb_alloc(64), tdiCount = ad_sb_alloc(4);
-    uint64_t allImage = 0;
-    if (!tdi || !tdiCount) { ad_sb_free(tdi); ad_sb_free(tdiCount); return 0; }
-    uint32_t tdiC = TASK_DYLD_INFO_COUNT;
-    remote_write(tdiCount, &tdiC, sizeof(tdiC));
-    uint64_t tiRc = r_dlsym_call(R_TIMEOUT, "task_info", task, TASK_DYLD_INFO, tdi, tdiCount, 0, 0, 0, 0);
-    if ((int)tiRc == 0 && r_last_call_ok())
-        remote_read(tdi, &allImage, sizeof(allImage));
-    ad_sb_free(tdi); ad_sb_free(tdiCount);
-    if (allImage) {
-        uint64_t ai = ad_sb_alloc(24), gotp = ad_sb_alloc(8);
-        uint64_t infoArray = 0, header = 0;
-        if (ai && gotp && ad_sb_vm_read(task, allImage, ai, gotp, 24)) {
-            remote_read(ai + 8, &infoArray, sizeof(infoArray));
-            if (infoArray) {
-                uint64_t first = ad_sb_alloc(8);
-                if (first && ad_sb_vm_read(task, infoArray, first, gotp, 8))
-                    remote_read(first, &header, sizeof(header));
-                ad_sb_free(first);
-            }
-        }
-        ad_sb_free(ai); ad_sb_free(gotp);
-        if (header) return header;
-    }
-    // dyld may not have published all_image_infos yet: read the first
-    // suspended thread's stack slots, exactly as the local helper does.
-    uint64_t threadsPtr = ad_sb_alloc(8), countPtr = ad_sb_alloc(4);
-    uint64_t header = 0;
-    if (!threadsPtr || !countPtr) { ad_sb_free(threadsPtr); ad_sb_free(countPtr); return 0; }
-    uint64_t zeroThreads = 0;
-    remote_write(threadsPtr, &zeroThreads, sizeof(zeroThreads));
-    uint32_t zeroCount = 0;
-    remote_write(countPtr, &zeroCount, sizeof(zeroCount));
-    r_dlsym_call(R_TIMEOUT, "task_threads", task, threadsPtr, countPtr, 0, 0, 0, 0, 0);
-    uint64_t threads = 0; uint32_t count = 0;
-    remote_read(threadsPtr, &threads, sizeof(threads));
-    remote_read(countPtr, &count, sizeof(count));
-    if (threads && count) {
-        uint32_t thread = 0;
-        remote_read(threads, &thread, sizeof(thread));
-        uint64_t statep = ad_sb_alloc(512), stateCountp = ad_sb_alloc(4);
-        if (thread && statep && stateCountp) {
-            uint32_t stateCount = ARM_THREAD_STATE64_COUNT;
-            remote_write(stateCountp, &stateCount, sizeof(stateCount));
-            r_dlsym_call(R_TIMEOUT, "thread_get_state", thread, ARM_THREAD_STATE64, statep, stateCountp, 0, 0, 0, 0);
-            arm_thread_state64_t state;
-            if (remote_read(statep, &state, sizeof(state))) {
-                uint64_t sp = (uint64_t)arm_thread_state64_get_sp(state);
-                uint64_t scratch = ad_sb_alloc(32), gotp = ad_sb_alloc(8);
-                if (sp && scratch && gotp && ad_sb_vm_read(task, sp, scratch, gotp, 32)) {
-                    uint64_t slots[4] = {0};
-                    remote_read(scratch, slots, sizeof(slots));
-                    for (int i = 0; i < 4 && !header; i++) {
-                        if (!slots[i]) continue;
-                        uint32_t magic = 0;
-                        if (ad_sb_vm_read(task, slots[i], scratch, gotp, sizeof(magic))) {
-                            remote_read(scratch, &magic, sizeof(magic));
-                            if (magic == MH_MAGIC_64 || magic == MH_MAGIC ||
-                                magic == FAT_MAGIC || magic == FAT_CIGAM ||
-                                magic == FAT_MAGIC_64 || magic == FAT_CIGAM_64)
-                                header = slots[i];
-                        }
-                    }
-                }
-                ad_sb_free(scratch); ad_sb_free(gotp);
-            }
-        }
-        ad_sb_free(statep); ad_sb_free(stateCountp);
-    }
-    ad_sb_free(threadsPtr); ad_sb_free(countPtr);
-    (void)self;
-    return header;
-}
-
-static BOOL ad_decrypt_range_in_springboard_spawn(NSString *src, NSString *dst, uint64_t start,
-                                                  const ADEncryptedSlice *s, NSString **why)
-{
-    if (s->filetype != MH_EXECUTE) { *why = @"SpringBoard: not a spawned executable"; return NO; }
-    if (!s->cryptsize || s->cryptsize > 256u * 1024u * 1024u) {
-        *why = @"SpringBoard: implausible encrypted size";
-        return NO;
-    }
-    uint64_t self = ad_sb_task_self();
-    uint64_t rsrc = r_alloc_str(src.fileSystemRepresentation);
-    uint64_t rdst = r_alloc_str(dst.fileSystemRepresentation);
-    uint64_t argv = ad_sb_alloc(16), pidp = ad_sb_alloc(4), attrp = ad_sb_alloc(64), taskp = ad_sb_alloc(4);
-    uint64_t envp = ad_sb_env();
-    BOOL ok = NO;
-    uint64_t task = 0, scratch = 0, gotp = 0;
-    int fdOut = -1;
-    pid_t pid = 0;
-    do {
-        if (!self || !rsrc || !rdst || !argv || !pidp || !attrp || !taskp) {
-            *why = @"SpringBoard: allocation failed"; break;
-        }
-        remote_write64(argv, rsrc);
-        remote_write64(argv + 8, 0);
-        uint32_t zeroPid = 0;
-        remote_write(pidp, &zeroPid, sizeof(zeroPid));
-        if ((int)r_dlsym_call(R_TIMEOUT, "posix_spawnattr_init", attrp, 0, 0, 0, 0, 0, 0, 0) != 0) {
-            *why = @"SpringBoard: posix_spawnattr_init failed"; break;
-        }
-        r_dlsym_call(R_TIMEOUT, "posix_spawnattr_setflags", attrp, POSIX_SPAWN_START_SUSPENDED, 0, 0, 0, 0, 0, 0);
-        uint64_t rc = r_dlsym_call(R_TIMEOUT, "posix_spawn", pidp, rsrc, 0, attrp, argv, envp, 0, 0);
-        if (!r_last_call_ok() || (int)rc != 0) {
-            printf("[DECRYPT]   SpringBoard spawn with STOPPED: %d; retrying without it\n", (int)rc);
-            rc = r_dlsym_call(R_TIMEOUT, "posix_spawn", pidp, rsrc, 0, 0, argv, envp, 0, 0);
-        }
-        if (!r_last_call_ok() || (int)rc != 0) {
-            *why = [NSString stringWithFormat:@"SpringBoard: posix_spawn failed (%d)", (int)rc]; break;
-        }
-        uint32_t p32 = 0;
-        remote_read(pidp, &p32, sizeof(p32));
-        pid = (pid_t)p32;
-        if (!pid) { *why = @"SpringBoard: posix_spawn returned no pid"; break; }
-        uint32_t zeroTask = 0;
-        remote_write(taskp, &zeroTask, sizeof(zeroTask));
-        uint64_t tfp = r_dlsym_call(R_TIMEOUT, "task_for_pid", self, pid, taskp, 0, 0, 0, 0, 0);
-        uint32_t t32 = 0;
-        remote_read(taskp, &t32, sizeof(t32));
-        task = t32;
-        if (!r_last_call_ok() || (int)tfp != 0 || !task) {
-            *why = [NSString stringWithFormat:@"SpringBoard: task_for_pid failed (%d)", (int)tfp]; break;
-        }
-        uint64_t header = ad_sb_main_header(task, self);
-        if (!header) { *why = @"SpringBoard: no Mach-O header"; break; }
-        scratch = ad_sb_alloc(s->cryptsize);
-        gotp = ad_sb_alloc(8);
-        if (!scratch || !gotp) { *why = @"SpringBoard: no read buffer"; break; }
-        if (!ad_sb_vm_read(task, header + s->cryptoff, scratch, gotp, s->cryptsize)) {
-            *why = @"SpringBoard: reading the task range failed"; break;
-        }
-        fdOut = (int)r_dlsym_call(R_TIMEOUT, "open", rdst, O_WRONLY | O_CLOEXEC, 0, 0, 0, 0, 0, 0);
-        if (fdOut < 0) { *why = @"SpringBoard: opening the working copy failed"; break; }
-        uint64_t done = 0;
-        while (done < s->cryptsize) {
-            size_t chunk = (size_t)MIN((uint64_t)s->cryptsize - done, 1024ULL * 1024ULL);
-            int64_t n = (int64_t)r_dlsym_call(R_TIMEOUT, "pwrite", (uint64_t)fdOut,
-                                              scratch + done, chunk, start + done, 0, 0, 0, 0);
-            if (n <= 0 || !r_last_call_ok()) { *why = @"SpringBoard: writing the range failed"; break; }
-            done += (uint64_t)n;
-        }
-        if (done != s->cryptsize) break;
-        printf("[DECRYPT]   springboard spawn pid %d header 0x%llx read 0x%x bytes: ok\n",
-               pid, header, s->cryptsize);
-        ok = YES;
-    } while (0);
-    if (fdOut >= 0) r_dlsym_call(R_TIMEOUT, "close", (uint64_t)fdOut, 0, 0, 0, 0, 0, 0, 0);
-    if (pid) {
-        r_dlsym_call(R_TIMEOUT, "kill", (uint64_t)pid, SIGKILL, 0, 0, 0, 0, 0, 0);
-        r_dlsym_call(R_TIMEOUT, "waitpid", (uint64_t)pid, 0, 0, 0, 0, 0, 0, 0);
-    }
-    if (task) r_dlsym_call(R_TIMEOUT, "mach_port_deallocate", self, task, 0, 0, 0, 0, 0, 0);
-    ad_sb_free(scratch); ad_sb_free(gotp);
-    ad_sb_free(argv); ad_sb_free(pidp); ad_sb_free(attrp); ad_sb_free(taskp);
-    if (rsrc) r_free(rsrc);
-    if (rdst) r_free(rdst);
-    return ok;
-}
-
-// pid of a running app as SpringBoard's RunningBoard sees it.
-static int ad_sb_pid_for_bundle(uint64_t bundleStr)
-{
-    uint64_t clsPred = r_class("RBSProcessPredicate");
-    uint64_t clsHandle = r_class("RBSProcessHandle");
-    if (!r_is_objc_ptr(clsPred) || !r_is_objc_ptr(clsHandle)) return 0;
-    uint64_t pred = r_msg2(clsPred, "predicateMatchingBundleIdentifier:", bundleStr, 0, 0, 0);
-    if (!r_is_objc_ptr(pred)) return 0;
-    uint64_t handle = r_msg2(clsHandle, "handleForPredicate:error:", pred, 0, 0, 0);
-    if (!r_is_objc_ptr(handle)) return 0;
-    return (int)(r_msg2(handle, "rbs_pid", 0, 0, 0, 0) & 0xffffffffULL);
-}
-
-static BOOL ad_sb_write_task_range(uint64_t task, uint64_t header, uint64_t start,
-                                   NSString *dst, const ADEncryptedSlice *s, uint64_t *outTask, NSString **why)
-{
-    uint64_t scratch = ad_sb_alloc(s->cryptsize), gotp = ad_sb_alloc(8);
-    if (!scratch || !gotp) { ad_sb_free(scratch); ad_sb_free(gotp); *why = @"SpringBoard: no read buffer"; return NO; }
-    BOOL ok = NO;
-    if (!ad_sb_vm_read(task, header + s->cryptoff, scratch, gotp, s->cryptsize)) {
-        *why = @"SpringBoard: reading the task range failed";
-    } else {
-        uint64_t rdst = r_alloc_str(dst.fileSystemRepresentation);
-        int fdOut = rdst ? (int)r_dlsym_call(R_TIMEOUT, "open", rdst, O_WRONLY | O_CLOEXEC, 0, 0, 0, 0, 0, 0) : -1;
-        if (fdOut < 0) {
-            *why = @"SpringBoard: opening the working copy failed";
-        } else {
-            uint64_t done = 0;
-            ok = YES;
-            while (done < s->cryptsize) {
-                size_t chunk = (size_t)MIN((uint64_t)s->cryptsize - done, 1024ULL * 1024ULL);
-                int64_t n = (int64_t)r_dlsym_call(R_TIMEOUT, "pwrite", (uint64_t)fdOut,
-                                                  scratch + done, chunk, start + done, 0, 0, 0, 0);
-                if (n <= 0 || !r_last_call_ok()) { *why = @"SpringBoard: writing the range failed"; ok = NO; break; }
-                done += (uint64_t)n;
-            }
-            r_dlsym_call(R_TIMEOUT, "close", (uint64_t)fdOut, 0, 0, 0, 0, 0, 0, 0);
-            if (ok && outTask) *outTask = task;
-        }
-        if (rdst) r_free(rdst);
-    }
-    ad_sb_free(scratch); ad_sb_free(gotp);
-    return ok;
-}
-
-// Direct posix_spawn of an App Store executable is refused with EPERM on
-// this iOS build. As a last resort, ask SpringBoard to open the app, SIGSTOP
-// it as soon as RunningBoard reports its pid, read the decrypted range, and
-// kill only the instance we launched.
-static BOOL ad_decrypt_range_in_launched_app(NSString *src, NSString *dst, int out, uint64_t start,
-                                             const ADEncryptedSlice *s, NSString **why)
-{
-    if (s->filetype != MH_EXECUTE) { *why = @"launched app: not an executable"; return NO; }
-    if ([src rangeOfString:@".appex/"].location != NSNotFound) {
-        *why = @"launched app: extension needs a host"; return NO;
-    }
-    NSString *appPath = src;
-    while (appPath.length > 1 && ![appPath.pathExtension isEqualToString:@"app"])
-        appPath = appPath.stringByDeletingLastPathComponent;
-    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
-                          [appPath stringByAppendingPathComponent:@"Info.plist"]];
-    NSString *bundleID = [info[@"CFBundleIdentifier"] isKindOfClass:NSString.class] ? info[@"CFBundleIdentifier"] : nil;
-    if (!bundleID.length) { *why = @"launched app: no bundle identifier"; return NO; }
-    uint64_t self = ad_sb_task_self();
-    uint64_t bundleStr = r_nsstr_retained(bundleID.UTF8String);
-    if (!self || !bundleStr) { if (bundleStr) r_release(bundleStr); *why = @"launched app: setup failed"; return NO; }
-    int pid = ad_sb_pid_for_bundle(bundleStr);
-    BOOL launched = NO;
-    if (pid <= 0) {
-        uint64_t cls = r_class("LSApplicationWorkspace");
-        uint64_t ws = r_is_objc_ptr(cls) ? r_msg2(cls, "defaultWorkspace", 0, 0, 0, 0) : 0;
-        if (!r_is_objc_ptr(ws)) { r_release(bundleStr); *why = @"launched app: no LSApplicationWorkspace"; return NO; }
-        r_msg2_main(ws, "openApplicationWithBundleID:", bundleStr, 0, 0, 0);
-        launched = YES;
-        for (int i = 0; i < 25 && pid <= 0; i++) {
-            usleep(200000);
-            pid = ad_sb_pid_for_bundle(bundleStr);
-        }
-    }
-    r_release(bundleStr);
-    if (pid <= 0) { *why = @"launched app: it did not start"; return NO; }
-
-    // Stop it immediately; the goal is only to read the pages it has mapped.
-    r_dlsym_call(R_TIMEOUT, "kill", (uint64_t)pid, SIGSTOP, 0, 0, 0, 0, 0, 0);
-
-    // Try the local task port first (same-user children are sometimes
-    // inspectable without going through SpringBoard).
-    mach_port_t localTask = MACH_PORT_NULL;
-    if (task_for_pid(mach_task_self(), pid, &localTask) == KERN_SUCCESS && localTask != MACH_PORT_NULL) {
-        uint64_t header = ad_task_main_header(localTask);
-        void *buf = header ? malloc(s->cryptsize) : NULL;
-        BOOL localOK = NO;
-        if (buf && ad_task_read(localTask, header + s->cryptoff, buf, s->cryptsize) &&
-            ad_pwrite_all(out, buf, s->cryptsize, (off_t)start)) {
-            printf("[DECRYPT]   launched-app pid %d local task header 0x%llx read 0x%x bytes: ok\n",
-                   pid, header, s->cryptsize);
-            localOK = YES;
-        }
-        free(buf);
-        mach_port_deallocate(mach_task_self(), localTask);
-        if (localOK) {
-            if (launched) r_dlsym_call(R_TIMEOUT, "kill", (uint64_t)pid, SIGKILL, 0, 0, 0, 0, 0, 0);
-            else r_dlsym_call(R_TIMEOUT, "kill", (uint64_t)pid, SIGCONT, 0, 0, 0, 0, 0, 0);
-            return YES;
-        }
-    }
-
-    uint64_t taskp = ad_sb_alloc(4);
-    uint32_t task = 0;
-    BOOL ok = NO;
-    if (taskp) {
-        uint64_t zeroTask = 0;
-        remote_write(taskp, &zeroTask, sizeof(zeroTask));
-        uint64_t tfp = r_dlsym_call(R_TIMEOUT, "task_for_pid", self, pid, taskp, 0, 0, 0, 0, 0);
-        remote_read(taskp, &task, sizeof(task));
-        if ((int)tfp == 0 && task) {
-            uint64_t header = ad_sb_main_header(task, self);
-            if (header) {
-                NSString *readWhy = nil;
-                ok = ad_sb_write_task_range(task, header, start, dst, s, NULL, &readWhy);
-                if (!ok) *why = readWhy ?: @"launched app: reading failed";
-                else printf("[DECRYPT]   launched-app pid %d header 0x%llx read 0x%x bytes: ok\n",
-                            pid, header, s->cryptsize);
-            } else *why = @"launched app: no Mach-O header";
-        } else *why = [NSString stringWithFormat:@"launched app: task_for_pid failed (%d)", (int)tfp];
-        ad_sb_free(taskp);
-    } else *why = @"launched app: no task buffer";
-
-    if (launched) r_dlsym_call(R_TIMEOUT, "kill", (uint64_t)pid, SIGKILL, 0, 0, 0, 0, 0, 0);
-    else r_dlsym_call(R_TIMEOUT, "kill", (uint64_t)pid, SIGCONT, 0, 0, 0, 0, 0, 0);
-    if (task) r_dlsym_call(R_TIMEOUT, "mach_port_deallocate", self, task, 0, 0, 0, 0, 0, 0);
-    return ok;
+    if (why) *why = @"mremap_encrypted: no accepted mapping variant";
+    return NO;
 }
 
 // Writes a copy of `src` with every encrypted slice decrypted and its cryptid
@@ -737,7 +324,7 @@ static BOOL ad_decrypt_file(NSString *src, NSString *dst, BOOL useSpringBoard, B
 {
     static dispatch_once_t adBuildOnce;
     dispatch_once(&adBuildOnce, ^{
-        printf("[DECRYPT] spawn fallback active (compiled %s %s)\n", __DATE__, __TIME__);
+        printf("[DECRYPT] no-launch mremap variants active (compiled %s %s)\n", __DATE__, __TIME__);
     });
     *decrypted = NO;
     static ADMremapEncrypted mremapEncrypted;
@@ -778,65 +365,16 @@ static BOOL ad_decrypt_file(NSString *src, NSString *dst, BOOL useSpringBoard, B
         // Whole pages: on a 16 KB system the kernel rejects a partial last
         // page (a 4 KB range in an app extension failed with ENOMEM).
         size_t mapLen = ((delta + s.cryptsize) + page - 1) & ~(page - 1);
-        // 1) Here, in Cyanide. If the range is not 16 KB aligned, mmap and
-        // mremap_encrypted cannot both be satisfied; for an executable, launch
-        // it suspended and read the decrypted range from its task instead
-        // (the fallback flexdecrypt uses for applications).
+        // 1) Here, in Cyanide. Trying address/length pairs matters for a
+        // 4 KB encrypted range inside a 16 KB page: mremap has no cryptoff.
+        printf("[DECRYPT] %s: cpu=0x%x/0x%x cryptid=%u slice=0x%llx cryptoff=0x%x (16K-aligned=%d) map=0x%llx+0x%zx\n",
+               src.lastPathComponent.UTF8String, s.cputype, s.cpusubtype, s.cryptid, s.sliceOffset, s.cryptoff,
+               (int)((start % page) == 0), aligned, mapLen);
         NSString *localWhy = nil;
-        BOOL localOK = NO;
-        if ((start % page) && s.filetype == MH_EXECUTE) {
-            NSString *spawnWhy = nil;
-            localOK = ad_decrypt_range_in_spawned_process(src, out, start, &s, &spawnWhy);
-            if (!localOK) localWhy = [@"spawn: " stringByAppendingString:spawnWhy ?: @"failed"];
-            if (!localOK && useSpringBoard) {
-                NSString *sbSpawnWhy = nil;
-                localOK = ad_decrypt_range_in_springboard_spawn(src, dst, start, &s, &sbSpawnWhy);
-                if (!localOK)
-                    localWhy = [NSString stringWithFormat:@"%@; SpringBoard spawn: %@",
-                                localWhy ?: @"spawn failed", sbSpawnWhy ?: @"failed"];
-            }
-            if (!localOK && useSpringBoard) {
-                NSString *launchWhy = nil;
-                localOK = ad_decrypt_range_in_launched_app(src, dst, out, start, &s, &launchWhy);
-                if (!localOK)
-                    localWhy = [NSString stringWithFormat:@"%@; launch: %@",
-                                localWhy ?: @"spawn failed", launchWhy ?: @"failed"];
-            }
-        }
-        void *map = NULL;
-        if (!localOK) {
-            map = mmap(NULL, mapLen, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, (off_t)aligned);
-            if (map == MAP_FAILED) map = mmap(NULL, mapLen, PROT_READ, MAP_PRIVATE, fd, (off_t)aligned);
-            if (map == MAP_FAILED) {
-                NSString *why = [NSString stringWithFormat:@"mmap: %s", strerror(errno)];
-                localWhy = localWhy ? [localWhy stringByAppendingFormat:@"; %@", why] : why;
-                map = NULL;
-            } else if (!mremapEncrypted) {
-                localWhy = localWhy ? [localWhy stringByAppendingString:@"; no mremap_encrypted"] : @"no mremap_encrypted";
-            } else {
-                // Diagnostics for the device log: what the kernel is being asked.
-                printf("[DECRYPT] %s: cpu=0x%x/0x%x cryptid=%u slice=0x%llx cryptoff=0x%x (16K-aligned=%d) map=0x%llx+0x%zx\n",
-                       src.lastPathComponent.UTF8String, s.cputype, s.cpusubtype, s.cryptid, s.sliceOffset, s.cryptoff,
-                       (int)((start % page) == 0), aligned, mapLen);
-                uint32_t subtypes[2] = { s.cpusubtype, s.cpusubtype & ~(uint32_t)CPU_SUBTYPE_MASK };
-                int r = -1, e = 0;
-                for (int v = 0; v < 2 && r != 0; v++) {
-                    if (v == 1 && subtypes[1] == subtypes[0]) break;
-                    r = mremapEncrypted(map, mapLen, s.cryptid, s.cputype, subtypes[v]);
-                    if (r != 0) e = errno;
-                    printf("[DECRYPT]   local variant %d (subtype 0x%x): %s\n", v, subtypes[v], r == 0 ? "ok" : strerror(e));
-                }
-                if (r != 0) {
-                    NSString *why = [NSString stringWithFormat:@"mremap_encrypted: %s", strerror(e)];
-                    localWhy = localWhy ? [localWhy stringByAppendingFormat:@"; %@", why] : why;
-                } else {
-                    localOK = ad_pwrite_all(out, (const uint8_t *)map + delta, s.cryptsize, (off_t)start);
-                    if (!localOK) localWhy = localWhy ? [localWhy stringByAppendingString:@"; writing the copy failed"]
-                                                       : @"writing the copy failed";
-                }
-            }
-        }
-        if (map) munmap(map, mapLen);
+        BOOL localOK = mremapEncrypted &&
+            ad_try_mremap_variants(fd, out, start, page, aligned, delta, mapLen,
+                                   &s, mremapEncrypted, &localWhy);
+        if (!localOK && !localWhy) localWhy = @"no mremap_encrypted";
         printf("[DECRYPT] %s: off=0x%llx size=0x%x delta=0x%zx local=%s\n", src.lastPathComponent.UTF8String,
                start, s.cryptsize, delta, localOK ? "ok" : localWhy.UTF8String);
         // 2) In SpringBoard, when Cyanide may not decrypt itself.

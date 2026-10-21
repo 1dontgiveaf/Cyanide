@@ -16,7 +16,7 @@ A new **Lara** section with tools ported from lara, a more capable File Browser,
   - **JIT Enabler:** opens an app with JIT, for emulators and similar apps signed with a development profile.
   - **3-App Limit:** shows which sideloaded apps count toward the free Apple ID limit and frees the slots. Run it again after installing or refreshing an app.
   - **Wallet Card Art:** replace a Wallet card's picture with your own (cosmetic); the original is backed up and can be restored.
-  - **App Decrypt:** makes a decrypted IPA of an App Store app on your device, e.g. to inject a tweak and sideload it. The app, its frameworks and its extensions are decrypted by iOS itself. When an executable's encrypted range isn't 16 KB-aligned, it is started suspended only long enough to read the decrypted pages, then killed before its UI appears. If iOS refuses the direct spawn, the app is opened briefly and stopped immediately. IPAs stay on your device until you share them. Only for apps you own.
+  - **App Decrypt:** makes a decrypted IPA of an App Store app on your device, e.g. to inject a tweak and sideload it. The app, its frameworks and its extensions are decrypted by iOS itself. When an executable's encrypted range isn't 16 KB-aligned, Cyanide tries alternate decryption mappings; it does not launch the app. IPAs stay on your device until you share them. Only for apps you own.
 - **File Browser:**
   - **Copy, Cut and Paste** between folders (long-press an item, then use + in the target folder).
   - **Image viewer** with zoom and Share for PNG, JPEG, HEIC, GIF, WebP and more.
