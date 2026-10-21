@@ -434,8 +434,9 @@ static uint64_t ad_sb_main_header(uint64_t task, uint64_t self)
     if (!tdi || !tdiCount) { ad_sb_free(tdi); ad_sb_free(tdiCount); return 0; }
     uint32_t tdiC = TASK_DYLD_INFO_COUNT;
     remote_write(tdiCount, &tdiC, sizeof(tdiC));
-    r_dlsym_call(R_TIMEOUT, "task_info", task, TASK_DYLD_INFO, tdi, tdiCount, 0, 0, 0, 0);
-    remote_read(tdi, &allImage, sizeof(allImage));
+    uint64_t tiRc = r_dlsym_call(R_TIMEOUT, "task_info", task, TASK_DYLD_INFO, tdi, tdiCount, 0, 0, 0, 0);
+    if ((int)tiRc == 0 && r_last_call_ok())
+        remote_read(tdi, &allImage, sizeof(allImage));
     ad_sb_free(tdi); ad_sb_free(tdiCount);
     if (allImage) {
         uint64_t ai = ad_sb_alloc(24), gotp = ad_sb_alloc(8);
