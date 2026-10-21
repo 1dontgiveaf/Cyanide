@@ -134,6 +134,10 @@ static BOOL QueuePackageIsHideHomeBar(Package *pkg)
         [self.clearButton.topAnchor        constraintEqualToAnchor:self.confirmButton.bottomAnchor constant:2.0],
         [self.clearButton.centerXAnchor    constraintEqualToAnchor:container.centerXAnchor],
         [self.clearButton.bottomAnchor     constraintEqualToAnchor:container.bottomAnchor constant:-8.0],
+        // A small text button right above the home indicator: keep a full
+        // 44 pt touch target (it was text-high and easy to miss).
+        [self.clearButton.heightAnchor     constraintGreaterThanOrEqualToConstant:44.0],
+        [self.clearButton.widthAnchor      constraintGreaterThanOrEqualToConstant:160.0],
     ]];
     return container;
 }

@@ -13855,6 +13855,9 @@ static NSUInteger settings_tab_index_for_title(UITabBarController *tab, NSString
     btn.contentEdgeInsets = UIEdgeInsetsMake(0, 0, 0, 4);
     [btn addTarget:self action:@selector(returnToInstaller) forControlEvents:UIControlEventTouchUpInside];
     [btn sizeToFit];
+    // sizeToFit leaves it text-high (~22 pt): give it a full 44 pt touch
+    // target, like the system back button.
+    btn.frame = CGRectMake(0, 0, MAX(btn.bounds.size.width, 44.0), 44.0);
 
     UIBarButtonItem *backItem = [[UIBarButtonItem alloc] initWithCustomView:btn];
     self.navigationItem.leftBarButtonItem = backItem;
