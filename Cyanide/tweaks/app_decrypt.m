@@ -75,6 +75,7 @@ typedef struct {
     uint32_t cputype, cpusubtype;
     uint32_t cryptoff, cryptsize, cryptid;
     uint64_t cryptidFileOffset;   // where to write cryptid = 0
+    BOOL hasCodesign;             // LC_CODE_SIGNATURE present
 } ADEncryptedSlice;
 
 static BOOL ad_pread_all(int fd, void *buf, size_t len, off_t off)
@@ -109,6 +110,7 @@ static BOOL ad_parse_slice(int fd, uint64_t off, uint64_t fileSize, ADEncryptedS
     uint64_t cmdsOff = off + sizeof(mh);
     if (cmdsOff + mh.sizeofcmds > fileSize || !ad_pread_all(fd, cmds.mutableBytes, mh.sizeofcmds, (off_t)cmdsOff)) return NO;
     const uint8_t *p = cmds.bytes, *end = p + cmds.length;
+    BOOL hasCodesign = NO, foundEncryption = NO;
     for (uint32_t i = 0; i < mh.ncmds && p + sizeof(struct load_command) <= end; i++) {
         const struct load_command *lc = (const void *)p;
         if (lc->cmdsize < sizeof(struct load_command) || p + lc->cmdsize > end) return NO;
@@ -116,6 +118,7 @@ static BOOL ad_parse_slice(int fd, uint64_t off, uint64_t fileSize, ADEncryptedS
             const struct encryption_info_command_64 *e = (const void *)p;
             if (e->cryptid == 0) return NO;
             out->sliceOffset = off;
+            out->hasCodesign = NO;
             out->cputype = (uint32_t)mh.cputype;
             out->cpusubtype = (uint32_t)mh.cpusubtype;
             out->cryptoff = e->cryptoff;
@@ -123,9 +126,13 @@ static BOOL ad_parse_slice(int fd, uint64_t off, uint64_t fileSize, ADEncryptedS
             out->cryptid = e->cryptid;
             out->cryptidFileOffset = cmdsOff + (uint64_t)(p - (const uint8_t *)cmds.bytes)
                                    + offsetof(struct encryption_info_command_64, cryptid);
-            return YES;
+            foundEncryption = YES;
         }
         p += lc->cmdsize;
+    }
+    if (foundEncryption) {
+        out->hasCodesign = hasCodesign;
+        return YES;
     }
     return NO;
 }
@@ -385,9 +392,9 @@ static BOOL ad_decrypt_file(NSString *src, NSString *dst, BOOL useSpringBoard, B
         size_t mapLen = ((delta + s.cryptsize) + page - 1) & ~(page - 1);
         // 1) Here, in Cyanide. Trying address/length pairs matters for a
         // 4 KB encrypted range inside a 16 KB page: mremap has no cryptoff.
-        printf("[DECRYPT] %s: cpu=0x%x/0x%x cryptid=%u slice=0x%llx cryptoff=0x%x (16K-aligned=%d) map=0x%llx+0x%zx\n",
+        printf("[DECRYPT] %s: cpu=0x%x/0x%x cryptid=%u slice=0x%llx cryptoff=0x%x (16K-aligned=%d) codesign=%d map=0x%llx+0x%zx\n",
                src.lastPathComponent.UTF8String, s.cputype, s.cpusubtype, s.cryptid, s.sliceOffset, s.cryptoff,
-               (int)((start % page) == 0), aligned, mapLen);
+               (int)((start % page) == 0), (int)s.hasCodesign, aligned, mapLen);
         NSString *localWhy = nil;
         BOOL localOK = mremapEncrypted &&
             ad_try_mremap_variants(fd, out, start, page, aligned, delta, mapLen,

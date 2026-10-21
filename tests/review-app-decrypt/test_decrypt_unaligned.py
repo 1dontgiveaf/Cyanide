@@ -23,5 +23,6 @@ assert "task_for_pid" not in SOURCE
 assert "launched-app" not in SOURCE
 assert "memcmp(enc, dec" in SOURCE
 assert "cryptidFileOffset" in SOURCE
+assert "hasCodesign" in SOURCE
 
 print("app decrypt unaligned mremap attempts: PASS")
