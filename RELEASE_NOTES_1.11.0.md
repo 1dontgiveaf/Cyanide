@@ -26,6 +26,7 @@ A new **Lara** section with tools ported from lara, a more capable File Browser,
 ## Improvements
 
 - **Cache Cleaner:** "Select Large Caches (50 MB+)" in the ⋯ menu picks only the caches worth clearing, and the result now explains that apps refill their caches as you use them.
+- **Cache Cleaner on small iPhones:** the blue Clean button is easier to hit; taps near the edge of the bottom bar now count (reported on the iPhone mini).
 
 ## Good to know
 

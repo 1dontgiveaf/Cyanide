@@ -745,6 +745,28 @@ static BOOL cleaner_intro_accepted(void)
 @property (nonatomic, strong) NSLayoutConstraint *cleanButtonWidth;
 @end
 
+// A larger touch target for the toolbar's Clean button: the holder accepts
+// touches up to 10 pt outside itself and hands them all to the button.
+@interface CYCleanerButtonHolder : UIView
+@property (nonatomic, weak) UIButton *button;
+@end
+
+@implementation CYCleanerButtonHolder
+
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event
+{
+    return CGRectContainsPoint(CGRectInset(self.bounds, -10, -10), point);
+}
+
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event
+{
+    if (self.hidden || self.alpha < 0.01 || !self.userInteractionEnabled) return nil;
+    if (![self pointInside:point withEvent:event]) return nil;
+    return self.button.enabled ? self.button : [super hitTest:point withEvent:event];
+}
+
+@end
+
 @implementation CleanerViewController
 
 - (instancetype)init
@@ -893,6 +915,9 @@ static BOOL cleaner_intro_accepted(void)
 }
 
 // The clean button lives in the toolbar so it stays put while the list scrolls.
+// Its holder forwards every touch in and around it to the button: on small
+// phones (iPhone mini) a tap near the toolbar's edge or the home indicator
+// otherwise missed the button itself.
 - (void)buildBottomBar
 {
     UIButtonConfiguration *cfg = [UIButtonConfiguration filledButtonConfiguration];
@@ -914,7 +939,8 @@ static BOOL cleaner_intro_accepted(void)
         [self.cleanProgress.bottomAnchor constraintEqualToAnchor:self.cleanButton.bottomAnchor constant:-6],
     ]];
     self.cleanButton.translatesAutoresizingMaskIntoConstraints = NO;
-    UIView *holder = [UIView new];
+    CYCleanerButtonHolder *holder = [CYCleanerButtonHolder new];
+    holder.button = self.cleanButton;
     [holder addSubview:self.cleanButton];
     holder.translatesAutoresizingMaskIntoConstraints = NO;
     self.cleanButtonWidth = [holder.widthAnchor constraintEqualToConstant:320];
