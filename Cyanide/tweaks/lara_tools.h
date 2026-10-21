@@ -42,3 +42,15 @@ const LaraPrefToggle *lara_pref_toggles(void);
 // 1 on, 0 off/unset, -1 read failed.
 int  lara_pref_get_in_session(const LaraPrefToggle *toggle);
 bool lara_pref_set_in_session(const LaraPrefToggle *toggle, bool on);
+
+// JIT for a sideloaded app signed with get-task-allow (a development
+// profile): SpringBoard attaches to it as a debugger and detaches again,
+// which marks the process as debugged so it may use JIT. Opens the app first
+// when it isn't running. Lasts until the app quits.
+// 0 on success, else an errno-style code (ESRCH: app didn't start).
+int lara_jit_enable_in_session(NSString *bundleID);
+
+// Installed apps that can get JIT (their embedded.mobileprovision allows
+// get-task-allow). Each: @{ name, bundleID, path, (icon) }. Needs filesystem
+// access (sandbox lifted); blocking.
+NSArray<NSDictionary *> *lara_jit_candidate_apps(void);

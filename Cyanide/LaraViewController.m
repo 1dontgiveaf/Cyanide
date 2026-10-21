@@ -10,6 +10,7 @@
 #import "LaraViewController.h"
 #import "SettingsViewController.h"
 #import "tweaks/lara_tools.h"
+#import <errno.h>
 
 static NSString * const kLaraCredit = @"Ported from lara by rooootdev.";
 
@@ -26,6 +27,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
 @property (nonatomic, copy) NSString *status;        // shown in the first footer
 @property (nonatomic) int hudMode;                   // -1 off, -2 unknown
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *prefStates;   // index -> 0/1
+@property (nonatomic, copy) NSArray<NSDictionary *> *jitApps;   // nil until listed
 @end
 
 @implementation LaraViewController
@@ -42,6 +44,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             case LaraToolDebugOverlay:   self.title = @"Debug Overlay"; break;
             case LaraToolUpsideDown:     self.title = @"Upside Down"; break;
             case LaraToolHiddenSettings: self.title = @"Hidden Settings"; break;
+            case LaraToolJIT:            self.title = @"JIT Enabler"; break;
         }
     }
     return self;
@@ -52,6 +55,41 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
     [super viewDidLoad];
     self.navigationItem.largeTitleDisplayMode = UINavigationItemLargeTitleDisplayModeNever;
     if (self.tool == LaraToolPerformanceHUD || self.tool == LaraToolHiddenSettings) [self readState];
+    if (self.tool == LaraToolJIT) [self listJITApps];
+}
+
+// Apps signed with get-task-allow; needs the filesystem sandbox lifted.
+- (void)listJITApps
+{
+    if (self.busy) return;
+    self.busy = YES;
+    self.status = @"Looking for apps…";
+    [self.tableView reloadData];
+    __weak typeof(self) weakSelf = self;
+    settings_unlock_filesystem_async(NO, ^(BOOL ok, NSString *message) {
+        typeof(self) me = weakSelf;
+        if (!me) return;
+        if (!ok) {
+            me.busy = NO;
+            BOOL needsRun = [message isEqualToString:kSettingsFullExploitRequiredMessage];
+            me.status = needsRun ? kSettingsNoKernelAccessHint : (message ?: @"Filesystem access is not available.");
+            [me.tableView reloadData];
+            if (needsRun) settings_tool_needs_exploit(me, me.tableView, @"JIT Enabler", ^{ [weakSelf listJITApps]; });
+            return;
+        }
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            NSArray *apps = lara_jit_candidate_apps();
+            dispatch_async(dispatch_get_main_queue(), ^{
+                typeof(self) me2 = weakSelf;
+                if (!me2) return;
+                me2.busy = NO;
+                me2.jitApps = apps;
+                me2.status = apps.count ? nil
+                    : @"No app here can get JIT. It only works for apps installed with a development profile (get-task-allow), e.g. sideloaded with a developer certificate.";
+                [me2.tableView reloadData];
+            });
+        });
+    });
 }
 
 #pragma mark Running
@@ -118,6 +156,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             for (const LaraPrefToggle *t = lara_pref_toggles(); t->title; t++) n++;
             return n;
         }
+        case LaraToolJIT: return (NSInteger)self.jitApps.count;
     }
     return 0;
 }
@@ -137,6 +176,9 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             break;
         case LaraToolHiddenSettings:
             about = @"Hidden iOS preferences. Most take effect after a respring and stay until you turn them off.";
+            break;
+        case LaraToolJIT:
+            about = @"Tap an app to open it with JIT (for emulators and similar apps). Only apps signed with a development profile can get it. JIT lasts until the app quits; some apps can't tell it's on.";
             break;
     }
     NSMutableArray *parts = [NSMutableArray array];
@@ -182,6 +224,16 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
             break;
         }
+        case LaraToolJIT: {
+            NSDictionary *app = self.jitApps[indexPath.row];
+            c.text = app[@"name"];
+            c.secondaryText = app[@"bundleID"];
+            c.secondaryTextProperties.color = UIColor.secondaryLabelColor;
+            c.image = app[@"icon"] ?: [UIImage systemImageNamed:@"app.dashed"];
+            c.imageProperties.maximumSize = CGSizeMake(36, 36);
+            c.imageProperties.cornerRadius = 8;
+            break;
+        }
     }
     cell.contentConfiguration = c;
     return cell;
@@ -212,6 +264,20 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
         }
         case LaraToolHiddenSettings:
             break;
+        case LaraToolJIT: {
+            NSDictionary *app = self.jitApps[indexPath.row];
+            NSString *bid = app[@"bundleID"], *name = app[@"name"];
+            __block int err = 0;
+            [self runNamed:[NSString stringWithFormat:@"Opening %@ with JIT", name]
+                      work:^BOOL{ err = lara_jit_enable_in_session(bid); return err == 0; }
+                      done:^(BOOL ok) {
+                weakSelf.status = ok ? [NSString stringWithFormat:@"JIT is on for %@ until it quits.", name]
+                    : err == ESRCH ? [NSString stringWithFormat:@"%@ didn't start. Open it once, then try again.", name]
+                    : err == EPERM ? [NSString stringWithFormat:@"iOS refused to attach to %@. It needs a development profile (get-task-allow).", name]
+                    : [NSString stringWithFormat:@"JIT couldn't be enabled for %@ (error %d). Check the log.", name, err];
+            }];
+            break;
+        }
     }
 }
 

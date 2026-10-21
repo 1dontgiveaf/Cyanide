@@ -17,6 +17,8 @@
 #import "remote_objc.h"
 #import "../TaskRop/RemoteCall.h"
 #import "../LogTextView.h"
+#import "../FBAppContainers.h"
+#import <errno.h>
 #import <stdio.h>
 #import <unistd.h>
 
@@ -249,3 +251,115 @@ bool lara_pref_set_in_session(const LaraPrefToggle *t, bool on)
     printf("[LARA] pref %s/%s -> %d (readback %d)\n", t->domain, t->key, on, now);
     return ok;
 }
+
+#pragma mark - JIT
+
+#define LARA_PT_ATTACHEXC 14
+#define LARA_PT_DETACH    11
+
+// The app's pid through RunningBoard, as SpringBoard sees it; 0 if not running.
+static int lara_pid_for_bundle(uint64_t bundleStr)
+{
+    uint64_t clsPred = r_class("RBSProcessPredicate");
+    uint64_t clsHandle = r_class("RBSProcessHandle");
+    if (!r_is_objc_ptr(clsPred) || !r_is_objc_ptr(clsHandle)) return 0;
+    uint64_t pred = r_msg2(clsPred, "predicateMatchingBundleIdentifier:", bundleStr, 0, 0, 0);
+    if (!r_is_objc_ptr(pred)) return 0;
+    uint64_t handle = r_msg2(clsHandle, "handleForPredicate:error:", pred, 0, 0, 0);
+    if (!r_is_objc_ptr(handle)) return 0;
+    return (int)(r_msg2(handle, "rbs_pid", 0, 0, 0, 0) & 0xffffffffULL);
+}
+
+int lara_jit_enable_in_session(NSString *bundleID)
+{
+    if (bundleID.length == 0) return EINVAL;
+    uint64_t bundleStr = r_cfstr(bundleID.UTF8String);
+    if (!bundleStr) return ENOMEM;
+
+    int pid = lara_pid_for_bundle(bundleStr);
+    uint64_t clsWorkspace = r_class("LSApplicationWorkspace");
+    uint64_t workspace = r_is_objc_ptr(clsWorkspace) ? r_msg2(clsWorkspace, "defaultWorkspace", 0, 0, 0, 0) : 0;
+    if (pid <= 0) {
+        // Not running: open it from SpringBoard and wait for it to come up.
+        if (!r_is_objc_ptr(workspace)) return ESRCH;
+        r_msg2_main(workspace, "openApplicationWithBundleID:", bundleStr, 0, 0, 0);
+        for (int i = 0; i < 25 && pid <= 0; i++) {
+            usleep(200000);
+            pid = lara_pid_for_bundle(bundleStr);
+        }
+        if (pid <= 0) {
+            printf("[LARA] JIT: %s did not start\n", bundleID.UTF8String);
+            return ESRCH;
+        }
+    }
+    if (pid == getpid()) return EPERM;   // never Cyanide itself
+    // ptrace returns an int: only w0 is meaningful, hence the (int) casts.
+
+    int rc = (int)r_dlsym_call(R_TIMEOUT, "ptrace", LARA_PT_ATTACHEXC, (uint64_t)pid, 0, 0, 0, 0, 0, 0);
+    if (rc == -1 || !r_last_call_ok()) {
+        printf("[LARA] JIT: attach to %s (pid %d) refused — not signed with get-task-allow?\n",
+               bundleID.UTF8String, pid);
+        return EPERM;
+    }
+    usleep(100000);
+    rc = (int)r_dlsym_call(R_TIMEOUT, "ptrace", LARA_PT_DETACH, (uint64_t)pid, 0, 0, 0, 0, 0, 0);
+    if (rc == -1 || !r_last_call_ok()) {
+        // Still attached would leave the app stopped: say so loudly.
+        printf("[LARA] JIT: detach from %s (pid %d) failed\n", bundleID.UTF8String, pid);
+        return EIO;
+    }
+    // Bring it to the front (it may have been running in the background).
+    if (r_is_objc_ptr(workspace)) r_msg2_main(workspace, "openApplicationWithBundleID:", bundleStr, 0, 0, 0);
+    printf("[LARA] JIT enabled for %s (pid %d)\n", bundleID.UTF8String, pid);
+    return 0;
+}
+
+// get-task-allow from the app's embedded.mobileprovision (a signed blob with
+// the XML plist inside).
+static BOOL lara_profile_allows_debugging(NSString *appPath)
+{
+    NSData *data = [NSData dataWithContentsOfFile:[appPath stringByAppendingPathComponent:@"embedded.mobileprovision"]];
+    if (data.length == 0) return NO;
+    NSData *open = [@"<?xml" dataUsingEncoding:NSUTF8StringEncoding];
+    NSData *close = [@"</plist>" dataUsingEncoding:NSUTF8StringEncoding];
+    NSRange start = [data rangeOfData:open options:0 range:NSMakeRange(0, data.length)];
+    if (start.location == NSNotFound) return NO;
+    NSRange end = [data rangeOfData:close options:0 range:NSMakeRange(start.location, data.length - start.location)];
+    if (end.location == NSNotFound) return NO;
+    NSData *xml = [data subdataWithRange:NSMakeRange(start.location, NSMaxRange(end) - start.location)];
+    NSDictionary *plist = [NSPropertyListSerialization propertyListWithData:xml options:0 format:NULL error:nil];
+    NSDictionary *ents = [plist isKindOfClass:NSDictionary.class] ? plist[@"Entitlements"] : nil;
+    id gta = [ents isKindOfClass:NSDictionary.class] ? ents[@"get-task-allow"] : nil;
+    return [gta respondsToSelector:@selector(boolValue)] && [gta boolValue];
+}
+
+NSArray<NSDictionary *> *lara_jit_candidate_apps(void)
+{
+    NSString *root = @"/var/containers/Bundle/Application";
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSMutableArray *apps = [NSMutableArray array];
+    for (NSString *uuid in [fm contentsOfDirectoryAtPath:root error:nil]) {
+        NSString *container = [root stringByAppendingPathComponent:uuid];
+        for (NSString *item in [fm contentsOfDirectoryAtPath:container error:nil]) {
+            if (![item.pathExtension isEqualToString:@"app"]) continue;
+            NSString *appPath = [container stringByAppendingPathComponent:item];
+            if (!lara_profile_allows_debugging(appPath)) continue;
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[appPath stringByAppendingPathComponent:@"Info.plist"]];
+            NSString *bid = info[@"CFBundleIdentifier"];
+            if (![bid isKindOfClass:NSString.class] || bid.length == 0) continue;
+            if ([bid isEqualToString:NSBundle.mainBundle.bundleIdentifier]) continue;
+            FBAppContainer *c = fb_container_for_path(container, NO);
+            NSString *name = c.displayName.length ? c.displayName
+                           : ([info[@"CFBundleDisplayName"] isKindOfClass:NSString.class] ? info[@"CFBundleDisplayName"]
+                           : item.stringByDeletingPathExtension);
+            NSMutableDictionary *app = [@{ @"name": name, @"bundleID": bid, @"path": appPath } mutableCopy];
+            if (c.icon) app[@"icon"] = c.icon;
+            [apps addObject:app];
+        }
+    }
+    [apps sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [a[@"name"] localizedCaseInsensitiveCompare:b[@"name"]];
+    }];
+    return apps;
+}
+

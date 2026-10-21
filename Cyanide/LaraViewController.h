@@ -13,6 +13,7 @@ typedef NS_ENUM(NSInteger, LaraTool) {
     LaraToolDebugOverlay,
     LaraToolUpsideDown,
     LaraToolHiddenSettings,
+    LaraToolJIT,
 };
 
 @interface LaraViewController : UITableViewController

@@ -14863,6 +14863,7 @@ UIViewController *settings_make_daemons_viewer(void)
         @{ @"title": @"Debug Overlay",    @"icon": @"ladybug.fill",          @"color": [UIColor systemOrangeColor], @"section": @(-1), @"custom": @"lara", @"lara": @(LaraToolDebugOverlay) },
         @{ @"title": @"Upside Down",      @"icon": @"arrow.up.and.down.circle.fill", @"color": [UIColor systemIndigoColor], @"section": @(-1), @"custom": @"lara", @"lara": @(LaraToolUpsideDown) },
         @{ @"title": @"Hidden Settings",  @"icon": @"eye.slash.fill",        @"color": [UIColor systemGrayColor],   @"section": @(-1), @"custom": @"lara", @"lara": @(LaraToolHiddenSettings) },
+        @{ @"title": @"JIT Enabler",      @"icon": @"bolt.horizontal.fill",  @"color": [UIColor systemYellowColor], @"section": @(-1), @"custom": @"lara", @"lara": @(LaraToolJIT) },
     ];
 }
 
