@@ -118,21 +118,11 @@ static uint64_t sbmat_cache_slot(NSString *probe)
     return slot;
 }
 
-// lara's "Disabled": no blur and a fully transparent tint, wherever the
-// recipe has a blur or filtering (rooootdev's ColorSwapManager.setColor with
-// alpha 0, blur 0).
-static id sbmat_replace_key(id obj, NSString *key, NSString *newKey, id replacement)
-{
-    if (![obj isKindOfClass:NSDictionary.class]) return obj;
-    NSMutableDictionary *out = [NSMutableDictionary dictionary];
-    [(NSDictionary *)obj enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
-        if ([k isEqual:key]) out[newKey] = replacement;
-        else out[k] = sbmat_replace_key(v, key, newKey, replacement);
-    }];
-    return out;
-}
-
-static NSData *sbmat_disabled_recipe(NSString *name, NSString **why)
+// The recipe with its materialFiltering replaced: no blur, and either no
+// tint (off, the backdrop shows through) or a strong red tint (test: makes it
+// obvious whether our recipe is used at all). materialSettingsVersion stays:
+// it tells CoreMaterial which format the file is in.
+static NSData *sbmat_edited_recipe(NSString *name, int mode, NSString **why)
 {
     NSURL *url = sbmat_system_recipe_url(name);
     NSData *data = url ? [NSData dataWithContentsOfURL:url] : nil;
@@ -141,16 +131,21 @@ static NSData *sbmat_disabled_recipe(NSString *name, NSString **why)
         *why = [NSString stringWithFormat:@"%@.materialrecipe wasn't found", name];
         return nil;
     }
-    printf("[SBMAT] %s: %s, keys: %s\n", name.UTF8String, url.path.UTF8String,
-           [[plist.allKeys componentsJoinedByString:@", "] UTF8String]);
-    NSDictionary *tintColor = @{ @"alpha": @0.0, @"red": @0.0, @"green": @0.0, @"blue": @0.0 };
-    NSDictionary *tinting = @{ @"tintAlpha": @0.0, @"tintColor": tintColor };
+    printf("[SBMAT] %s original: %s\n", name.UTF8String,
+           [[plist.description stringByReplacingOccurrencesOfString:@"\n" withString:@" "] UTF8String]);
     NSMutableDictionary *changed = [plist mutableCopy];
-    [changed removeObjectsForKeys:@[ @"materialSettingsVersion", @"visualStyleSetVersion" ]];
-    id out = sbmat_replace_key(changed, @"blurRadius", @"blurRadius", @0);
-    out = sbmat_replace_key(out, @"materialFiltering", @"materialFiltering", @{ @"blurRadius": @0, @"tinting": tinting });
-    out = sbmat_replace_key(out, @"filtering", @"tinting", tinting);
-    return [NSPropertyListSerialization dataWithPropertyList:out format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
+    NSMutableDictionary *base = [plist[@"baseMaterial"] isKindOfClass:NSDictionary.class] ? [plist[@"baseMaterial"] mutableCopy]
+                                                                                       : [NSMutableDictionary dictionary];
+    NSMutableDictionary *filtering = [NSMutableDictionary dictionaryWithDictionary:@{ @"blurRadius": @0 }];
+    if (mode == 2) {
+        filtering[@"tinting"] = @{ @"tintAlpha": @0.8,
+                                   @"tintColor": @{ @"alpha": @1.0, @"red": @1.0, @"green": @0.0, @"blue": @0.0 } };
+    }
+    base[@"materialFiltering"] = filtering;
+    changed[@"baseMaterial"] = base;
+    printf("[SBMAT] %s edited: %s\n", name.UTF8String,
+           [[changed.description stringByReplacingOccurrencesOfString:@"\n" withString:@" "] UTF8String]);
+    return [NSPropertyListSerialization dataWithPropertyList:changed format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
 }
 
 #pragma mark - SpringBoard
@@ -231,7 +226,7 @@ static uint64_t sbmat_dock_material_layer(void)
     return r_is_objc_ptr(layer) && r_responds_main(layer, "setRecipeName:") ? layer : 0;
 }
 
-bool sbmat_dock_test_in_session(bool disable, NSString **why)
+bool sbmat_dock_test_in_session(int mode, NSString **why)
 {
     __autoreleasing NSString *dummy = nil;
     if (!why) why = &dummy;
@@ -245,11 +240,12 @@ bool sbmat_dock_test_in_session(bool disable, NSString **why)
     printf("[SBMAT] SpringBoard recipe cache 0x%llx: %s, %llu recipes\n", cache, cacheOK ? "ok" : "not a dictionary", count);
     if (!cacheOK) { *why = @"SpringBoard's recipe cache wasn't found."; return false; }
 
+    bool disable = mode != 0;
     uint64_t url = 0, dir = 0;
     if (disable) {
         NSMutableDictionary<NSString *, NSData *> *files = [NSMutableDictionary dictionary];
         for (NSString *name in names) {
-            NSData *data = sbmat_disabled_recipe(name, why);
+            NSData *data = sbmat_edited_recipe(name, mode, why);
             if (!data) return false;
             files[[name stringByAppendingPathExtension:@"materialrecipe"]] = data;
         }
@@ -286,7 +282,18 @@ bool sbmat_dock_test_in_session(bool disable, NSString **why)
     uint64_t after = r_msg2_main(layer, "_recipeSettings", 0, 0, 0, 0);
     uint64_t cached = r_msg2_main(cache, "objectForKey:", str, 0, 0, 0);
     sbmat_cfrelease(str);
-    printf("[SBMAT] dock %s: recipe %s reloaded, settings %s (cache %s)\n", disable ? "disabled" : "restored",
+    // What the layer now uses, and a forced reconfigure in case it waits for one.
+    uint64_t desc = r_is_objc_ptr(after) ? r_msg2_main(after, "description", 0, 0, 0, 0) : 0;
+    char text[700] = {0};
+    if (r_is_objc_ptr(desc) && r_read_nsstring(desc, text, sizeof(text))) {
+        for (char *c = text; *c; c++) if (*c == '\n') *c = ' ';
+        printf("[SBMAT] dock settings now: %s\n", text);
+    }
+    if (r_responds_main(layer, "_updateForChangeInRecipeAndConfiguration"))
+        r_msg2_main(layer, "_updateForChangeInRecipeAndConfiguration", 0, 0, 0, 0);
+    r_msg2_main(layer, "setNeedsLayout", 0, 0, 0, 0);
+    r_msg2_main(layer, "setNeedsDisplay", 0, 0, 0, 0);
+    printf("[SBMAT] dock mode %d: recipe %s reloaded, settings %s (cache %s)\n", mode,
            recipe.UTF8String, before != after ? "replaced" : "unchanged", cached ? "refilled" : "empty");
     if (before == after) *why = @"The recipe was replaced, but the dock didn't reload it. Check the log.";
     return before != after;

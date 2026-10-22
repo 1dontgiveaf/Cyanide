@@ -16,5 +16,6 @@
 #import <Foundation/Foundation.h>
 #import <stdbool.h>
 
-// Test build: the dock background off (disable = YES) or back to normal.
-bool sbmat_dock_test_in_session(bool disable, NSString **why);
+// Test build: the dock background back to normal (0), off (1) or red (2,
+// to see whether our recipe is used at all).
+bool sbmat_dock_test_in_session(int mode, NSString **why);

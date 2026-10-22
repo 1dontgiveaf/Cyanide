@@ -184,7 +184,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
         case LaraToolPerformanceHUD: return kLaraHUDModeCount;
         case LaraToolDebugOverlay:
         case LaraToolUpsideDown:     return 1;
-        case LaraToolSpringBoard:    return 2;
+        case LaraToolSpringBoard:    return 3;
         case LaraToolHiddenSettings: {
             NSInteger n = 0;
             for (const LaraPrefToggle *t = lara_pref_toggles(); t->title; t++) n++;
@@ -268,7 +268,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             c.textProperties.color = self.busy ? UIColor.secondaryLabelColor : UIColor.systemBlueColor;
             break;
         case LaraToolSpringBoard:
-            c.text = indexPath.row == 0 ? @"Dock Background Off" : @"Restore Dock Background";
+            c.text = indexPath.row == 0 ? @"Dock Background Off" : indexPath.row == 1 ? @"Dock Background Red (Test)" : @"Restore Dock Background";
             c.textProperties.color = self.busy ? UIColor.secondaryLabelColor : UIColor.systemBlueColor;
             break;
         case LaraToolHiddenSettings: {
@@ -376,10 +376,10 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             break;
         }
         case LaraToolSpringBoard: {
-            bool disable = indexPath.row == 0;
+            int mode = indexPath.row == 0 ? 1 : indexPath.row == 1 ? 2 : 0;
             __block NSString *why = nil;
-            [self runNamed:disable ? @"Turning the dock background off" : @"Restoring the dock background"
-                      work:^BOOL{ return sbmat_dock_test_in_session(disable, &why); }
+            [self runNamed:mode ? @"Changing the dock background" : @"Restoring the dock background"
+                      work:^BOOL{ return sbmat_dock_test_in_session(mode, &why); }
                       done:^(BOOL ok) { weakSelf.status = ok ? @"Done." : (why ?: @"It didn't work. Check the log."); }];
             break;
         }
