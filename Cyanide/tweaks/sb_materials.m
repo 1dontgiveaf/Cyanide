@@ -1,0 +1,278 @@
+//
+//  sb_materials.m
+//  Cyanide
+//
+//  See sb_materials.h. How CoreMaterial finds a recipe (iOS 18):
+//  _SharedMaterialSettingsForRecipeWithNameFromBundle looks the name up in a
+//  private cache (static NSMutableDictionary, name -> MTRecipeMaterialSettings),
+//  and only on a miss loads <name>.materialrecipe -- from the override bundle
+//  first, then the system bundle, per file. So the override folder only needs
+//  the recipes we change, but recipes SpringBoard already loaded (the dock,
+//  folders) stay cached until their entries are removed.
+//
+//  The cache has no API. The shared cache is mapped at the same address in
+//  every process, so its static variable is found here, in Cyanide: load a
+//  recipe once and look through CoreMaterial's data for the dictionary that
+//  now holds it. The same address in SpringBoard holds SpringBoard's cache.
+//
+
+#import "sb_materials.h"
+#import "remote_objc.h"
+#import "sb_walk.h"
+#import "../TaskRop/RemoteCall.h"
+#import "../LogTextView.h"
+#import <dlfcn.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <malloc/malloc.h>
+#import <objc/message.h>
+#import <objc/runtime.h>
+#import <ptrauth.h>
+
+extern const uintptr_t objc_debug_isa_class_mask;
+
+static NSString * const kSBMatCoreMaterialPath = @"/System/Library/PrivateFrameworks/CoreMaterial.framework/CoreMaterial";
+
+#pragma mark - Local (in Cyanide)
+
+static BOOL sbmat_load_corematerial(void)
+{
+    static BOOL loaded;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        loaded = dlopen(kSBMatCoreMaterialPath.fileSystemRepresentation, RTLD_NOW) != NULL &&
+                 objc_getClass("MTMaterialLayer") != Nil;
+        if (!loaded) printf("[SBMAT] CoreMaterial couldn't be loaded: %s\n", dlerror() ?: "MTMaterialLayer missing");
+    });
+    return loaded;
+}
+
+// The system's <name>.materialrecipe, as CoreMaterial itself finds it.
+static NSURL *sbmat_system_recipe_url(NSString *name)
+{
+    if (!sbmat_load_corematerial()) return nil;
+    SEL bundleSel = sel_registerName("coreMaterialRecipeBundle"), urlSel = sel_registerName("URLForMaterialRecipe:");
+    if (![NSBundle respondsToSelector:bundleSel]) return nil;
+    NSBundle *bundle = ((id (*)(id, SEL))objc_msgSend)(NSBundle.class, bundleSel);
+    if (![bundle respondsToSelector:urlSel]) return nil;
+    return ((id (*)(id, SEL, id))objc_msgSend)(bundle, urlSel, name);
+}
+
+// Address of CoreMaterial's recipe cache variable (the same in every
+// process), found by loading `probe` here and looking for the dictionary
+// holding it. 0 when not found.
+static uint64_t sbmat_cache_slot(NSString *probe)
+{
+    static uint64_t slot;
+    if (slot) return slot;
+    if (!sbmat_load_corematerial()) return 0;
+    id layer = [objc_getClass("MTMaterialLayer") new];
+    ((void (*)(id, SEL, id))objc_msgSend)(layer, sel_registerName("setRecipeName:"), probe);
+
+    const struct mach_header_64 *mh = NULL;
+    intptr_t slide = 0;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && strcmp(name, kSBMatCoreMaterialPath.fileSystemRepresentation) == 0) {
+            mh = (const struct mach_header_64 *)_dyld_get_image_header(i);
+            slide = _dyld_get_image_vmaddr_slide(i);
+            break;
+        }
+    }
+    if (!mh) { printf("[SBMAT] CoreMaterial image not found\n"); return 0; }
+
+    // What the cache can be: +[NSMutableDictionary new] or a CF dictionary.
+    CFMutableDictionaryRef cf = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    uintptr_t dictClasses[2] = { (uintptr_t)object_getClass([NSMutableDictionary new]), (uintptr_t)object_getClass((__bridge id)cf) };
+    CFRelease(cf);
+    Class settingsCls = objc_getClass("MTRecipeMaterialSettings");
+
+    const uint8_t *p = (const uint8_t *)(mh + 1);
+    for (uint32_t c = 0; c < mh->ncmds && !slot; c++) {
+        const struct load_command *lc = (const void *)p;
+        p += lc->cmdsize;
+        if (lc->cmd != LC_SEGMENT_64) continue;
+        const struct segment_command_64 *seg = (const void *)lc;
+        if (strncmp(seg->segname, "__DATA", 6) != 0) continue;   // __DATA, __DATA_DIRTY (statics)
+        const struct section_64 *sect = (const void *)(seg + 1);
+        for (uint32_t s = 0; s < seg->nsects && !slot; s++) {
+            const uintptr_t *w = (const uintptr_t *)(uintptr_t)(sect[s].addr + slide);
+            uint64_t words = sect[s].size / sizeof(uintptr_t);
+            for (uint64_t k = 0; k < words; k++) {
+                uintptr_t v = w[k];
+                // Only heap blocks are dereferenced, and only their isa read,
+                // until the class is known to be a dictionary.
+                if (!v || (v & 0xf) || !malloc_zone_from_ptr((const void *)v)) continue;
+                uintptr_t cls = (uintptr_t)ptrauth_strip((void *)(*(const uintptr_t *)v & objc_debug_isa_class_mask),
+                                                         ptrauth_key_asda);
+                if (cls != dictClasses[0] && cls != dictClasses[1]) continue;
+                id value = ((__bridge NSDictionary *)(void *)v)[probe];
+                if (value && (!settingsCls || [value isKindOfClass:settingsCls])) {
+                    slot = (uint64_t)(uintptr_t)&w[k];
+                    break;
+                }
+            }
+        }
+    }
+    printf("[SBMAT] recipe cache variable: %s (0x%llx)\n", slot ? "found" : "not found", slot);
+    (void)layer;
+    return slot;
+}
+
+// lara's "Disabled": no blur and a fully transparent tint, wherever the
+// recipe has a blur or filtering (rooootdev's ColorSwapManager.setColor with
+// alpha 0, blur 0).
+static id sbmat_replace_key(id obj, NSString *key, NSString *newKey, id replacement)
+{
+    if (![obj isKindOfClass:NSDictionary.class]) return obj;
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    [(NSDictionary *)obj enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
+        if ([k isEqual:key]) out[newKey] = replacement;
+        else out[k] = sbmat_replace_key(v, key, newKey, replacement);
+    }];
+    return out;
+}
+
+static NSData *sbmat_disabled_recipe(NSString *name, NSString **why)
+{
+    NSURL *url = sbmat_system_recipe_url(name);
+    NSData *data = url ? [NSData dataWithContentsOfURL:url] : nil;
+    NSDictionary *plist = data ? [NSPropertyListSerialization propertyListWithData:data options:0 format:NULL error:nil] : nil;
+    if (![plist isKindOfClass:NSDictionary.class]) {
+        *why = [NSString stringWithFormat:@"%@.materialrecipe wasn't found", name];
+        return nil;
+    }
+    printf("[SBMAT] %s: %s, keys: %s\n", name.UTF8String, url.path.UTF8String,
+           [[plist.allKeys componentsJoinedByString:@", "] UTF8String]);
+    NSDictionary *tintColor = @{ @"alpha": @0.0, @"red": @0.0, @"green": @0.0, @"blue": @0.0 };
+    NSDictionary *tinting = @{ @"tintAlpha": @0.0, @"tintColor": tintColor };
+    NSMutableDictionary *changed = [plist mutableCopy];
+    [changed removeObjectsForKeys:@[ @"materialSettingsVersion", @"visualStyleSetVersion" ]];
+    id out = sbmat_replace_key(changed, @"blurRadius", @"blurRadius", @0);
+    out = sbmat_replace_key(out, @"materialFiltering", @"materialFiltering", @{ @"blurRadius": @0, @"tinting": tinting });
+    out = sbmat_replace_key(out, @"filtering", @"tinting", tinting);
+    return [NSPropertyListSerialization dataWithPropertyList:out format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
+}
+
+#pragma mark - SpringBoard
+
+static void sbmat_cfrelease(uint64_t cf)
+{
+    if (cf) r_dlsym_call(R_TIMEOUT, "CFRelease", cf, 0, 0, 0, 0, 0, 0, 0);
+}
+
+// Writes `files` (name -> data) into a new folder in SpringBoard's temp
+// directory and returns its path (a remote NSString, retained), or 0. A new
+// folder each time: NSBundle caches a folder's contents.
+static uint64_t sbmat_write_folder(NSDictionary<NSString *, NSData *> *files)
+{
+    uint64_t tmp = r_dlsym_call(R_TIMEOUT, "NSTemporaryDirectory", 0, 0, 0, 0, 0, 0, 0, 0);
+    if (!r_is_objc_ptr(tmp)) return 0;
+    NSString *leaf = [@"CyanideMaterials-" stringByAppendingString:[NSUUID.UUID.UUIDString substringToIndex:8]];
+    uint64_t leafStr = r_cfstr(leaf.UTF8String);
+    uint64_t dir = r_msg2(tmp, "stringByAppendingPathComponent:", leafStr, 0, 0, 0);
+    sbmat_cfrelease(leafStr);
+    if (!r_is_objc_ptr(dir)) return 0;
+    r_msg2(dir, "retain", 0, 0, 0, 0);
+    uint64_t fm = r_msg2(r_class("NSFileManager"), "defaultManager", 0, 0, 0, 0);
+    if (!r_msg2(fm, "createDirectoryAtPath:withIntermediateDirectories:attributes:error:", dir, 1, 0, 0)) {
+        printf("[SBMAT] SpringBoard couldn't create its recipe folder\n");
+        r_release(dir);
+        return 0;
+    }
+    __block BOOL ok = YES;
+    [files enumerateKeysAndObjectsUsingBlock:^(NSString *file, NSData *data, BOOL *stop) {
+        uint64_t buf = r_dlsym_call(R_TIMEOUT, "malloc", data.length, 0, 0, 0, 0, 0, 0, 0);
+        uint64_t name = r_cfstr(file.UTF8String);
+        uint64_t path = name ? r_msg2(dir, "stringByAppendingPathComponent:", name, 0, 0, 0) : 0;
+        uint64_t nsdata = (buf && remote_write(buf, data.bytes, data.length))
+            ? r_msg2(r_class("NSData"), "dataWithBytes:length:", buf, data.length, 0, 0) : 0;
+        BOOL wrote = r_is_objc_ptr(nsdata) && r_is_objc_ptr(path) && r_msg2(nsdata, "writeToFile:atomically:", path, 1, 0, 0);
+        if (buf) r_free(buf);
+        sbmat_cfrelease(name);
+        printf("[SBMAT] wrote %s (%lu bytes): %s\n", file.UTF8String, (unsigned long)data.length, wrote ? "ok" : "failed");
+        if (!wrote) { ok = NO; *stop = YES; }
+    }];
+    if (!ok) { r_release(dir); return 0; }
+    return dir;
+}
+
+// Makes existing material layers using `names` load their recipe again.
+static int sbmat_refresh_layers(NSSet<NSString *> *names)
+{
+    uint64_t cls = r_class("MTMaterialView");
+    if (!r_is_objc_ptr(cls)) { printf("[SBMAT] MTMaterialView class not found\n"); return 0; }
+    static uint64_t views[512];
+    int n = sb_collect_views_in_windows_main(cls, views, 512);
+    NSCountedSet *seen = [NSCountedSet set];
+    int refreshed = 0;
+    for (int i = 0; i < n; i++) {
+        uint64_t layer = r_msg2_main(views[i], "layer", 0, 0, 0, 0);
+        uint64_t rn = r_is_objc_ptr(layer) && r_responds_main(layer, "recipeName")
+            ? r_msg2_main(layer, "recipeName", 0, 0, 0, 0) : 0;
+        char buf[128] = {0};
+        if (!r_is_objc_ptr(rn) || !r_read_nsstring(rn, buf, sizeof(buf))) continue;
+        NSString *name = @(buf);
+        [seen addObject:name];
+        if (![names containsObject:name]) continue;
+        uint64_t str = r_cfstr(buf);
+        r_msg2_main(layer, "setRecipeName:", str, 0, 0, 0);
+        sbmat_cfrelease(str);
+        refreshed++;
+    }
+    NSMutableArray *list = [NSMutableArray array];
+    for (NSString *s in seen) [list addObject:[NSString stringWithFormat:@"%@×%lu", s, (unsigned long)[seen countForObject:s]]];
+    printf("[SBMAT] %d material views; recipes in use: %s\n", n, [[list componentsJoinedByString:@", "] UTF8String]);
+    return refreshed;
+}
+
+bool sbmat_dock_test_in_session(bool disable, NSString **why)
+{
+    __autoreleasing NSString *dummy = nil;
+    if (!why) why = &dummy;
+    NSArray<NSString *> *names = @[ @"dockDark", @"dockLight" ];
+
+    uint64_t slot = sbmat_cache_slot(names[0]);
+    if (!slot) { *why = @"CoreMaterial's recipe cache wasn't found."; return false; }
+    uint64_t cache = remote_read64(slot);
+    BOOL cacheOK = r_is_objc_ptr(cache) && r_msg2(cache, "isKindOfClass:", r_class("NSDictionary"), 0, 0, 0);
+    uint64_t count = cacheOK ? r_msg2(cache, "count", 0, 0, 0, 0) : 0;
+    printf("[SBMAT] SpringBoard recipe cache 0x%llx: %s, %llu recipes\n", cache, cacheOK ? "ok" : "not a dictionary", count);
+    if (!cacheOK) { *why = @"SpringBoard's recipe cache wasn't found."; return false; }
+
+    uint64_t url = 0, dir = 0;
+    if (disable) {
+        NSMutableDictionary<NSString *, NSData *> *files = [NSMutableDictionary dictionary];
+        for (NSString *name in names) {
+            NSData *data = sbmat_disabled_recipe(name, why);
+            if (!data) return false;
+            files[[name stringByAppendingPathExtension:@"materialrecipe"]] = data;
+        }
+        dir = sbmat_write_folder(files);
+        if (!dir) { *why = @"The edited recipes couldn't be written for SpringBoard."; return false; }
+        url = r_msg2(r_class("NSURL"), "fileURLWithPath:", dir, 0, 0, 0);
+        if (!r_is_objc_ptr(url)) { r_release(dir); *why = @"No URL for the recipe folder."; return false; }
+    }
+    uint64_t bundleCls = r_class("NSBundle");
+    if (!r_responds(bundleCls, "_setCoreMaterialOverrideRecipeBundleURL:")) {
+        if (dir) r_release(dir);
+        *why = @"This iOS version has no CoreMaterial override.";
+        return false;
+    }
+    r_msg2_main(bundleCls, "_setCoreMaterialOverrideRecipeBundleURL:", url, 0, 0, 0);
+    uint64_t now = r_msg2_main(bundleCls, "coreMaterialOverrideRecipeBundleURL", 0, 0, 0, 0);
+    printf("[SBMAT] override folder %s\n", r_is_objc_ptr(now) ? "set" : "cleared");
+    if (dir) r_release(dir);
+
+    for (NSString *name in names) {
+        uint64_t key = r_cfstr(name.UTF8String);
+        uint64_t had = r_msg2_main(cache, "objectForKey:", key, 0, 0, 0);
+        r_msg2_main(cache, "removeObjectForKey:", key, 0, 0, 0);
+        printf("[SBMAT] cache entry %s: %s\n", name.UTF8String, had ? "removed" : "wasn't loaded");
+        sbmat_cfrelease(key);
+    }
+    int refreshed = sbmat_refresh_layers([NSSet setWithArray:names]);
+    printf("[SBMAT] dock %s: %d layer(s) reloaded\n", disable ? "disabled" : "restored", refreshed);
+    if (!refreshed) *why = @"Applied, but no dock layer was reloaded. Check the log.";
+    return refreshed > 0;
+}

@@ -11,6 +11,7 @@
 #import "SettingsViewController.h"
 #import "tweaks/lara_tools.h"
 #import "tweaks/app_decrypt.h"
+#import "tweaks/sb_materials.h"
 #import "FileBrowserViewController.h"
 #import <errno.h>
 #import <PhotosUI/PhotosUI.h>
@@ -53,6 +54,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             case LaraToolAppLimit:       self.title = @"3-App Limit"; break;
             case LaraToolCards:          self.title = @"Wallet Card Art"; break;
             case LaraToolDecrypt:        self.title = @"App Decrypt"; break;
+            case LaraToolSpringBoard:    self.title = @"SpringBoard Tools"; break;
         }
     }
     return self;
@@ -182,6 +184,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
         case LaraToolPerformanceHUD: return kLaraHUDModeCount;
         case LaraToolDebugOverlay:
         case LaraToolUpsideDown:     return 1;
+        case LaraToolSpringBoard:    return 2;
         case LaraToolHiddenSettings: {
             NSInteger n = 0;
             for (const LaraPrefToggle *t = lara_pref_toggles(); t->title; t++) n++;
@@ -229,6 +232,9 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
         case LaraToolAppLimit:
             about = @"With a free Apple ID, iOS allows only 3 sideloaded apps: installd marks each one, and only marked apps count. Removing the marks frees the slots. Run it again after installing or refreshing (re-signing) an app, which marks it again.";
             break;
+        case LaraToolSpringBoard:
+            about = @"Test build: turns the dock background off through CoreMaterial's own recipe override, in SpringBoard's memory. Lasts until the next respring.";
+            break;
         case LaraToolJIT:
             about = @"Tap an app to open it with JIT (for emulators and similar apps). Only apps signed with a development profile can get it. JIT lasts until the app quits; some apps can't tell it's on.";
             break;
@@ -259,6 +265,10 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             break;
         case LaraToolUpsideDown:
             c.text = @"Enable Upside Down";
+            c.textProperties.color = self.busy ? UIColor.secondaryLabelColor : UIColor.systemBlueColor;
+            break;
+        case LaraToolSpringBoard:
+            c.text = indexPath.row == 0 ? @"Dock Background Off" : @"Restore Dock Background";
             c.textProperties.color = self.busy ? UIColor.secondaryLabelColor : UIColor.systemBlueColor;
             break;
         case LaraToolHiddenSettings: {
@@ -363,6 +373,14 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
         case LaraToolUpsideDown: {
             [self runNamed:@"Enabling" work:^BOOL{ return lara_upside_down_enable_in_session(); }
                       done:^(BOOL ok) { if (ok) weakSelf.status = @"Enabled. Turn the device upside down."; }];
+            break;
+        }
+        case LaraToolSpringBoard: {
+            bool disable = indexPath.row == 0;
+            __block NSString *why = nil;
+            [self runNamed:disable ? @"Turning the dock background off" : @"Restoring the dock background"
+                      work:^BOOL{ return sbmat_dock_test_in_session(disable, &why); }
+                      done:^(BOOL ok) { weakSelf.status = ok ? @"Done." : (why ?: @"It didn't work. Check the log."); }];
             break;
         }
         case LaraToolHiddenSettings:
