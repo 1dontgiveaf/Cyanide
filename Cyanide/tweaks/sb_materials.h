@@ -16,6 +16,7 @@
 #import <Foundation/Foundation.h>
 #import <stdbool.h>
 
-// Test build: the dock background back to normal (0), off (1) or red (2,
-// to see whether our recipe is used at all).
+// Test build: the dock background back to normal (0), off (1), red (2, to
+// see whether our recipe is used at all) or its view hidden (3, to see
+// whether it's the dock on screen).
 bool sbmat_dock_test_in_session(int mode, NSString **why);

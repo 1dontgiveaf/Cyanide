@@ -228,7 +228,7 @@ static NSString *sbmat_recipe_name(uint64_t layer)
 
 // The dock's material layer, straight from the home screen's view
 // controllers (no view walk). 0 when not found.
-static uint64_t sbmat_dock_material_layer(void)
+static uint64_t sbmat_dock_material_layer(uint64_t *viewOut)
 {
     uint64_t ctrl = r_msg2_main(r_class("SBIconController"), "sharedInstance", 0, 0, 0, 0);
     uint64_t mgr = r_is_objc_ptr(ctrl) ? r_msg2_main(ctrl, "iconManager", 0, 0, 0, 0) : 0;
@@ -243,6 +243,14 @@ static uint64_t sbmat_dock_material_layer(void)
            r_is_objc_ptr(ctrl), r_is_objc_ptr(mgr), r_is_objc_ptr(root), r_is_objc_ptr(rootView),
            sbmat_class_name(dock).UTF8String, sbmat_class_name(bg).UTF8String, sbmat_class_name(layer).UTF8String,
            (sbmat_recipe_name(layer) ?: @"-").UTF8String);
+    // Where it is and whether it's what's on screen.
+    uint64_t window = r_is_objc_ptr(bg) ? r_msg2_main(bg, "window", 0, 0, 0, 0) : 0;
+    printf("[SBMAT] dock view: %s\n", r_is_objc_ptr(dock) ? sbmat_describe(r_msg2_main(dock, "description", 0, 0, 0, 0)).UTF8String : "-");
+    printf("[SBMAT] dock background: %s\n", r_is_objc_ptr(bg) ? sbmat_describe(r_msg2_main(bg, "description", 0, 0, 0, 0)).UTF8String : "-");
+    printf("[SBMAT] dock window: %s\n", r_is_objc_ptr(window) ? sbmat_describe(r_msg2_main(window, "description", 0, 0, 0, 0)).UTF8String : "none");
+    if (r_is_objc_ptr(layer) && r_responds_main(layer, "isContentReplacedWithSnapshot"))
+        printf("[SBMAT] dock layer snapshot=%llu\n", r_msg2_main(layer, "isContentReplacedWithSnapshot", 0, 0, 0, 0) & 1);
+    if (viewOut) *viewOut = r_is_objc_ptr(bg) ? bg : 0;
     return r_is_objc_ptr(layer) && r_responds_main(layer, "setRecipeName:") ? layer : 0;
 }
 
@@ -251,6 +259,19 @@ bool sbmat_dock_test_in_session(int mode, NSString **why)
     __autoreleasing NSString *dummy = nil;
     if (!why) why = &dummy;
     NSArray<NSString *> *names = @[ @"dockDark", @"dockLight" ];
+
+    // Test 3: hide the background view itself -- shows whether it's the dock
+    // on screen at all. Restore (0) unhides it again.
+    if (mode == 3 || mode == 0) {
+        uint64_t view = 0;
+        sbmat_dock_material_layer(&view);
+        if (view) r_msg2_main(view, "setHidden:", mode == 3, 0, 0, 0);
+        printf("[SBMAT] dock background view %s\n", !view ? "not found" : mode == 3 ? "hidden" : "shown");
+        if (mode == 3) {
+            if (!view) *why = @"The dock's background wasn't found.";
+            return view != 0;
+        }
+    }
 
     uint64_t slot = sbmat_cache_slot(names[0]);
     if (!slot) { *why = @"CoreMaterial's recipe cache wasn't found."; return false; }
@@ -302,7 +323,7 @@ bool sbmat_dock_test_in_session(int mode, NSString **why)
         sbmat_cfrelease(key);
     }
     // Load the recipe again: the cache misses now and finds ours first.
-    uint64_t layer = sbmat_dock_material_layer();
+    uint64_t layer = sbmat_dock_material_layer(NULL);
     NSString *recipe = layer ? sbmat_recipe_name(layer) : nil;
     if (!recipe) { *why = @"The dock's background wasn't found. Check the log."; return false; }
     uint64_t str = r_cfstr(recipe.UTF8String);
