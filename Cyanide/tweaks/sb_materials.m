@@ -208,6 +208,15 @@ static NSString *sbmat_class_name(uint64_t obj)
     return cls ? sbmat_describe(r_dlsym_call(R_TIMEOUT, "NSStringFromClass", cls, 0, 0, 0, 0, 0, 0, 0)) : @"?";
 }
 
+static NSString *sbmat_kvc_path(uint64_t obj, const char *path)
+{
+    if (!r_is_objc_ptr(obj)) return @"-";
+    uint64_t k = r_cfstr(path);
+    uint64_t v = r_msg2_main(obj, "valueForKeyPath:", k, 0, 0, 0);
+    if (k) r_dlsym_call(R_TIMEOUT, "CFRelease", k, 0, 0, 0, 0, 0, 0, 0);
+    return r_is_objc_ptr(v) ? sbmat_describe(r_msg2_main(v, "description", 0, 0, 0, 0)) : @"nil";
+}
+
 // Value of a property through KVC (doubles come back boxed), described.
 static NSString *sbmat_kvc(uint64_t obj, const char *key)
 {
@@ -228,6 +237,17 @@ static NSString *sbmat_recipe_name(uint64_t layer)
 
 // The dock's material layer, straight from the home screen's view
 // controllers (no view walk). 0 when not found.
+// Values the layer actually renders with. CALayer resolves
+// "filters.<name>.<input>" key paths and returns nil for unknown ones.
+static void sbmat_log_layer_values(uint64_t layer, const char *when)
+{
+    printf("[SBMAT] dock layer %s: filters=%s weighting=%s blur=%s saturate=%s matrix=%s\n", when,
+           sbmat_kvc(layer, "filters").UTF8String, sbmat_kvc(layer, "weighting").UTF8String,
+           sbmat_kvc_path(layer, "filters.gaussianBlur.inputRadius").UTF8String,
+           sbmat_kvc_path(layer, "filters.colorSaturate.inputAmount").UTF8String,
+           sbmat_kvc_path(layer, "filters.colorMatrix.inputColorMatrix").UTF8String);
+}
+
 static uint64_t sbmat_dock_material_layer(uint64_t *viewOut)
 {
     uint64_t ctrl = r_msg2_main(r_class("SBIconController"), "sharedInstance", 0, 0, 0, 0);
@@ -328,7 +348,7 @@ bool sbmat_dock_test_in_session(int mode, NSString **why)
     if (!recipe) { *why = @"The dock's background wasn't found. Check the log."; return false; }
     uint64_t str = r_cfstr(recipe.UTF8String);
     uint64_t before = r_msg2_main(layer, "_recipeSettings", 0, 0, 0, 0);
-    printf("[SBMAT] dock layer filters before: %s\n", sbmat_kvc(layer, "filters").UTF8String);
+    sbmat_log_layer_values(layer, "before");
     r_msg2_main(layer, "setRecipeName:", str, 0, 0, 0);
     uint64_t after = r_msg2_main(layer, "_recipeSettings", 0, 0, 0, 0);
     uint64_t cached = r_msg2_main(cache, "objectForKey:", str, 0, 0, 0);
@@ -349,7 +369,7 @@ bool sbmat_dock_test_in_session(int mode, NSString **why)
     r_msg2_main(layer, "layoutIfNeeded", 0, 0, 0, 0);
     printf("[SBMAT] dock layer enabled=%llu backgroundColor=%s\n", r_msg2_main(layer, "isEnabled", 0, 0, 0, 0) & 1,
            sbmat_kvc(layer, "backgroundColor").UTF8String);
-    printf("[SBMAT] dock layer filters after: %s\n", sbmat_kvc(layer, "filters").UTF8String);
+    sbmat_log_layer_values(layer, "after");
     printf("[SBMAT] dock mode %d: recipe %s reloaded, settings %s (cache %s)\n", mode,
            recipe.UTF8String, before != after ? "replaced" : "unchanged", cached ? "refilled" : "empty");
     if (before == after) *why = @"The recipe was replaced, but the dock didn't reload it. Check the log.";
