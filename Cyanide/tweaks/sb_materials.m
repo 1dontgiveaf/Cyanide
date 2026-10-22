@@ -365,14 +365,19 @@ bool sbmat_dock_test_in_session(int mode, NSString **why)
     if (r_responds_main(layer, "_updateForChangeInRecipeAndConfiguration"))
         r_msg2_main(layer, "_updateForChangeInRecipeAndConfiguration", 0, 0, 0, 0);
     // The layer now blends the old settings (initial) into the new (final) by
-    // its weighting, which stays 0 here -- the old look. Make both the new
-    // settings so any weighting shows them.
-    uint64_t interp = r_ivar_value(layer, "_settingsInterpolator");
-    uint64_t final = r_is_objc_ptr(interp) ? r_msg2_main(interp, "finalSettings", 0, 0, 0, 0) : 0;
-    if (r_is_objc_ptr(final) && r_responds_main(interp, "setInitialSettings:"))
-        r_msg2_main(interp, "setInitialSettings:", final, 0, 0, 0);
-    printf("[SBMAT] dock interpolator %s, initial settings %s\n", r_is_objc_ptr(interp) ? "found" : "not found",
-           r_is_objc_ptr(final) ? "set to the new ones" : "unchanged");
+    // its weighting, which stays 0 here -- the old look. Normally the material
+    // view animates it; set it to 1 (all new) on the view, which manages it,
+    // and on the layer.
+    double one = 1.0;
+    uint64_t view = 0;
+    sbmat_dock_material_layer(&view);
+    bool viewSet = view && r_responds_main(view, "setWeighting:");
+    if (viewSet) r_msg2_main_raw(view, "setWeighting:", &one, sizeof(one), NULL, 0, NULL, 0, NULL, 0);
+    if (r_responds_main(layer, "setWeighting:"))
+        r_msg2_main_raw(layer, "setWeighting:", &one, sizeof(one), NULL, 0, NULL, 0, NULL, 0);
+    printf("[SBMAT] dock weighting set to 1 (view %s): view=%s layer=%s\n", viewSet ? "too" : "can't",
+           viewSet && r_responds_main(view, "weighting") ? sbmat_kvc(view, "weighting").UTF8String : "-",
+           sbmat_kvc(layer, "weighting").UTF8String);
     if (r_responds_main(layer, "_setNeedsConfiguring"))
         r_msg2_main(layer, "_setNeedsConfiguring", 0, 0, 0, 0);
     r_msg2_main(layer, "layoutIfNeeded", 0, 0, 0, 0);
