@@ -34,6 +34,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
 @property (nonatomic, copy) NSArray<NSDictionary *> *jitApps;   // nil until listed (JIT / app limit / cards)
 @property (nonatomic, strong) NSDictionary *pickingCard;          // card whose image is being picked
 @property (nonatomic, strong) UIProgressView *progressBar;        // under the navigation bar while decrypting
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSDictionary *> *sbConfig;   // SpringBoard Tools choices
 @end
 
 @implementation LaraViewController
@@ -166,7 +167,101 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView
 {
     // App limit: action, then the apps. Decrypt: finished IPAs, then the apps.
+    if (self.tool == LaraToolSpringBoard) return 1 + (NSInteger)[self sbItemCount];   // Apply/Reset, then one per item
     return (self.tool == LaraToolAppLimit || self.tool == LaraToolDecrypt) ? 2 : 1;
+}
+
+#pragma mark SpringBoard Tools
+
+- (NSUInteger)sbItemCount
+{
+    NSUInteger n = 0;
+    for (const SBMatItem *item = sbmat_items(); item->key; item++) n++;
+    return n;
+}
+
+// Item for a table section (section 0 holds Apply and Reset).
+- (const SBMatItem *)sbItemForSection:(NSInteger)section
+{
+    return section >= 1 && (NSUInteger)section <= [self sbItemCount] ? &sbmat_items()[section - 1] : NULL;
+}
+
+- (NSMutableDictionary<NSString *, NSDictionary *> *)sbConfig
+{
+    if (!_sbConfig) {
+        NSDictionary *saved = [NSUserDefaults.standardUserDefaults dictionaryForKey:kSBMatConfigKey];
+        _sbConfig = saved ? [saved mutableCopy] : [NSMutableDictionary dictionary];
+    }
+    return _sbConfig;
+}
+
+- (NSDictionary *)sbChoiceFor:(const SBMatItem *)item
+{
+    NSDictionary *c = self.sbConfig[@(item->key)];
+    return [c isKindOfClass:NSDictionary.class] ? c : @{};
+}
+
+- (void)sbSet:(id)value forKey:(NSString *)key item:(const SBMatItem *)item
+{
+    NSMutableDictionary *c = [[self sbChoiceFor:item] mutableCopy];
+    c[key] = value;
+    self.sbConfig[@(item->key)] = c;
+    [NSUserDefaults.standardUserDefaults setObject:self.sbConfig forKey:kSBMatConfigKey];
+}
+
+- (UIColor *)sbColorFor:(const SBMatItem *)item
+{
+    NSArray<NSNumber *> *rgba = [self sbChoiceFor:item][@"color"];
+    if (![rgba isKindOfClass:NSArray.class] || rgba.count < 4) return [UIColor colorWithWhite:0 alpha:0.5];
+    return [UIColor colorWithRed:rgba[0].doubleValue green:rgba[1].doubleValue blue:rgba[2].doubleValue alpha:rgba[3].doubleValue];
+}
+
+- (double)sbBlurFor:(const SBMatItem *)item
+{
+    NSNumber *blur = [self sbChoiceFor:item][@"blur"];
+    return blur ? blur.doubleValue : item->defaultBlur;
+}
+
+- (void)sbModeChanged:(UISegmentedControl *)seg
+{
+    const SBMatItem *item = [self sbItemForSection:seg.tag];
+    if (!item) return;
+    [self sbSet:@(seg.selectedSegmentIndex) forKey:@"mode" item:item];
+    [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:seg.tag] withRowAnimation:UITableViewRowAnimationAutomatic];
+}
+
+- (void)sbColorChanged:(UIColorWell *)well
+{
+    const SBMatItem *item = [self sbItemForSection:well.tag];
+    CGFloat r = 0, g = 0, b = 0, a = 1;
+    if (!item || ![well.selectedColor getRed:&r green:&g blue:&b alpha:&a]) return;
+    [self sbSet:@[ @(r), @(g), @(b), @(a) ] forKey:@"color" item:item];
+}
+
+- (void)sbBlurChanged:(UISlider *)slider
+{
+    const SBMatItem *item = [self sbItemForSection:slider.tag];
+    if (!item) return;
+    double blur = round(slider.value);
+    [self sbSet:@(blur) forKey:@"blur" item:item];
+    UITableViewCell *cell = [self.tableView cellForRowAtIndexPath:[NSIndexPath indexPathForRow:2 inSection:slider.tag]];
+    UIListContentConfiguration *c = (UIListContentConfiguration *)cell.contentConfiguration;
+    if ([c isKindOfClass:UIListContentConfiguration.class]) {
+        c.secondaryText = [NSString stringWithFormat:@"%.0f", blur];
+        cell.contentConfiguration = c;
+    }
+}
+
+- (void)sbApply
+{
+    NSDictionary *config = [self.sbConfig copy];
+    __block NSString *why = nil;
+    __weak typeof(self) weakSelf = self;
+    [self runNamed:@"Applying" work:^BOOL{ return sbmat_apply_in_session(config, &why); }
+              done:^(BOOL ok) {
+        weakSelf.status = ok ? @"Applied. Open a folder, Control Center or the app switcher to see the rest."
+                             : (why ?: @"It didn't work. Check the log.");
+    }];
 }
 
 - (NSUInteger)markedAppCount
@@ -184,7 +279,11 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
         case LaraToolPerformanceHUD: return kLaraHUDModeCount;
         case LaraToolDebugOverlay:
         case LaraToolUpsideDown:     return 1;
-        case LaraToolSpringBoard:    return 6;
+        case LaraToolSpringBoard: {
+            if (section == 0) return 2;
+            const SBMatItem *item = [self sbItemForSection:section];
+            return item && [[self sbChoiceFor:item][@"mode"] integerValue] == SBMatModeColor ? 3 : 1;
+        }
         case LaraToolHiddenSettings: {
             NSInteger n = 0;
             for (const LaraPrefToggle *t = lara_pref_toggles(); t->title; t++) n++;
@@ -200,6 +299,10 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section
 {
+    if (self.tool == LaraToolSpringBoard) {
+        const SBMatItem *item = [self sbItemForSection:section];
+        return item ? @(item->title) : nil;
+    }
     if (section != 1 || !self.jitApps.count) return nil;
     if (self.tool == LaraToolAppLimit) return @"Sideloaded Apps";
     if (self.tool == LaraToolDecrypt) return @"App Store Apps";
@@ -233,7 +336,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             about = @"With a free Apple ID, iOS allows only 3 sideloaded apps: installd marks each one, and only marked apps count. Removing the marks frees the slots. Run it again after installing or refreshing (re-signing) an app, which marks it again.";
             break;
         case LaraToolSpringBoard:
-            about = @"Test build: turns the dock background off through CoreMaterial's own recipe override, in SpringBoard's memory. Lasts until the next respring. Stay in Cyanide until it says Done, then go to the Home Screen.";
+            about = @"Changes the material behind the dock, folders, Control Center, notification banners and the app switcher: Apple's (Visible), your own tint and blur (Color), or none (Disabled). Tap Apply after changing something. It works in SpringBoard's memory, so a respring undoes it: apply again after one.";
             break;
         case LaraToolJIT:
             about = @"Tap an app to open it with JIT (for emulators and similar apps). Only apps signed with a development profile can get it. JIT lasts until the app quits; some apps can't tell it's on.";
@@ -267,11 +370,57 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             c.text = @"Enable Upside Down";
             c.textProperties.color = self.busy ? UIColor.secondaryLabelColor : UIColor.systemBlueColor;
             break;
-        case LaraToolSpringBoard:
-            c.text = @[ @"Dock Background Off", @"Dock Background Red (Test)", @"Hide Dock Background View (Test)",
-                        @"Folders Red (Test)", @"Log Folder Recipes (Test)", @"Restore" ][indexPath.row];
-            c.textProperties.color = self.busy ? UIColor.secondaryLabelColor : UIColor.systemBlueColor;
+        case LaraToolSpringBoard: {
+            if (indexPath.section == 0) {
+                c.text = indexPath.row == 0 ? @"Apply" : @"Reset All";
+                c.textProperties.color = self.busy ? UIColor.secondaryLabelColor
+                                       : indexPath.row == 0 ? UIColor.systemBlueColor : UIColor.systemRedColor;
+                break;
+            }
+            const SBMatItem *item = [self sbItemForSection:indexPath.section];
+            if (!item) break;
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            if (indexPath.row == 0) {
+                UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:@[ @"Visible", @"Color", @"Disabled" ]];
+                seg.selectedSegmentIndex = MIN(MAX([[self sbChoiceFor:item][@"mode"] integerValue], 0), 2);
+                seg.tag = indexPath.section;
+                seg.enabled = !self.busy;
+                [seg addTarget:self action:@selector(sbModeChanged:) forControlEvents:UIControlEventValueChanged];
+                seg.translatesAutoresizingMaskIntoConstraints = NO;
+                [cell.contentView addSubview:seg];
+                UILayoutGuide *m = cell.contentView.layoutMarginsGuide;
+                [NSLayoutConstraint activateConstraints:@[
+                    [seg.leadingAnchor constraintEqualToAnchor:m.leadingAnchor],
+                    [seg.trailingAnchor constraintEqualToAnchor:m.trailingAnchor],
+                    [seg.topAnchor constraintEqualToAnchor:m.topAnchor],
+                    [seg.bottomAnchor constraintEqualToAnchor:m.bottomAnchor],
+                ]];
+                cell.imageView.image = nil;
+                return cell;
+            }
+            if (indexPath.row == 1) {
+                c.text = @"Tint";
+                UIColorWell *well = [UIColorWell new];
+                well.supportsAlpha = YES;
+                well.selectedColor = [self sbColorFor:item];
+                well.tag = indexPath.section;
+                [well addTarget:self action:@selector(sbColorChanged:) forControlEvents:UIControlEventValueChanged];
+                [well sizeToFit];
+                cell.accessoryView = well;
+            } else {
+                c.text = @"Blur";
+                c.secondaryText = [NSString stringWithFormat:@"%.0f", [self sbBlurFor:item]];
+                c.secondaryTextProperties.color = UIColor.secondaryLabelColor;
+                UISlider *slider = [[UISlider alloc] initWithFrame:CGRectMake(0, 0, 180, 30)];
+                slider.minimumValue = 0;
+                slider.maximumValue = 60;
+                slider.value = (float)[self sbBlurFor:item];
+                slider.tag = indexPath.section;
+                [slider addTarget:self action:@selector(sbBlurChanged:) forControlEvents:UIControlEventValueChanged];
+                cell.accessoryView = slider;
+            }
             break;
+        }
         case LaraToolHiddenSettings: {
             const LaraPrefToggle *t = &lara_pref_toggles()[indexPath.row];
             c.text = [NSString stringWithUTF8String:t->title];
@@ -376,14 +525,15 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
                       done:^(BOOL ok) { if (ok) weakSelf.status = @"Enabled. Turn the device upside down."; }];
             break;
         }
-        case LaraToolSpringBoard: {
-            int mode = (int[]){ 1, 2, 3, 4, 5, 0 }[indexPath.row];
-            __block NSString *why = nil;
-            [self runNamed:mode ? @"Changing the dock background" : @"Restoring the dock background"
-                      work:^BOOL{ return sbmat_dock_test_in_session(mode, &why); }
-                      done:^(BOOL ok) { weakSelf.status = ok ? @"Done." : (why ?: @"It didn't work. Check the log."); }];
+        case LaraToolSpringBoard:
+            if (indexPath.section != 0) break;
+            if (indexPath.row == 1) {
+                [self.sbConfig removeAllObjects];
+                [NSUserDefaults.standardUserDefaults removeObjectForKey:kSBMatConfigKey];
+                [self.tableView reloadData];
+            }
+            [self sbApply];
             break;
-        }
         case LaraToolHiddenSettings:
             break;
         case LaraToolAppLimit:
