@@ -379,6 +379,24 @@ bool sbmat_dock_test_in_session(int mode, NSString **why)
         sbmat_cfrelease(key);
     }
     if (mode == 4) {
+        // A view that names its own bundle (folders: SpringBoardHome) finds
+        // the system file there before the override folder is looked at. The
+        // cache comes before both: load ours into it now, through a layer
+        // without a bundle, and every later request gets ours.
+        uint64_t layerCls = r_class("MTMaterialLayer");
+        uint64_t probe = r_is_objc_ptr(layerCls) ? r_msg2_main(r_msg2_main(layerCls, "alloc", 0, 0, 0, 0), "init", 0, 0, 0, 0) : 0;
+        uint64_t tfm = r_class("MTTintingFilteringMaterialSettings");
+        for (NSString *name in names) {
+            uint64_t key = r_cfstr(name.UTF8String);
+            if (r_is_objc_ptr(probe)) r_msg2_main(probe, "setRecipeName:", key, 0, 0, 0);
+            uint64_t settings = r_msg2_main(cache, "objectForKey:", key, 0, 0, 0);
+            sbmat_cfrelease(key);
+            uint64_t base = r_is_objc_ptr(settings) ? r_msg2_main(settings, "baseMaterialSettings", 0, 0, 0, 0) : 0;
+            if (!r_msg2_main(base, "isKindOfClass:", tfm, 0, 0, 0)) base = 0;
+            printf("[SBMAT] %s preloaded: %s tintAlpha=%s\n", name.UTF8String, r_is_objc_ptr(settings) ? "in cache" : "not loaded",
+                   sbmat_kvc(base, "tintAlpha").UTF8String);
+        }
+        if (r_is_objc_ptr(probe)) r_release(probe);
         printf("[SBMAT] folder recipes overridden; existing views left as they are\n");
         return true;
     }
