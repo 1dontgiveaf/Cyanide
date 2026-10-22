@@ -118,10 +118,11 @@ static uint64_t sbmat_cache_slot(NSString *probe)
     return slot;
 }
 
-// The recipe with its materialFiltering replaced: no blur, and either no
-// tint (off, the backdrop shows through) or a strong red tint (test: makes it
-// obvious whether our recipe is used at all). materialSettingsVersion stays:
-// it tells CoreMaterial which format the file is in.
+// Off: materialFiltering reduced to no blur, so the material is an identity
+// and CoreMaterial turns the backdrop off (the wallpaper shows through).
+// Red (test): the original filtering plus a strong red tint, which version-2
+// recipes read from baseMaterial.tinting, next to materialFiltering.
+// materialSettingsVersion stays: it tells CoreMaterial the file's format.
 static NSData *sbmat_edited_recipe(NSString *name, int mode, NSString **why)
 {
     NSURL *url = sbmat_system_recipe_url(name);
@@ -136,12 +137,12 @@ static NSData *sbmat_edited_recipe(NSString *name, int mode, NSString **why)
     NSMutableDictionary *changed = [plist mutableCopy];
     NSMutableDictionary *base = [plist[@"baseMaterial"] isKindOfClass:NSDictionary.class] ? [plist[@"baseMaterial"] mutableCopy]
                                                                                        : [NSMutableDictionary dictionary];
-    NSMutableDictionary *filtering = [NSMutableDictionary dictionaryWithDictionary:@{ @"blurRadius": @0 }];
     if (mode == 2) {
-        filtering[@"tinting"] = @{ @"tintAlpha": @0.8,
-                                   @"tintColor": @{ @"alpha": @1.0, @"red": @1.0, @"green": @0.0, @"blue": @0.0 } };
+        base[@"tinting"] = @{ @"tintAlpha": @0.8,
+                              @"tintColor": @{ @"alpha": @1.0, @"red": @1.0, @"green": @0.0, @"blue": @0.0 } };
+    } else {
+        base[@"materialFiltering"] = @{ @"blurRadius": @0 };
     }
-    base[@"materialFiltering"] = filtering;
     changed[@"baseMaterial"] = base;
     printf("[SBMAT] %s edited: %s\n", name.UTF8String,
            [[changed.description stringByReplacingOccurrencesOfString:@"\n" withString:@" "] UTF8String]);
@@ -318,10 +319,15 @@ bool sbmat_dock_test_in_session(int mode, NSString **why)
     printf("[SBMAT] dock settings now: blurRadius=%s tintColor=%s tintAlpha=%s\n",
            sbmat_kvc(baseSettings, "blurRadius").UTF8String, sbmat_kvc(baseSettings, "tintColorDescription").UTF8String,
            sbmat_kvc(baseSettings, "tintAlpha").UTF8String);
+    // The filters are only rebuilt in -layoutSublayers while _needsConfiguring
+    // is set; setting the recipe doesn't set it.
     if (r_responds_main(layer, "_updateForChangeInRecipeAndConfiguration"))
         r_msg2_main(layer, "_updateForChangeInRecipeAndConfiguration", 0, 0, 0, 0);
-    r_msg2_main(layer, "setNeedsLayout", 0, 0, 0, 0);
-    r_msg2_main(layer, "setNeedsDisplay", 0, 0, 0, 0);
+    if (r_responds_main(layer, "_setNeedsConfiguring"))
+        r_msg2_main(layer, "_setNeedsConfiguring", 0, 0, 0, 0);
+    r_msg2_main(layer, "layoutIfNeeded", 0, 0, 0, 0);
+    printf("[SBMAT] dock layer enabled=%llu backgroundColor=%s\n", r_msg2_main(layer, "isEnabled", 0, 0, 0, 0) & 1,
+           sbmat_kvc(layer, "backgroundColor").UTF8String);
     printf("[SBMAT] dock layer filters after: %s\n", sbmat_kvc(layer, "filters").UTF8String);
     printf("[SBMAT] dock mode %d: recipe %s reloaded, settings %s (cache %s)\n", mode,
            recipe.UTF8String, before != after ? "replaced" : "unchanged", cached ? "refilled" : "empty");
