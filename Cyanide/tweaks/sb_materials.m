@@ -18,7 +18,6 @@
 
 #import "sb_materials.h"
 #import "remote_objc.h"
-#import "sb_walk.h"
 #import "../TaskRop/RemoteCall.h"
 #import "../LogTextView.h"
 #import <dlfcn.h>
@@ -197,33 +196,39 @@ static uint64_t sbmat_write_folder(NSDictionary<NSString *, NSData *> *files)
     return dir;
 }
 
-// Makes existing material layers using `names` load their recipe again.
-static int sbmat_refresh_layers(NSSet<NSString *> *names)
+static NSString *sbmat_class_name(uint64_t obj)
 {
-    uint64_t cls = r_class("MTMaterialView");
-    if (!r_is_objc_ptr(cls)) { printf("[SBMAT] MTMaterialView class not found\n"); return 0; }
-    static uint64_t views[512];
-    int n = sb_collect_views_in_windows_main(cls, views, 512);
-    NSCountedSet *seen = [NSCountedSet set];
-    int refreshed = 0;
-    for (int i = 0; i < n; i++) {
-        uint64_t layer = r_msg2_main(views[i], "layer", 0, 0, 0, 0);
-        uint64_t rn = r_is_objc_ptr(layer) && r_responds_main(layer, "recipeName")
-            ? r_msg2_main(layer, "recipeName", 0, 0, 0, 0) : 0;
-        char buf[128] = {0};
-        if (!r_is_objc_ptr(rn) || !r_read_nsstring(rn, buf, sizeof(buf))) continue;
-        NSString *name = @(buf);
-        [seen addObject:name];
-        if (![names containsObject:name]) continue;
-        uint64_t str = r_cfstr(buf);
-        r_msg2_main(layer, "setRecipeName:", str, 0, 0, 0);
-        sbmat_cfrelease(str);
-        refreshed++;
-    }
-    NSMutableArray *list = [NSMutableArray array];
-    for (NSString *s in seen) [list addObject:[NSString stringWithFormat:@"%@×%lu", s, (unsigned long)[seen countForObject:s]]];
-    printf("[SBMAT] %d material views; recipes in use: %s\n", n, [[list componentsJoinedByString:@", "] UTF8String]);
-    return refreshed;
+    uint64_t name = r_is_objc_ptr(obj) ? r_dlsym_call(R_TIMEOUT, "object_getClassName", obj, 0, 0, 0, 0, 0, 0, 0) : 0;
+    char buf[96] = {0};
+    return name && remote_read(name, buf, sizeof(buf) - 1) ? @(buf) : @"?";
+}
+
+static NSString *sbmat_recipe_name(uint64_t layer)
+{
+    uint64_t rn = r_is_objc_ptr(layer) && r_responds_main(layer, "recipeName")
+        ? r_msg2_main(layer, "recipeName", 0, 0, 0, 0) : 0;
+    char buf[128] = {0};
+    return r_is_objc_ptr(rn) && r_read_nsstring(rn, buf, sizeof(buf)) ? @(buf) : nil;
+}
+
+// The dock's material layer, straight from the home screen's view
+// controllers (no view walk). 0 when not found.
+static uint64_t sbmat_dock_material_layer(void)
+{
+    uint64_t ctrl = r_msg2_main(r_class("SBIconController"), "sharedInstance", 0, 0, 0, 0);
+    uint64_t mgr = r_is_objc_ptr(ctrl) ? r_msg2_main(ctrl, "iconManager", 0, 0, 0, 0) : 0;
+    uint64_t root = r_is_objc_ptr(mgr) ? r_msg2_main(mgr, "rootFolderController", 0, 0, 0, 0) : 0;
+    uint64_t rootView = r_is_objc_ptr(root) ? r_msg2_main(root, "rootFolderView", 0, 0, 0, 0) : 0;
+    uint64_t dock = r_is_objc_ptr(rootView) && r_responds_main(rootView, "dockView")
+        ? r_msg2_main(rootView, "dockView", 0, 0, 0, 0) : 0;
+    uint64_t bg = r_is_objc_ptr(dock) && r_responds_main(dock, "backgroundView")
+        ? r_msg2_main(dock, "backgroundView", 0, 0, 0, 0) : 0;
+    uint64_t layer = r_is_objc_ptr(bg) ? r_msg2_main(bg, "layer", 0, 0, 0, 0) : 0;
+    printf("[SBMAT] dock: controller=%d manager=%d root=%d rootView=%d dockView=%s background=%s layer=%s recipe=%s\n",
+           r_is_objc_ptr(ctrl), r_is_objc_ptr(mgr), r_is_objc_ptr(root), r_is_objc_ptr(rootView),
+           sbmat_class_name(dock).UTF8String, sbmat_class_name(bg).UTF8String, sbmat_class_name(layer).UTF8String,
+           (sbmat_recipe_name(layer) ?: @"-").UTF8String);
+    return r_is_objc_ptr(layer) && r_responds_main(layer, "setRecipeName:") ? layer : 0;
 }
 
 bool sbmat_dock_test_in_session(bool disable, NSString **why)
@@ -271,8 +276,18 @@ bool sbmat_dock_test_in_session(bool disable, NSString **why)
         printf("[SBMAT] cache entry %s: %s\n", name.UTF8String, had ? "removed" : "wasn't loaded");
         sbmat_cfrelease(key);
     }
-    int refreshed = sbmat_refresh_layers([NSSet setWithArray:names]);
-    printf("[SBMAT] dock %s: %d layer(s) reloaded\n", disable ? "disabled" : "restored", refreshed);
-    if (!refreshed) *why = @"Applied, but no dock layer was reloaded. Check the log.";
-    return refreshed > 0;
+    // Load the recipe again: the cache misses now and finds ours first.
+    uint64_t layer = sbmat_dock_material_layer();
+    NSString *recipe = layer ? sbmat_recipe_name(layer) : nil;
+    if (!recipe) { *why = @"The dock's background wasn't found. Check the log."; return false; }
+    uint64_t str = r_cfstr(recipe.UTF8String);
+    uint64_t before = r_msg2_main(layer, "_recipeSettings", 0, 0, 0, 0);
+    r_msg2_main(layer, "setRecipeName:", str, 0, 0, 0);
+    uint64_t after = r_msg2_main(layer, "_recipeSettings", 0, 0, 0, 0);
+    uint64_t cached = r_msg2_main(cache, "objectForKey:", str, 0, 0, 0);
+    sbmat_cfrelease(str);
+    printf("[SBMAT] dock %s: recipe %s reloaded, settings %s (cache %s)\n", disable ? "disabled" : "restored",
+           recipe.UTF8String, before != after ? "replaced" : "unchanged", cached ? "refilled" : "empty");
+    if (before == after) *why = @"The recipe was replaced, but the dock didn't reload it. Check the log.";
+    return before != after;
 }

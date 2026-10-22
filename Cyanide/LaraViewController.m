@@ -233,7 +233,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             about = @"With a free Apple ID, iOS allows only 3 sideloaded apps: installd marks each one, and only marked apps count. Removing the marks frees the slots. Run it again after installing or refreshing (re-signing) an app, which marks it again.";
             break;
         case LaraToolSpringBoard:
-            about = @"Test build: turns the dock background off through CoreMaterial's own recipe override, in SpringBoard's memory. Lasts until the next respring.";
+            about = @"Test build: turns the dock background off through CoreMaterial's own recipe override, in SpringBoard's memory. Lasts until the next respring. Stay in Cyanide until it says Done, then go to the Home Screen.";
             break;
         case LaraToolJIT:
             about = @"Tap an app to open it with JIT (for emulators and similar apps). Only apps signed with a development profile can get it. JIT lasts until the app quits; some apps can't tell it's on.";
