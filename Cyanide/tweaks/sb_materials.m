@@ -46,9 +46,16 @@ static BOOL sbmat_load_corematerial(void)
     return loaded;
 }
 
-// The system's <name>.materialrecipe, as CoreMaterial itself finds it.
+// The system's <name>.materialrecipe: CoreMaterial's own bundle, or the
+// framework that ships it (SpringBoard's recipes live with SpringBoard).
 static NSURL *sbmat_system_recipe_url(NSString *name)
 {
+    for (NSString *framework in @[ @"SpringBoardHome", @"SpringBoard", @"SpringBoardFoundation", @"PlatterKit",
+                                   @"ControlCenterUI", @"ControlCenterUIKit", @"CoverSheet" ]) {
+        NSString *path = [NSString stringWithFormat:@"/System/Library/PrivateFrameworks/%@.framework/%@.materialrecipe",
+                          framework, name];
+        if ([NSFileManager.defaultManager fileExistsAtPath:path]) return [NSURL fileURLWithPath:path];
+    }
     if (!sbmat_load_corematerial()) return nil;
     SEL bundleSel = sel_registerName("coreMaterialRecipeBundle"), urlSel = sel_registerName("URLForMaterialRecipe:");
     if (![NSBundle respondsToSelector:bundleSel]) return nil;
@@ -305,6 +312,9 @@ bool sbmat_dock_test_in_session(int mode, NSString **why)
     uint64_t count = cacheOK ? r_msg2(cache, "count", 0, 0, 0, 0) : 0;
     printf("[SBMAT] SpringBoard recipe cache 0x%llx: %s, %llu recipes\n", cache, cacheOK ? "ok" : "not a dictionary", count);
     if (!cacheOK) { *why = @"SpringBoard's recipe cache wasn't found."; return false; }
+    uint64_t keys = r_msg2_main(cache, "allKeys", 0, 0, 0, 0);
+    uint64_t joined = r_is_objc_ptr(keys) ? r_msg2_main(keys, "componentsJoinedByString:", r_cfstr(", "), 0, 0, 0) : 0;
+    printf("[SBMAT] recipes SpringBoard has loaded: %s\n", sbmat_describe(joined).UTF8String);
 
     bool disable = mode != 0;
     uint64_t url = 0, dir = 0;
