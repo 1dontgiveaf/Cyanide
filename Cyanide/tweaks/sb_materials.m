@@ -364,6 +364,15 @@ bool sbmat_dock_test_in_session(int mode, NSString **why)
     // is set; setting the recipe doesn't set it.
     if (r_responds_main(layer, "_updateForChangeInRecipeAndConfiguration"))
         r_msg2_main(layer, "_updateForChangeInRecipeAndConfiguration", 0, 0, 0, 0);
+    // The layer now blends the old settings (initial) into the new (final) by
+    // its weighting, which stays 0 here -- the old look. Make both the new
+    // settings so any weighting shows them.
+    uint64_t interp = r_ivar_value(layer, "_settingsInterpolator");
+    uint64_t final = r_is_objc_ptr(interp) ? r_msg2_main(interp, "finalSettings", 0, 0, 0, 0) : 0;
+    if (r_is_objc_ptr(final) && r_responds_main(interp, "setInitialSettings:"))
+        r_msg2_main(interp, "setInitialSettings:", final, 0, 0, 0);
+    printf("[SBMAT] dock interpolator %s, initial settings %s\n", r_is_objc_ptr(interp) ? "found" : "not found",
+           r_is_objc_ptr(final) ? "set to the new ones" : "unchanged");
     if (r_responds_main(layer, "_setNeedsConfiguring"))
         r_msg2_main(layer, "_setNeedsConfiguring", 0, 0, 0, 0);
     r_msg2_main(layer, "layoutIfNeeded", 0, 0, 0, 0);
