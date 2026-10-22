@@ -288,7 +288,8 @@ bool sbmat_dock_test_in_session(int mode, NSString **why)
     NSArray<NSString *> *dockNames = @[ @"dockDark", @"dockLight" ];
     // Test 4: folders red, without touching existing views -- shows whether
     // views made later (an opened folder) pick the override up by themselves.
-    NSArray<NSString *> *folderNames = @[ @"folderDark", @"folderLight", @"folderExpandedBackgroundHome" ];
+    NSArray<NSString *> *folderNames = @[ @"folderDark", @"folderLight", @"folderDarkSimplified", @"folderLightSimplified",
+                                          @"folderExpandedBackgroundHome", @"folderExpandedBackgroundHomeSimplified" ];
     NSArray<NSString *> *names = mode == 4 ? folderNames : mode == 0 ? [dockNames arrayByAddingObjectsFromArray:folderNames]
                                                                      : dockNames;
 
@@ -315,6 +316,23 @@ bool sbmat_dock_test_in_session(int mode, NSString **why)
     uint64_t keys = r_msg2_main(cache, "allKeys", 0, 0, 0, 0);
     uint64_t joined = r_is_objc_ptr(keys) ? r_msg2_main(keys, "componentsJoinedByString:", r_cfstr(", "), 0, 0, 0) : 0;
     printf("[SBMAT] recipes SpringBoard has loaded: %s\n", sbmat_describe(joined).UTF8String);
+    // Test 5: what the folder recipes SpringBoard loaded look like (after
+    // opening a folder): ours (red) or the system's.
+    if (mode == 5) {
+        uint64_t tfm = r_class("MTTintingFilteringMaterialSettings");
+        for (NSString *name in folderNames) {
+            uint64_t key = r_cfstr(name.UTF8String);
+            uint64_t settings = r_msg2_main(cache, "objectForKey:", key, 0, 0, 0);
+            sbmat_cfrelease(key);
+            if (!r_is_objc_ptr(settings)) { printf("[SBMAT] %s: not loaded\n", name.UTF8String); continue; }
+            uint64_t base = r_msg2_main(settings, "baseMaterialSettings", 0, 0, 0, 0);
+            if (!r_msg2_main(base, "isKindOfClass:", tfm, 0, 0, 0)) base = 0;
+            printf("[SBMAT] %s: loaded, blurRadius=%s tintColor=%s tintAlpha=%s\n", name.UTF8String,
+                   sbmat_kvc(base, "blurRadius").UTF8String, sbmat_kvc(base, "tintColorDescription").UTF8String,
+                   sbmat_kvc(base, "tintAlpha").UTF8String);
+        }
+        return true;
+    }
 
     bool disable = mode != 0;
     uint64_t url = 0, dir = 0;
