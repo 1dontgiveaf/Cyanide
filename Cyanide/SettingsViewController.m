@@ -175,12 +175,8 @@ static void settings_clear_repo_tweak_defaults(NSString *repoURL, NSString *twea
         ![tweakID isKindOfClass:NSString.class] || tweakID.length == 0) {
         return;
     }
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    [d removeObjectForKey:repotweaks_enabled_defaults_key(repoURL, tweakID)];
-    [d removeObjectForKey:repotweaks_script_defaults_key(repoURL, tweakID)];
-    [d removeObjectForKey:repotweaks_values_defaults_key(repoURL, tweakID)];
-    [d synchronize];
-    repotweaks_cancel_tweak(repoURL, tweakID);
+    repotweaks_forget_tweak(repoURL, tweakID);
+    [[NSUserDefaults standardUserDefaults] synchronize];
 }
 
 static NSDictionary *settings_repotweaks_caches(void)

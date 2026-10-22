@@ -33,8 +33,11 @@ Confirmed working on iPhone 16 Pro Max (iOS 18.5), iPhone 15 Pro Max
 
 ## Tweaks
 
-Installed from the in-app Installer. Everything is applied in memory for the
-current boot — nothing is written to the filesystem, and a respring undoes it.
+Installed from the in-app Installer. Most tweaks are applied in memory for the
+current boot, and a respring undoes them. A few write files or system settings
+that last beyond a respring or reboot: the OTA blocker, the call recording
+sound, Hide Home Bar and the Daemon Manager stay until you switch them off in
+Cyanide, and the Cache Cleaner deletes what you select.
 
 ### Home Screen
 

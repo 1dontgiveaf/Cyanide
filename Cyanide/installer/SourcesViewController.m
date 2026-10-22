@@ -127,13 +127,9 @@ static void sources_clear_repo_defaults(NSString *url)
     for (NSDictionary *tweak in sources_tweaks_for_url(url)) {
         NSString *tweakID = sources_string_or_empty(tweak[@"id"]);
         if (tweakID.length == 0) continue;
-        [d removeObjectForKey:repotweaks_enabled_defaults_key(url, tweakID)];
-        [d removeObjectForKey:repotweaks_script_defaults_key(url, tweakID)];
-        [d removeObjectForKey:repotweaks_values_defaults_key(url, tweakID)];
-        [d removeObjectForKey:[@"RepoTweakScriptSource_" stringByAppendingString:repotweaks_storage_key(url, tweakID)]];
-        repotweaks_cancel_tweak(url, tweakID);
-        quickloader_clear_repo_tweak_if_matches(url, tweakID);
+        repotweaks_forget_tweak(url, tweakID);
     }
+    [d synchronize];
 }
 
 #pragma mark - Category icon/color helpers

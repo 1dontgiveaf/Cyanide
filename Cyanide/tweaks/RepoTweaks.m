@@ -1043,7 +1043,8 @@ bool repotweaks_apply_in_session(void) {
 // URL (back) into RepoTweaksURLs, and drops its result if the source was
 // removed while the fetch was in flight.
 static void repotweaks_download_script_capped(NSString *repoURL, NSString *tweakId, NSString *scriptURL,
-                                              NSUInteger maxBytes, void (^completion)(BOOL success, NSUInteger bytes));
+                                              NSUInteger maxBytes, uint64_t fetchGeneration,
+                                              void (^completion)(BOOL success, NSUInteger bytes));
 
 
 // Review R-03: the 16 MB refresh budget is per refresh, not a total. Old
@@ -1117,13 +1118,32 @@ static BOOL repotweaks_fetch_generation_is_current(NSString *repoURL, uint64_t g
     }
 }
 
-// A tweak a successful refresh no longer lists: stopped and forgotten, as if
-// its source had been swiped away -- otherwise its running script keeps going
-// (and QuickLoader reloads it) with no package row left to uninstall it.
-static void repotweaks_retire_tweak(NSUserDefaults *d, NSString *repoURL, NSString *tweakID) {
+NSString *repotweaks_native_enabled_key(NSString *tweakID) {
+    if ([tweakID isEqualToString:@"lightsaber.sbcustomizer"]) return kSettingsSBCEnabled;
+    if ([tweakID isEqualToString:@"lightsaber.statbar"]) return kSettingsStatBarEnabled;
+    if ([tweakID isEqualToString:@"lightsaber.powercuff"]) return kSettingsPowercuffEnabled;
+    return nil;
+}
+
+// A tweak a successful refresh no longer lists, or whose source is deleted:
+// stopped and forgotten -- otherwise its running script keeps going (and
+// QuickLoader reloads it) with no package row left to uninstall it.
+void repotweaks_forget_tweak(NSString *repoURL, NSString *tweakID) {
+    if (![repoURL isKindOfClass:NSString.class] || repoURL.length == 0 ||
+        ![tweakID isKindOfClass:NSString.class] || tweakID.length == 0) return;
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     repotweaks_cancel_tweak(repoURL, tweakID);
     quickloader_clear_repo_tweak_if_matches(repoURL, tweakID);
     NSString *storageKey = repotweaks_storage_key(repoURL, tweakID);
+    // A package backed by a built-in tweak (SBCustomizer, StatBar, Powercuff)
+    // turns that off too -- but only when this package is what installed it,
+    // not when the built-in tweak was switched on by itself.
+    NSString *nativeKey = repotweaks_native_enabled_key(tweakID);
+    if (nativeKey.length && [d boolForKey:nativeKey] &&
+        [d objectForKey:[@"RepoTweakInstalledVersion_" stringByAppendingString:storageKey]]) {
+        [d setBool:NO forKey:nativeKey];
+        log_user("[RepoTweaks] %s: turned off the built-in tweak it had switched on.\n", tweakID.UTF8String);
+    }
     [d removeObjectForKey:repotweaks_enabled_defaults_key(repoURL, tweakID)];
     [d removeObjectForKey:repotweaks_script_defaults_key(repoURL, tweakID)];
     [d removeObjectForKey:repotweaks_values_defaults_key(repoURL, tweakID)];
@@ -1240,23 +1260,36 @@ static void repotweaks_fetch_repo(NSString *repoURL, BOOL addIfMissing,
             for (NSString *tid in oldVersions) {
                 if (![newIDs containsObject:tid]) [removedIDs addObject:tid];
             }
+            BOOL keepPrevious = NO;
             if (removedIDs.count > 0 && newIDs.count == 0) {
                 // Every tweak gone at once looks like a broken publish, not a
-                // deliberate removal: keep installs as they are this time.
-                log_user("[RepoTweaks] %s now lists no tweaks; keeping the %lu installed from it.\n",
-                         repoURL.UTF8String, (unsigned long)removedIDs.count);
+                // deliberate removal: keep installs as they are this time --
+                // and the previous list with them, or their package rows (and
+                // a later source deletion's cleanup) would lose track of them.
+                for (NSString *tid in removedIDs) {
+                    if ([d boolForKey:repotweaks_enabled_defaults_key(repoURL, tid)] ||
+                        [d objectForKey:repotweaks_installed_version_key(repoURL, tid)]) { keepPrevious = YES; break; }
+                }
+            }
+            if (keepPrevious) {
+                log_user("[RepoTweaks] %s now lists no tweaks; keeping its previous list and the tweaks installed from it.\n",
+                         repoURL.UTF8String);
             } else {
                 for (NSString *tid in removedIDs) {
                     BOOL wasActive = [d boolForKey:repotweaks_enabled_defaults_key(repoURL, tid)] ||
                         [d objectForKey:[@"RepoTweakInstalledVersion_" stringByAppendingString:
                                           repotweaks_storage_key(repoURL, tid)]] != nil;
-                    repotweaks_retire_tweak(d, repoURL, tid);
+                    repotweaks_forget_tweak(repoURL, tid);
                     if (wasActive)
                         log_user("[RepoTweaks] %s was removed from its source: stopped and uninstalled. "
                                  "Respring to clear anything it already changed.\n", tid.UTF8String);
                 }
             }
 
+            if (keepPrevious) {
+                finish(NO, @"The source now lists no tweaks; kept the previous list.");
+                return;
+            }
             caches[repoURL] = sanitized;
             [d setObject:caches forKey:@"RepoTweaksCaches"];
             [d synchronize];
@@ -1285,7 +1318,7 @@ static void repotweaks_fetch_repo(NSString *repoURL, BOOL addIfMissing,
                         continue;
                     }
                     repotweaks_download_script_capped(repoURL, tweak[@"id"], tweak[@"scriptURL"],
-                                                      MIN(kRepoTweaksMaxScriptBytes, remaining),
+                                                      MIN(kRepoTweaksMaxScriptBytes, remaining), fetchGeneration,
                                                       ^(BOOL success, NSUInteger bytes) {
                         @synchronized (group) {
                             if (!success) scriptsOK = NO;
@@ -1297,6 +1330,10 @@ static void repotweaks_fetch_repo(NSString *repoURL, BOOL addIfMissing,
                 }
             });
             dispatch_group_notify(group, dispatch_get_main_queue(), ^{
+                if (!repotweaks_fetch_generation_is_current(repoURL, fetchGeneration)) {
+                    finish(NO, @"A newer refresh of this source replaced this one.");
+                    return;
+                }
                 finish(scriptsOK, scriptsOK ? @"Refreshed." : @"Refreshed, but one or more scripts failed to download.");
             });
         });
@@ -1312,14 +1349,33 @@ void repotweaks_add_repo(NSString *repoURL, void (^completion)(BOOL success, NSS
 }
 
 void repotweaks_download_script(NSString *repoURL, NSString *tweakId, NSString *scriptURL, void (^completion)(BOOL success)) {
-    repotweaks_download_script_capped(repoURL, tweakId, scriptURL, kRepoTweaksMaxScriptBytes, ^(BOOL success, NSUInteger bytes) {
+    repotweaks_download_script_capped(repoURL, tweakId, scriptURL, kRepoTweaksMaxScriptBytes, 0, ^(BOOL success, NSUInteger bytes) {
         if (completion) completion(success);
     });
 }
 
+// A finished script download may still be stored: its source is still saved,
+// no newer refresh of that source has started (fetchGeneration, 0 for a
+// download outside a refresh), and the feed still points this tweak at the
+// same script. A slow download must not overwrite a newer script or bring
+// back a deleted source's data.
+static BOOL repotweaks_script_download_is_current(NSUserDefaults *d, NSString *repoURL, NSString *tweakId,
+                                                  NSString *scriptURL, uint64_t fetchGeneration) {
+    if (![repotweaks_saved_urls(d) containsObject:repoURL]) return NO;
+    if (fetchGeneration && !repotweaks_fetch_generation_is_current(repoURL, fetchGeneration)) return NO;
+    NSDictionary *repo = repotweaks_saved_caches(d)[repoURL];
+    NSArray *tweaks = [repo isKindOfClass:NSDictionary.class] && [repo[@"tweaks"] isKindOfClass:NSArray.class] ? repo[@"tweaks"] : @[];
+    for (NSDictionary *tweak in tweaks) {
+        if (![tweak isKindOfClass:NSDictionary.class] || ![repotweaks_string_or_empty(tweak[@"id"]) isEqualToString:tweakId]) continue;
+        return [repotweaks_string_or_empty(tweak[@"scriptURL"]) isEqualToString:scriptURL];
+    }
+    return NO;
+}
+
 // Completion runs on main; bytes is the stored script's size (0 on failure).
 static void repotweaks_download_script_capped(NSString *repoURL, NSString *tweakId, NSString *scriptURL,
-                                              NSUInteger maxBytes, void (^completion)(BOOL success, NSUInteger bytes)) {
+                                              NSUInteger maxBytes, uint64_t fetchGeneration,
+                                              void (^completion)(BOOL success, NSUInteger bytes)) {
     void (^finish)(BOOL) = ^(BOOL success) {
         if (completion) dispatch_async(dispatch_get_main_queue(), ^{ completion(success, 0); });
     };
@@ -1372,6 +1428,11 @@ static void repotweaks_download_script_capped(NSString *repoURL, NSString *tweak
         // with a user's edit and write back an older snapshot over it.
         dispatch_async(dispatch_get_main_queue(), ^{
             NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+            if (!repotweaks_script_download_is_current(d, repoURL, tweakId, scriptURL, fetchGeneration)) {
+                log_user("[RepoTweaks] Dropped an outdated download of %s.\n", tweakId.UTF8String);
+                if (completion) completion(NO, 0);
+                return;
+            }
             [d setObject:jsCode forKey:repotweaks_script_defaults_key(repoURL, tweakId)];
             // Where this copy came from, so a feed entry that now points at a
             // different script never runs the old one (see

@@ -115,10 +115,7 @@ static BOOL PackageRepoScriptRequiresNativeBridge(NSString *rawScript)
 - (NSString *)repoNativeEnabledKey
 {
     if (self.kind != PackageInstallKindRepoTweak) return nil;
-    if ([self.repoTweakID isEqualToString:@"lightsaber.sbcustomizer"]) return kSettingsSBCEnabled;
-    if ([self.repoTweakID isEqualToString:@"lightsaber.statbar"]) return kSettingsStatBarEnabled;
-    if ([self.repoTweakID isEqualToString:@"lightsaber.powercuff"]) return kSettingsPowercuffEnabled;
-    return nil;
+    return repotweaks_native_enabled_key(self.repoTweakID);
 }
 
 - (BOOL)repoTweakUsesQuickLoader

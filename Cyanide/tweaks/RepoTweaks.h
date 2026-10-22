@@ -42,6 +42,12 @@ BOOL repotweaks_download_script_sync(NSString *repoURL,
                                      NSTimeInterval timeout,
                                      NSString **message);
 void repotweaks_cancel_tweak(NSString *repoURL, NSString *tweakId);
+// Stops a tweak and removes everything stored for it (script, values,
+// installed version, QuickLoader copy, and a built-in tweak it switched on).
+// Used when its source drops it or is deleted. Call on main; caller syncs.
+void repotweaks_forget_tweak(NSString *repoURL, NSString *tweakId);
+// The built-in tweak's enabled key for a repo package backed by one, or nil.
+NSString *repotweaks_native_enabled_key(NSString *tweakId);
 
 bool repotweaks_stop_in_session(void);
 

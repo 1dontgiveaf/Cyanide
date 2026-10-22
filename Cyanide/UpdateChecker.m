@@ -77,11 +77,18 @@ static NSString *update_http_failure(NSURLResponse *response)
     return nil;
 }
 
-// Burn the persisted 24 h throttle. Called only when the check has no prompt
-// to show (no update / skipped / snoozed) or has actually presented one.
+// Burn both gates (the persisted 24 h throttle and this process's check).
+// Called only when the check has no prompt to show (no update / skipped /
+// snoozed) or has actually presented one: a prompt that couldn't be shown
+// (backgrounded, another alert up) is tried again on the next foreground.
 - (void)markAutoCheckTimestamp
 {
     [[NSUserDefaults standardUserDefaults] setObject:[NSDate date] forKey:kUpdateLastCheckAtKey];
+    // The flag is read on main (checkForUpdatesIfNeededFrom:): write it there.
+    __weak typeof(self) weakSelf = self;
+    void (^mark)(void) = ^{ weakSelf.didCompleteAutoCheckThisProcess = YES; };
+    if (NSThread.isMainThread) mark();
+    else dispatch_async(dispatch_get_main_queue(), mark);
 }
 
 - (void)checkForUpdatesIfNeededFrom:(UIViewController *)presenter
@@ -159,15 +166,10 @@ static NSString *update_http_failure(NSURLResponse *response)
             return;
         }
 
-        // A usable response still only consumes the per-process gate here.
-        // The persisted throttle is burned only when no prompt is owed (no
-        // update / skipped / snoozed) or a prompt is actually presented: a
-        // prompt suppressed by an in-flight manual check must not hide the
-        // update for the next 24 h.
-        dispatch_async(dispatch_get_main_queue(), ^{
-            strongSelf.didCompleteAutoCheckThisProcess = YES;
-        });
-
+        // Both gates are burned only when no prompt is owed (no update /
+        // skipped / snoozed) or a prompt is actually presented: a prompt
+        // suppressed (backgrounded, manual check, another alert) must not hide
+        // the update until the throttle runs out.
         if (!strongSelf) return;
 
         NSString *latest  = [strongSelf normalizeTag:tag];
