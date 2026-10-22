@@ -278,7 +278,12 @@ bool sbmat_dock_test_in_session(int mode, NSString **why)
 {
     __autoreleasing NSString *dummy = nil;
     if (!why) why = &dummy;
-    NSArray<NSString *> *names = @[ @"dockDark", @"dockLight" ];
+    NSArray<NSString *> *dockNames = @[ @"dockDark", @"dockLight" ];
+    // Test 4: folders red, without touching existing views -- shows whether
+    // views made later (an opened folder) pick the override up by themselves.
+    NSArray<NSString *> *folderNames = @[ @"folderDark", @"folderLight", @"folderExpandedBackgroundHome" ];
+    NSArray<NSString *> *names = mode == 4 ? folderNames : mode == 0 ? [dockNames arrayByAddingObjectsFromArray:folderNames]
+                                                                     : dockNames;
 
     // Test 3: hide the background view itself -- shows whether it's the dock
     // on screen at all. Restore (0) unhides it again.
@@ -306,8 +311,11 @@ bool sbmat_dock_test_in_session(int mode, NSString **why)
     if (disable) {
         NSMutableDictionary<NSString *, NSData *> *files = [NSMutableDictionary dictionary];
         for (NSString *name in names) {
-            NSData *data = sbmat_edited_recipe(name, mode, why);
-            if (!data) return false;
+            NSData *data = sbmat_edited_recipe(name, mode == 4 ? 2 : mode, why);
+            if (!data) {
+                if (mode == 4) { printf("[SBMAT] %s: no such recipe, skipped\n", name.UTF8String); *why = nil; continue; }
+                return false;
+            }
             files[[name stringByAppendingPathExtension:@"materialrecipe"]] = data;
         }
         dir = sbmat_write_folder(files);
@@ -341,6 +349,10 @@ bool sbmat_dock_test_in_session(int mode, NSString **why)
         r_msg2_main(cache, "removeObjectForKey:", key, 0, 0, 0);
         printf("[SBMAT] cache entry %s: %s\n", name.UTF8String, had ? "removed" : "wasn't loaded");
         sbmat_cfrelease(key);
+    }
+    if (mode == 4) {
+        printf("[SBMAT] folder recipes overridden; existing views left as they are\n");
+        return true;
     }
     // Load the recipe again: the cache misses now and finds ours first.
     uint64_t layer = sbmat_dock_material_layer(NULL);
