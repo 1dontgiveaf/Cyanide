@@ -191,11 +191,30 @@ static uint64_t sbmat_write_folder(NSDictionary<NSString *, NSData *> *files)
     return dir;
 }
 
+// -description (or any NSString) of a remote object, on one line.
+static NSString *sbmat_describe(uint64_t str)
+{
+    char buf[900] = {0};
+    if (!r_is_objc_ptr(str) || !r_read_nsstring(str, buf, sizeof(buf))) return @"-";
+    NSString *s = @(buf);
+    while ([s containsString:@"  "]) s = [s stringByReplacingOccurrencesOfString:@"  " withString:@" "];
+    return [s stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+}
+
 static NSString *sbmat_class_name(uint64_t obj)
 {
-    uint64_t name = r_is_objc_ptr(obj) ? r_dlsym_call(R_TIMEOUT, "object_getClassName", obj, 0, 0, 0, 0, 0, 0, 0) : 0;
-    char buf[96] = {0};
-    return name && remote_read(name, buf, sizeof(buf) - 1) ? @(buf) : @"?";
+    uint64_t cls = r_is_objc_ptr(obj) ? r_dlsym_call(R_TIMEOUT, "object_getClass", obj, 0, 0, 0, 0, 0, 0, 0) : 0;
+    return cls ? sbmat_describe(r_dlsym_call(R_TIMEOUT, "NSStringFromClass", cls, 0, 0, 0, 0, 0, 0, 0)) : @"?";
+}
+
+// Value of a property through KVC (doubles come back boxed), described.
+static NSString *sbmat_kvc(uint64_t obj, const char *key)
+{
+    if (!r_is_objc_ptr(obj)) return @"-";
+    uint64_t k = r_cfstr(key);
+    uint64_t v = r_msg2_main(obj, "valueForKey:", k, 0, 0, 0);
+    sbmat_cfrelease(k);
+    return r_is_objc_ptr(v) ? sbmat_describe(r_msg2_main(v, "description", 0, 0, 0, 0)) : @"nil";
 }
 
 static NSString *sbmat_recipe_name(uint64_t layer)
@@ -263,6 +282,15 @@ bool sbmat_dock_test_in_session(int mode, NSString **why)
     r_msg2_main(bundleCls, "_setCoreMaterialOverrideRecipeBundleURL:", url, 0, 0, 0);
     uint64_t now = r_msg2_main(bundleCls, "coreMaterialOverrideRecipeBundleURL", 0, 0, 0, 0);
     printf("[SBMAT] override folder %s\n", r_is_objc_ptr(now) ? "set" : "cleared");
+    // Does CoreMaterial's own lookup find our file there?
+    uint64_t ob = r_responds(bundleCls, "coreMaterialOverrideRecipeBundle")
+        ? r_msg2_main(bundleCls, "coreMaterialOverrideRecipeBundle", 0, 0, 0, 0) : 0;
+    uint64_t dockKey = r_cfstr("dockDark");
+    uint64_t found = r_is_objc_ptr(ob) && r_responds(ob, "URLForMaterialRecipe:")
+        ? r_msg2_main(ob, "URLForMaterialRecipe:", dockKey, 0, 0, 0) : 0;
+    sbmat_cfrelease(dockKey);
+    printf("[SBMAT] override bundle %s, dockDark there: %s\n", sbmat_class_name(ob).UTF8String,
+           r_is_objc_ptr(found) ? sbmat_describe(r_msg2_main(found, "path", 0, 0, 0, 0)).UTF8String : "not found");
     if (dir) r_release(dir);
 
     for (NSString *name in names) {
@@ -278,21 +306,23 @@ bool sbmat_dock_test_in_session(int mode, NSString **why)
     if (!recipe) { *why = @"The dock's background wasn't found. Check the log."; return false; }
     uint64_t str = r_cfstr(recipe.UTF8String);
     uint64_t before = r_msg2_main(layer, "_recipeSettings", 0, 0, 0, 0);
+    printf("[SBMAT] dock layer filters before: %s\n", sbmat_kvc(layer, "filters").UTF8String);
     r_msg2_main(layer, "setRecipeName:", str, 0, 0, 0);
     uint64_t after = r_msg2_main(layer, "_recipeSettings", 0, 0, 0, 0);
     uint64_t cached = r_msg2_main(cache, "objectForKey:", str, 0, 0, 0);
     sbmat_cfrelease(str);
     // What the layer now uses, and a forced reconfigure in case it waits for one.
-    uint64_t desc = r_is_objc_ptr(after) ? r_msg2_main(after, "description", 0, 0, 0, 0) : 0;
-    char text[700] = {0};
-    if (r_is_objc_ptr(desc) && r_read_nsstring(desc, text, sizeof(text))) {
-        for (char *c = text; *c; c++) if (*c == '\n') *c = ' ';
-        printf("[SBMAT] dock settings now: %s\n", text);
-    }
+    uint64_t baseSettings = r_is_objc_ptr(after) ? r_msg2_main(after, "baseMaterialSettings", 0, 0, 0, 0) : 0;
+    // Only keys MTTintingFilteringMaterialSettings has: an unknown key throws in SpringBoard.
+    if (!r_msg2_main(baseSettings, "isKindOfClass:", r_class("MTTintingFilteringMaterialSettings"), 0, 0, 0)) baseSettings = 0;
+    printf("[SBMAT] dock settings now: blurRadius=%s tintColor=%s tintAlpha=%s\n",
+           sbmat_kvc(baseSettings, "blurRadius").UTF8String, sbmat_kvc(baseSettings, "tintColorDescription").UTF8String,
+           sbmat_kvc(baseSettings, "tintAlpha").UTF8String);
     if (r_responds_main(layer, "_updateForChangeInRecipeAndConfiguration"))
         r_msg2_main(layer, "_updateForChangeInRecipeAndConfiguration", 0, 0, 0, 0);
     r_msg2_main(layer, "setNeedsLayout", 0, 0, 0, 0);
     r_msg2_main(layer, "setNeedsDisplay", 0, 0, 0, 0);
+    printf("[SBMAT] dock layer filters after: %s\n", sbmat_kvc(layer, "filters").UTF8String);
     printf("[SBMAT] dock mode %d: recipe %s reloaded, settings %s (cache %s)\n", mode,
            recipe.UTF8String, before != after ? "replaced" : "unchanged", cached ? "refilled" : "empty");
     if (before == after) *why = @"The recipe was replaced, but the dock didn't reload it. Check the log.";
