@@ -1063,6 +1063,10 @@ NSString * const kSettingsSBCDockAppBundleID = @"SBCDockAppBundleID";
 
 NSString * const kSettingsPowercuffEnabled = @"PowercuffEnabled";
 NSString * const kSettingsPowercuffLevel   = @"PowercuffLevel";
+// Level thermalmonitord was last set to by Powercuff (absent: never / "off").
+// Turning Powercuff off sends "off" while this is set: thermalmonitord keeps
+// a simulated level until it restarts.
+static NSString * const kSettingsPowercuffAppliedLevel = @"PowercuffAppliedLevel";
 static NSString * const kSettingsPowercuffNominalNoticeShown = @"cyanide.powercuff.nominalDefaultNoticeShown.v1";
 
 NSString * const kSettingsDSDisableAppLibrary = @"DSDisableAppLibrary";
@@ -9425,6 +9429,9 @@ static void settings_run_actions_internal(BOOL pendingOnly)
         @try {
             BOOL patchSandboxExt = [d boolForKey:kSettingsRunPatchSandboxExt];
             BOOL runPowercuff = settings_enabled_tweak_should_run(d, kSettingsPowercuffEnabled, pendingOnly);
+            // Removed after it was applied: put thermalmonitord back to "off".
+            BOOL resetPowercuff = !runPowercuff && ![d boolForKey:kSettingsPowercuffEnabled] &&
+                                  [d stringForKey:kSettingsPowercuffAppliedLevel].length > 0;
             BOOL forceSpringBoardRefresh = runPowercuff &&
                                            settings_has_persistent_springboard_remote_call_user();
             BOOL springBoardPendingOnly = pendingOnly && !forceSpringBoardRefresh;
@@ -9474,16 +9481,16 @@ static void settings_run_actions_internal(BOOL pendingOnly)
             BOOL runSandboxEscape = [d boolForKey:kSettingsRunSandboxEscape] && (!pendingOnly || needsSpringBoardWork);
             BOOL needsSpringBoard = runSandboxEscape || needsSpringBoardWork || forceSpringBoardRefresh;
 
-            BOOL hasRunWork = patchSandboxExt || runPowercuff || needsSpringBoard;
+            BOOL hasRunWork = patchSandboxExt || runPowercuff || resetPowercuff || needsSpringBoard;
             BOOL skipKernelForVPhoneSpringBoardOnly =
                 cyanide_vphone_debug_build() &&
                 needsSpringBoard &&
                 !patchSandboxExt &&
-                !runPowercuff;
+                !runPowercuff && !resetPowercuff;
             BOOL needsKernelPrimitiveStage = hasRunWork && !skipKernelForVPhoneSpringBoardOnly;
             NSUInteger total = needsKernelPrimitiveStage ? 1 : 0;
             if (patchSandboxExt) total++;
-            if (runPowercuff) total++;
+            if (runPowercuff || resetPowercuff) total++;
             if (needsSpringBoard) total++;
             if (runSandboxEscape) total++;
             if (runSBC) total++;
@@ -9568,8 +9575,9 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                 escape_sbx_demo3();
                 log_user("[OK] Sandbox extension issue path patched.\n");
             }
-            if (runPowercuff) {
-                settings_progress(&step, total, "Applying Powercuff via thermalmonitord");
+            if (runPowercuff || resetPowercuff) {
+                settings_progress(&step, total, resetPowercuff ? "Turning Powercuff off via thermalmonitord"
+                                                               : "Applying Powercuff via thermalmonitord");
                 if (g_springboard_rc_ready || settings_any_registered_live_loop_running()) {
                     settings_request_all_live_loops_stop("Powercuff process switch");
                     settings_wait_live_loops_stopped_for_switch("Powercuff process switch");
@@ -9579,13 +9587,17 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                     // not run SpringBoard tweak stop paths or clear applied
                     // package state; enabled tweaks are reapplied below.
                     settings_destroy_springboard_remote_call_locked_internal("switching to thermalmonitord", NO);
-                    NSString *lvl = [d stringForKey:kSettingsPowercuffLevel] ?: @"nominal";
+                    NSString *lvl = resetPowercuff ? @"off" : ([d stringForKey:kSettingsPowercuffLevel] ?: @"nominal");
                     bool ok = powercuff_apply(lvl.UTF8String);
                     settings_mark_tweak_applied(kSettingsPowercuffEnabled,
                                                 ok && [d boolForKey:kSettingsPowercuffEnabled]);
-                    log_user("%s Powercuff %s through thermalmonitord.\n",
+                    if (ok) {
+                        if ([lvl isEqualToString:@"off"]) [d removeObjectForKey:kSettingsPowercuffAppliedLevel];
+                        else [d setObject:lvl forKey:kSettingsPowercuffAppliedLevel];
+                    }
+                    log_user("%s Powercuff %s through thermalmonitord (%s).\n",
                              ok ? "[OK]" : "[WARN]",
-                             ok ? "applied" : "did not apply cleanly");
+                             ok ? (resetPowercuff ? "turned off" : "applied") : "did not apply cleanly", lvl.UTF8String);
                     if (!ok) [runWarnings addObject:@"Powercuff"];
                 }
             }
@@ -18912,8 +18924,15 @@ void cyanide_present_contact(UIViewController *host)
 
     NSArray<NSString *> *levels = powercuff_levels();
     if (sender.selectedSegmentIndex < 0 || sender.selectedSegmentIndex >= (NSInteger)levels.count) return;
-    [[NSUserDefaults standardUserDefaults] setObject:levels[sender.selectedSegmentIndex]
-                                              forKey:kSettingsPowercuffLevel];
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setObject:levels[sender.selectedSegmentIndex] forKey:kSettingsPowercuffLevel];
+    // A new level is new desired state: without this, an Apply after the
+    // first one skipped Powercuff (already applied) and the old level stayed.
+    if ([d boolForKey:kSettingsPowercuffEnabled]) {
+        settings_mark_tweak_needs_apply(kSettingsPowercuffEnabled);
+        settings_notify_package_queue_changed_async();
+        log_user("[POWERCUFF] Level set to %s; apply to use it.\n", levels[sender.selectedSegmentIndex].UTF8String);
+    }
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath
