@@ -151,10 +151,15 @@ static NSData *sbmat_edited_recipe(NSString *name, SBMatMode mode, NSArray<NSNum
     } else {
         NSMutableDictionary *filtering = [base[@"materialFiltering"] isKindOfClass:NSDictionary.class]
             ? [base[@"materialFiltering"] mutableCopy] : [NSMutableDictionary dictionary];
-        filtering[@"blurRadius"] = @(MAX(blur, 0));
+        filtering[@"blurRadius"] = @(isfinite(blur) ? MIN(MAX(blur, 0), 100) : 0);
         base[@"materialFiltering"] = filtering;
-        double r = rgba.count > 0 ? rgba[0].doubleValue : 0, g = rgba.count > 1 ? rgba[1].doubleValue : 0;
-        double b = rgba.count > 2 ? rgba[2].doubleValue : 0, alpha = rgba.count > 3 ? rgba[3].doubleValue : 0.5;
+        // CoreMaterial asserts (and SpringBoard aborts) on a component outside
+        // 0…1; the color picker hands out extended sRGB (P3 colors go past it).
+        double (^unit)(NSUInteger, double) = ^double(NSUInteger i, double fallback) {
+            double v = i < rgba.count && [rgba[i] isKindOfClass:NSNumber.class] ? rgba[i].doubleValue : fallback;
+            return isfinite(v) ? MIN(MAX(v, 0.0), 1.0) : fallback;
+        };
+        double r = unit(0, 0), g = unit(1, 0), b = unit(2, 0), alpha = unit(3, 0.5);
         base[@"tinting"] = @{ @"tintAlpha": @(alpha),
                               @"tintColor": @{ @"alpha": @1.0, @"red": @(r), @"green": @(g), @"blue": @(b) } };
     }

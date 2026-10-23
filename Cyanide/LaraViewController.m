@@ -235,7 +235,10 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
     const SBMatItem *item = [self sbItemForSection:well.tag];
     CGFloat r = 0, g = 0, b = 0, a = 1;
     if (!item || ![well.selectedColor getRed:&r green:&g blue:&b alpha:&a]) return;
-    [self sbSet:@[ @(r), @(g), @(b), @(a) ] forKey:@"color" item:item];
+    // Extended sRGB: P3 colors come back below 0 or above 1; CoreMaterial
+    // only takes 0…1 (sbmat clamps too).
+    CGFloat (^unit)(CGFloat) = ^CGFloat(CGFloat v) { return MIN(MAX(v, 0), 1); };
+    [self sbSet:@[ @(unit(r)), @(unit(g)), @(unit(b)), @(unit(a)) ] forKey:@"color" item:item];
 }
 
 - (void)sbBlurChanged:(UISlider *)slider
