@@ -263,14 +263,20 @@ static NSString *sbmat_recipe_name(uint64_t layer)
     return r_is_objc_ptr(rn) && r_read_nsstring(rn, buf, sizeof(buf)) ? @(buf) : nil;
 }
 
-// The dock's material view, straight from the home screen's view
-// controllers (a view walk is too slow). 0 when not found.
-static uint64_t sbmat_dock_material_view(void)
+// The Home Screen's root folder view (pages and dock). 0 when not found.
+static uint64_t sbmat_root_folder_view(void)
 {
     uint64_t ctrl = r_msg2_main(r_class("SBIconController"), "sharedInstance", 0, 0, 0, 0);
     uint64_t mgr = r_is_objc_ptr(ctrl) ? r_msg2_main(ctrl, "iconManager", 0, 0, 0, 0) : 0;
     uint64_t root = r_is_objc_ptr(mgr) ? r_msg2_main(mgr, "rootFolderController", 0, 0, 0, 0) : 0;
-    uint64_t rootView = r_is_objc_ptr(root) ? r_msg2_main(root, "rootFolderView", 0, 0, 0, 0) : 0;
+    return r_is_objc_ptr(root) ? r_msg2_main(root, "rootFolderView", 0, 0, 0, 0) : 0;
+}
+
+// The dock's material view, straight from the home screen's view
+// controllers (a view walk is too slow). 0 when not found.
+static uint64_t sbmat_dock_material_view(void)
+{
+    uint64_t rootView = sbmat_root_folder_view();
     uint64_t dock = r_is_objc_ptr(rootView) && r_responds_main(rootView, "dockView")
         ? r_msg2_main(rootView, "dockView", 0, 0, 0, 0) : 0;
     uint64_t bg = r_is_objc_ptr(dock) && r_responds_main(dock, "backgroundView")
@@ -338,6 +344,44 @@ static int sbmat_reload_views_under(uint64_t root, NSSet<NSString *> *names, con
     printf("[SBMAT] %s: %d material view(s) [%s], %d reloaded\n", what, n,
            [list componentsJoinedByString:@", "].UTF8String, reloaded);
     return reloaded;
+}
+
+// Folder icons on the Home Screen and in the dock each have a material view
+// of their own (SBFolderIconImageView._backgroundView), kept as long as the
+// icon is: without a reload they keep whatever they were last built with.
+static void sbmat_reload_folder_icons(NSSet<NSString *> *names)
+{
+    uint64_t rootView = sbmat_root_folder_view();
+    if (!r_is_objc_ptr(rootView)) { printf("[SBMAT] folder icons: Home Screen not found\n"); return; }
+    uint64_t lists[48];
+    int nLists = 0;
+    uint64_t pages = r_responds_main(rootView, "iconListViews") ? r_msg2_main_retained(rootView, "iconListViews") : 0;
+    if (r_is_objc_ptr(pages)) {
+        nLists = r_array_items_of_class(pages, r_class("SBIconListView"), lists, 47);
+        r_release(pages);
+    }
+    uint64_t dockList = r_responds_main(rootView, "dockListView") ? r_msg2_main(rootView, "dockListView", 0, 0, 0, 0) : 0;
+    if (r_is_objc_ptr(dockList)) lists[nLists++] = dockList;
+    uint64_t iconViewCls = r_class("SBIconView"), folderImageCls = r_class("SBFolderIconImageView");
+    uint64_t materialCls = r_class("MTMaterialView");
+    static uint64_t icons[128];
+    int folders = 0, reloaded = 0;
+    NSMutableSet<NSString *> *seen = [NSMutableSet set];
+    for (int l = 0; l < nLists; l++) {
+        int n = sb_collect_views_main(lists[l], iconViewCls, icons, 128);
+        for (int i = 0; i < n; i++) {
+            uint64_t image = r_ivar_value(icons[i], "_iconImageView");
+            if (!r_is_objc_ptr(image) || !r_msg2_main(image, "isKindOfClass:", folderImageCls, 0, 0, 0)) continue;
+            folders++;
+            uint64_t bg = r_ivar_value(image, "_backgroundView");
+            if (!r_is_objc_ptr(bg) || !r_msg2_main(bg, "isKindOfClass:", materialCls, 0, 0, 0)) continue;
+            NSString *recipe = sbmat_recipe_name(r_msg2_main(bg, "layer", 0, 0, 0, 0));
+            [seen addObject:recipe ?: @"?"];
+            if (recipe && [names containsObject:recipe] && sbmat_reload_view(bg, true)) reloaded++;
+        }
+    }
+    printf("[SBMAT] folder icons: %d page(s), %d folder(s) [%s], %d reloaded\n", nLists, folders,
+           [seen.allObjects componentsJoinedByString:@", "].UTF8String, reloaded);
 }
 
 // Control Center keeps its views once it has been opened: reach them
@@ -530,6 +574,7 @@ bool sbmat_apply_in_session(NSDictionary<NSString *, NSDictionary *> *config, NS
     uint64_t dockView = sbmat_dock_material_view();
     bool dockOK = dockView && sbmat_reload_view(dockView, true);
     NSSet<NSString *> *managed = [NSSet setWithArray:allNames];
+    sbmat_reload_folder_icons(managed);
     sbmat_reload_control_center(managed);
     sbmat_reload_home_backdrop(managed);
     printf("[SBMAT] applied: %lu recipe(s) changed, dock %s\n", (unsigned long)files.count,
