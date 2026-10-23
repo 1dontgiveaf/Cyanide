@@ -167,25 +167,21 @@ static double sbmat_unit(NSArray<NSNumber *> *rgba, NSUInteger i, double fallbac
 //    backdrop off.
 //  - Color: the blur radius, and the tint as part of the filter (a color
 //    matrix: each channel becomes (1 - a) * itself + a * color), which is
-//    drawn with the material's rounding everywhere.
+//    drawn with the material's rounding everywhere -- or, plainTint, as a
+//    plain tint (Control Center's background: with the color matrix its
+//    fade made dismissing Control Center slow).
 //  - Visible: Apple's filter.
 // squareTint: a plain tint on top. Lock screen platters only capture their
 // backdrop for a shared group, and CoreMaterial draws a plain tint as such a
 // layer's background color, unrounded -- square notifications, on purpose.
 // nil when the system has no such recipe.
-// Test: lara's recipe for Color, exactly (rooootdev's ColorSwapManager.setColor):
-// no materialSettingsVersion (so CoreMaterial reads the older format) and the
-// tint nested inside materialFiltering, which replaces Apple's filter.
-static NSData *sbmat_lara_recipe(NSDictionary *plist, NSArray<NSNumber *> *rgba, double blur);
-
 static NSData *sbmat_edited_recipe(NSString *name, SBMatMode mode, NSArray<NSNumber *> *rgba, double blur,
-                                   NSArray<NSNumber *> *squareTint, bool laraFormat)
+                                   NSArray<NSNumber *> *squareTint, bool plainTint)
 {
     NSURL *url = sbmat_system_recipe_url(name);
     NSData *data = url ? [NSData dataWithContentsOfURL:url] : nil;
     NSDictionary *plist = data ? [NSPropertyListSerialization propertyListWithData:data options:0 format:NULL error:nil] : nil;
     if (![plist isKindOfClass:NSDictionary.class]) return nil;
-    if (laraFormat && mode == SBMatModeColor) return sbmat_lara_recipe(plist, rgba, blur);
     NSMutableDictionary *changed = [plist mutableCopy];
     NSMutableDictionary *base = [plist[@"baseMaterial"] isKindOfClass:NSDictionary.class] ? [plist[@"baseMaterial"] mutableCopy]
                                                                                        : [NSMutableDictionary dictionary];
@@ -198,13 +194,19 @@ static NSData *sbmat_edited_recipe(NSString *name, SBMatMode mode, NSArray<NSNum
         filtering[@"blurRadius"] = @(isfinite(blur) ? MIN(MAX(blur, 0), 100) : 0);
         double r = sbmat_unit(rgba, 0, 0), g = sbmat_unit(rgba, 1, 0), b = sbmat_unit(rgba, 2, 0), a = sbmat_unit(rgba, 3, 0.5);
         double k = 1.0 - a;
-        filtering[@"colorMatrix"] = @{
-            @"m11": @(k), @"m12": @0, @"m13": @0, @"m14": @0, @"m15": @(a * r),
-            @"m21": @0, @"m22": @(k), @"m23": @0, @"m24": @0, @"m25": @(a * g),
-            @"m31": @0, @"m32": @0, @"m33": @(k), @"m34": @0, @"m35": @(a * b),
-            @"m41": @0, @"m42": @0, @"m43": @0, @"m44": @1, @"m45": @0 };
-        base[@"materialFiltering"] = filtering;
-        [base removeObjectForKey:@"tinting"];
+        if (plainTint) {
+            base[@"materialFiltering"] = filtering;
+            base[@"tinting"] = @{ @"tintAlpha": @(a),
+                                  @"tintColor": @{ @"alpha": @1.0, @"red": @(r), @"green": @(g), @"blue": @(b) } };
+        } else {
+            filtering[@"colorMatrix"] = @{
+                @"m11": @(k), @"m12": @0, @"m13": @0, @"m14": @0, @"m15": @(a * r),
+                @"m21": @0, @"m22": @(k), @"m23": @0, @"m24": @0, @"m25": @(a * g),
+                @"m31": @0, @"m32": @0, @"m33": @(k), @"m34": @0, @"m35": @(a * b),
+                @"m41": @0, @"m42": @0, @"m43": @0, @"m44": @1, @"m45": @0 };
+            base[@"materialFiltering"] = filtering;
+            [base removeObjectForKey:@"tinting"];
+        }
     }
     if (squareTint) {
         base[@"tinting"] = @{ @"tintAlpha": @(sbmat_unit(squareTint, 3, 0.5)),
@@ -214,36 +216,6 @@ static NSData *sbmat_edited_recipe(NSString *name, SBMatMode mode, NSArray<NSNum
     }
     changed[@"baseMaterial"] = base;
     return [NSPropertyListSerialization dataWithPropertyList:changed format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
-}
-
-// lara's changeValue: every key named `key`, at any depth, replaced by
-// `newKey: replacement`.
-static id sbmat_lara_change(id obj, NSString *key, NSString *newKey, id replacement)
-{
-    if (![obj isKindOfClass:NSDictionary.class]) return obj;
-    NSMutableDictionary *out = [NSMutableDictionary dictionary];
-    [(NSDictionary *)obj enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
-        if ([k isEqual:key]) out[newKey] = replacement;
-        else out[k] = sbmat_lara_change(v, key, newKey, replacement);
-    }];
-    return out;
-}
-
-static NSData *sbmat_lara_recipe(NSDictionary *plist, NSArray<NSNumber *> *rgba, double blur)
-{
-    NSMutableDictionary *changed = [plist mutableCopy];
-    [changed removeObjectsForKeys:@[ @"materialSettingsVersion", @"visualStyleSetVersion", @"MdC" ]];
-    double a = sbmat_unit(rgba, 3, 0.5);   // lara's alpha multiplier for notifications is 1
-    NSDictionary *tinting = @{ @"tintAlpha": @(a),
-                               @"tintColor": @{ @"alpha": @(a), @"red": @(sbmat_unit(rgba, 0, 0)),
-                                                @"green": @(sbmat_unit(rgba, 1, 0)), @"blue": @(sbmat_unit(rgba, 2, 0)) } };
-    NSNumber *radius = @((NSInteger)(isfinite(blur) ? MIN(MAX(blur, 0), 100) : 0));
-    id out = sbmat_lara_change(changed, @"blurRadius", @"blurRadius", radius);
-    out = sbmat_lara_change(out, @"materialFiltering", @"materialFiltering", @{ @"blurRadius": radius, @"tinting": tinting });
-    out = sbmat_lara_change(out, @"filtering", @"tinting", tinting);
-    printf("[SBMAT] lara format: %s\n",
-           [[[out description] componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet] componentsJoinedByString:@" "].UTF8String);
-    return [NSPropertyListSerialization dataWithPropertyList:out format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
 }
 
 #pragma mark - SpringBoard
@@ -418,14 +390,14 @@ NSString * const kSBMatConfigKey = @"CYSpringBoardToolsConfig";
 NSString * const kSBMatSquaresKey = @"CYSpringBoardToolsSquares";
 
 static const SBMatItem kSBMatItems[] = {
-    { "dock",         "Dock",                   "dock.rectangle",              "dockDark,dockLight", 30 },
-    { "folder",       "Folder Background",      "folder",                      "folderDark,folderLight,folderDarkSimplified,folderLightSimplified", 30 },
-    { "folderBlur",   "Folder Blur",            "folder.circle",               "folderExpandedBackgroundHome,folderExpandedBackgroundHomeSimplified,homeScreenOverlay", 9 },
-    { "ccModules",    "Control Center Modules", "switch.2",                    "modulesSheer", 15 },
-    { "ccBackground", "Control Center Blur",    "square.on.square",            "modulesBackground", 30 },
-    { "switcher",     "App Switcher Blur",      "apps.iphone",                 "homeScreenBackdrop-application", 20 },
-    { "notifications","Notification Banners",   "platter.filled.top.iphone",   "platters,plattersDark", 30 },
-    { NULL, NULL, NULL, NULL, 0 },
+    { "dock",         "Dock",                   "dock.rectangle",              "dockDark,dockLight", 30, false },
+    { "folder",       "Folder Background",      "folder",                      "folderDark,folderLight,folderDarkSimplified,folderLightSimplified", 30, false },
+    { "folderBlur",   "Folder Blur",            "folder.circle",               "folderExpandedBackgroundHome,folderExpandedBackgroundHomeSimplified,homeScreenOverlay", 9, false },
+    { "ccModules",    "Control Center Modules", "switch.2",                    "modulesSheer", 15, false },
+    { "ccBackground", "Control Center Blur",    "square.on.square",            "modulesBackground", 25, true },
+    { "switcher",     "App Switcher Blur",      "apps.iphone",                 "homeScreenBackdrop-application", 20, false },
+    { "notifications","Notification Banners",   "platter.filled.top.iphone",   "platters,plattersDark", 30, false },
+    { NULL, NULL, NULL, NULL, 0, false },
 };
 
 const SBMatItem *sbmat_items(void) { return kSBMatItems; }
@@ -458,12 +430,12 @@ bool sbmat_apply_in_session(NSDictionary<NSString *, NSDictionary *> *config, NS
                                           [rgba componentsJoinedByString:@","] ?: @"default"] UTF8String] : "");
         bool isNotifications = !strcmp(item->key, "notifications");
         NSArray *itemSquare = isNotifications ? squareTint : nil;
-        bool laraFormat = isNotifications && [c[@"lara"] boolValue];
+
         if (mode == SBMatModeDisabled) [disabled addObjectsFromArray:sbmat_item_recipes(item)];
         for (NSString *name in sbmat_item_recipes(item)) {
             [allNames addObject:name];
             if (mode == SBMatModeVisible && !itemSquare) continue;
-            NSData *data = sbmat_edited_recipe(name, mode, rgba, blur, itemSquare, laraFormat);
+            NSData *data = sbmat_edited_recipe(name, mode, rgba, blur, itemSquare, item->plainTint);
             if (data) { files[[name stringByAppendingPathExtension:@"materialrecipe"]] = data; continue; }
             // A descendant recipe: ours points at an edited copy of its
             // ancestor (under our own name) and keeps Apple's changes --
@@ -472,7 +444,7 @@ bool sbmat_apply_in_session(NSDictionary<NSString *, NSDictionary *> *config, NS
             // dismissing Control Center got slow. Only the blur radius is ours.
             NSDictionary *desc = sbmat_system_descendant(name);
             NSString *ancestor = [desc[@"ancestorRecipe"] isKindOfClass:NSString.class] ? desc[@"ancestorRecipe"] : nil;
-            NSData *base = ancestor ? sbmat_edited_recipe(ancestor, mode, rgba, blur, itemSquare, false) : nil;
+            NSData *base = ancestor ? sbmat_edited_recipe(ancestor, mode, rgba, blur, itemSquare, item->plainTint) : nil;
             if (!base) { printf("[SBMAT] %s: not on this iOS version, skipped\n", name.UTF8String); continue; }
             printf("[SBMAT] %s: descendant of %s, original: %s\n", name.UTF8String, ancestor.UTF8String,
                    [[desc.description componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet] componentsJoinedByString:@" "].UTF8String);
