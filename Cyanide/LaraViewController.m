@@ -226,11 +226,14 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
 {
     const SBMatItem *item = [self sbItemForSection:seg.tag];
     if (!item) return;
-    // Items without Color have two segments: Visible, Disabled.
-    SBMatMode mode = item->allowsColor ? (SBMatMode)seg.selectedSegmentIndex
-                                       : (seg.selectedSegmentIndex == 1 ? SBMatModeDisabled : SBMatModeVisible);
-    [self sbSet:@(mode) forKey:@"mode" item:item];
+    [self sbSet:@(seg.selectedSegmentIndex) forKey:@"mode" item:item];
     [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:seg.tag] withRowAnimation:UITableViewRowAnimationAutomatic];
+}
+
+- (void)sbSquareChanged:(UISwitch *)sw
+{
+    const SBMatItem *item = [self sbItemForSection:sw.tag];
+    if (item) [self sbSet:@(sw.on) forKey:@"square" item:item];
 }
 
 - (void)sbColorChanged:(UIColorWell *)well
@@ -288,7 +291,8 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
         case LaraToolSpringBoard: {
             if (section == 0) return 2;
             const SBMatItem *item = [self sbItemForSection:section];
-            return item && item->allowsColor && [[self sbChoiceFor:item][@"mode"] integerValue] == SBMatModeColor ? 3 : 1;
+            if (!item || [[self sbChoiceFor:item][@"mode"] integerValue] != SBMatModeColor) return 1;
+            return item->squareOption ? 4 : 3;   // mode, tint, blur (, square)
         }
         case LaraToolHiddenSettings: {
             NSInteger n = 0;
@@ -387,10 +391,8 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             if (!item) break;
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
             if (indexPath.row == 0) {
-                NSInteger mode = MIN(MAX([[self sbChoiceFor:item][@"mode"] integerValue], 0), 2);
-                UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:item->allowsColor
-                    ? @[ @"Visible", @"Color", @"Disabled" ] : @[ @"Visible", @"Disabled" ]];
-                seg.selectedSegmentIndex = item->allowsColor ? mode : (mode == SBMatModeDisabled ? 1 : 0);
+                UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:@[ @"Visible", @"Color", @"Disabled" ]];
+                seg.selectedSegmentIndex = MIN(MAX([[self sbChoiceFor:item][@"mode"] integerValue], 0), 2);
                 seg.tag = indexPath.section;
                 seg.enabled = !self.busy;
                 [seg addTarget:self action:@selector(sbModeChanged:) forControlEvents:UIControlEventValueChanged];
@@ -415,6 +417,15 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
                 [well addTarget:self action:@selector(sbColorChanged:) forControlEvents:UIControlEventValueChanged];
                 [well sizeToFit];
                 cell.accessoryView = well;
+            } else if (indexPath.row == 3) {
+                c.text = @"Square on Lock Screen";
+                c.secondaryText = @"A plain tint: lock screen notifications and their buttons become square.";
+                c.secondaryTextProperties.color = UIColor.secondaryLabelColor;
+                UISwitch *sw = [UISwitch new];
+                sw.on = [[self sbChoiceFor:item][@"square"] boolValue];
+                sw.tag = indexPath.section;
+                [sw addTarget:self action:@selector(sbSquareChanged:) forControlEvents:UIControlEventValueChanged];
+                cell.accessoryView = sw;
             } else {
                 c.text = @"Blur";
                 c.secondaryText = [NSString stringWithFormat:@"%.0f", [self sbBlurFor:item]];

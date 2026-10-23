@@ -157,7 +157,7 @@ static uint64_t sbmat_cache_slot(NSString *probe)
 // baseMaterial.tinting; materialSettingsVersion stays (it names the format).
 // Disabled: no blur and no tint, an identity, so CoreMaterial switches the
 // backdrop off. nil when the system has no such recipe.
-static NSData *sbmat_edited_recipe(NSString *name, SBMatMode mode, NSArray<NSNumber *> *rgba, double blur)
+static NSData *sbmat_edited_recipe(NSString *name, SBMatMode mode, NSArray<NSNumber *> *rgba, double blur, bool filterTint)
 {
     NSURL *url = sbmat_system_recipe_url(name);
     NSData *data = url ? [NSData dataWithContentsOfURL:url] : nil;
@@ -184,8 +184,21 @@ static NSData *sbmat_edited_recipe(NSString *name, SBMatMode mode, NSArray<NSNum
             return isfinite(v) ? MIN(MAX(v, 0.0), 1.0) : fallback;
         };
         double r = unit(0, 0), g = unit(1, 0), b = unit(2, 0), alpha = unit(3, 0.5);
-        base[@"tinting"] = @{ @"tintAlpha": @(alpha),
-                              @"tintColor": @{ @"alpha": @1.0, @"red": @(r), @"green": @(g), @"blue": @(b) } };
+        if (filterTint) {
+            // The tint as part of the backdrop filter: each channel becomes
+            // (1 - a) * itself + a * color. Drawn by the layer that does the
+            // rounding, unlike a plain tint on a capture-only layer.
+            double k = 1.0 - alpha;
+            filtering[@"colorMatrix"] = @{
+                @"m11": @(k), @"m12": @0, @"m13": @0, @"m14": @0, @"m15": @(alpha * r),
+                @"m21": @0, @"m22": @(k), @"m23": @0, @"m24": @0, @"m25": @(alpha * g),
+                @"m31": @0, @"m32": @0, @"m33": @(k), @"m34": @0, @"m35": @(alpha * b),
+                @"m41": @0, @"m42": @0, @"m43": @0, @"m44": @1, @"m45": @0 };
+            [base removeObjectForKey:@"tinting"];
+        } else {
+            base[@"tinting"] = @{ @"tintAlpha": @(alpha),
+                                  @"tintColor": @{ @"alpha": @1.0, @"red": @(r), @"green": @(g), @"blue": @(b) } };
+        }
     }
     changed[@"baseMaterial"] = base;
     return [NSPropertyListSerialization dataWithPropertyList:changed format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
@@ -343,17 +356,17 @@ static void sbmat_reload_home_backdrop(NSSet<NSString *> *names)
 
 NSString * const kSBMatConfigKey = @"CYSpringBoardToolsConfig";
 
-// Notification platters only capture their backdrop for a shared group; for
-// those CoreMaterial puts the tint into the layer's background color, which
-// isn't rounded -- so they get Visible / Disabled only.
+// Notification platters on the lock screen only capture their backdrop for a
+// shared group; CoreMaterial then draws a plain tint as the layer's background
+// color, which isn't rounded -- offered as an option ("square").
 static const SBMatItem kSBMatItems[] = {
-    { "dock",         "Dock",                   "dock.rectangle",              "dockDark,dockLight", 30, true },
-    { "folder",       "Folder Background",      "folder",                      "folderDark,folderLight,folderDarkSimplified,folderLightSimplified", 30, true },
-    { "folderBlur",   "Folder Blur",            "folder.circle",               "folderExpandedBackgroundHome,folderExpandedBackgroundHomeSimplified,homeScreenOverlay", 9, true },
-    { "ccModules",    "Control Center Modules", "switch.2",                    "modulesSheer", 30, true },
-    { "ccBackground", "Control Center Blur",    "square.on.square",            "modulesBackground", 30, true },
-    { "switcher",     "App Switcher Blur",      "apps.iphone",                 "homeScreenBackdrop-application", 20, true },
-    { "notifications","Notification Banners",   "platter.filled.top.iphone",   "platters,plattersDark", 30, false },
+    { "dock",         "Dock",                   "dock.rectangle",              "dockDark,dockLight", 30, false },
+    { "folder",       "Folder Background",      "folder",                      "folderDark,folderLight,folderDarkSimplified,folderLightSimplified", 30, false },
+    { "folderBlur",   "Folder Blur",            "folder.circle",               "folderExpandedBackgroundHome,folderExpandedBackgroundHomeSimplified,homeScreenOverlay", 9, false },
+    { "ccModules",    "Control Center Modules", "switch.2",                    "modulesSheer", 30, false },
+    { "ccBackground", "Control Center Blur",    "square.on.square",            "modulesBackground", 30, false },
+    { "switcher",     "App Switcher Blur",      "apps.iphone",                 "homeScreenBackdrop-application", 20, false },
+    { "notifications","Notification Banners",   "platter.filled.top.iphone",   "platters,plattersDark", 30, true },
     { NULL, NULL, NULL, NULL, 0, false },
 };
 
@@ -380,17 +393,19 @@ bool sbmat_apply_in_session(NSDictionary<NSString *, NSDictionary *> *config, NS
         printf("[SBMAT] %s: %s%s\n", item->key, mode == SBMatModeColor ? "Color" : mode == SBMatModeDisabled ? "Disabled" : "Visible",
                mode == SBMatModeColor ? [[NSString stringWithFormat:@" blur=%.0f tint=%@", blur,
                                           [rgba componentsJoinedByString:@","] ?: @"default"] UTF8String] : "");
-        if (!item->allowsColor && mode == SBMatModeColor) mode = SBMatModeVisible;
+        // Color tints through the filter's color matrix, which is drawn with
+        // the material's rounding everywhere; "square" uses a plain tint.
+        bool filterTint = !(item->squareOption && [c[@"square"] boolValue]);
         for (NSString *name in sbmat_item_recipes(item)) {
             [allNames addObject:name];
             if (mode == SBMatModeVisible) continue;
-            NSData *data = sbmat_edited_recipe(name, mode, rgba, blur);
+            NSData *data = sbmat_edited_recipe(name, mode, rgba, blur, filterTint);
             if (data) { files[[name stringByAppendingPathExtension:@"materialrecipe"]] = data; continue; }
             // A descendant recipe: ours points at an edited copy of its
             // ancestor (under our own name) and adds no changes of its own.
             NSDictionary *desc = sbmat_system_descendant(name);
             NSString *ancestor = [desc[@"ancestorRecipe"] isKindOfClass:NSString.class] ? desc[@"ancestorRecipe"] : nil;
-            NSData *base = ancestor ? sbmat_edited_recipe(ancestor, mode, rgba, blur) : nil;
+            NSData *base = ancestor ? sbmat_edited_recipe(ancestor, mode, rgba, blur, filterTint) : nil;
             if (!base) { printf("[SBMAT] %s: not on this iOS version, skipped\n", name.UTF8String); continue; }
             printf("[SBMAT] %s: descendant of %s, original: %s\n", name.UTF8String, ancestor.UTF8String,
                    [[desc.description componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet] componentsJoinedByString:@" "].UTF8String);

@@ -25,14 +25,15 @@ typedef struct {
     const char *icon;        // SF Symbol
     const char *recipes;     // comma-separated recipe names
     double defaultBlur;      // blur radius offered for Color
-    bool allowsColor;        // false: Visible / Disabled only (a tint would be drawn unrounded)
+    bool squareOption;       // offers "square": a plain tint, which the lock screen draws unrounded
 } SBMatItem;
 
 // The items, terminated by an entry with key == NULL.
 const SBMatItem *sbmat_items(void);
 
 // NSUserDefaults key of the saved config: item key -> @{ @"mode": @(SBMatMode),
-// @"color": @[r, g, b, a] (0…1), @"blur": @(radius) }. Missing items are Visible.
+// @"color": @[r, g, b, a] (0…1), @"blur": @(radius), @"square": @YES
+// (squareOption items only) }. Missing items are Visible.
 extern NSString * const kSBMatConfigKey;
 
 // Applies `config` in SpringBoard (inside an open RemoteCall session; caller
