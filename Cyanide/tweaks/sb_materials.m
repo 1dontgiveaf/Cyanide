@@ -26,6 +26,7 @@
 #import "remote_objc.h"
 #import "../TaskRop/RemoteCall.h"
 #import "../LogTextView.h"
+#import "sb_walk.h"
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
@@ -262,6 +263,48 @@ static bool sbmat_reload_view(uint64_t view)
     return before != after;
 }
 
+// Existing material views under `root` whose recipe is one of `names`,
+// reloaded (main-thread walk: only for small subtrees).
+static int sbmat_reload_views_under(uint64_t root, NSSet<NSString *> *names, const char *what)
+{
+    if (!r_is_objc_ptr(root)) { printf("[SBMAT] %s: not loaded, nothing to reload\n", what); return 0; }
+    static uint64_t views[256];
+    int n = sb_collect_views_main(root, r_class("MTMaterialView"), views, 256);
+    int reloaded = 0;
+    for (int i = 0; i < n; i++) {
+        uint64_t layer = r_msg2_main(views[i], "layer", 0, 0, 0, 0);
+        NSString *recipe = sbmat_recipe_name(layer);
+        if (recipe && [names containsObject:recipe] && sbmat_reload_view(views[i])) reloaded++;
+    }
+    printf("[SBMAT] %s: %d material view(s), %d reloaded\n", what, n, reloaded);
+    return reloaded;
+}
+
+// Control Center keeps its views once it has been opened.
+static void sbmat_reload_control_center(NSSet<NSString *> *names)
+{
+    uint64_t cc = r_msg2_main(r_class("SBControlCenterController"), "sharedInstance", 0, 0, 0, 0);
+    uint64_t vc = r_is_objc_ptr(cc) && r_responds_main(cc, "viewController") ? r_msg2_main(cc, "viewController", 0, 0, 0, 0) : 0;
+    bool loaded = r_is_objc_ptr(vc) && r_msg2_main(vc, "isViewLoaded", 0, 0, 0, 0);
+    sbmat_reload_views_under(loaded ? r_msg2_main(vc, "view", 0, 0, 0, 0) : 0, names, "Control Center");
+}
+
+// The blur behind the app switcher (and over the Home Screen): one
+// long-lived SBHomeScreenBackdropView with its own material view and a
+// blurred snapshot it reuses.
+static void sbmat_reload_home_backdrop(NSSet<NSString *> *names)
+{
+    uint64_t ui = r_msg2_main(r_class("SBUIController"), "sharedInstance", 0, 0, 0, 0);
+    uint64_t backdrop = r_is_objc_ptr(ui) ? r_ivar_value(ui, "_homeScreenBackdropView") : 0;
+    uint64_t material = r_is_objc_ptr(backdrop) ? r_ivar_value(backdrop, "_materialView") : 0;
+    NSString *recipe = r_is_objc_ptr(material) ? sbmat_recipe_name(r_msg2_main(material, "layer", 0, 0, 0, 0)) : nil;
+    bool reloaded = recipe && [names containsObject:recipe] && sbmat_reload_view(material);
+    if (r_is_objc_ptr(backdrop) && r_responds_main(backdrop, "_invalidateBackdropSnapshot"))
+        r_msg2_main(backdrop, "_invalidateBackdropSnapshot", 0, 0, 0, 0);
+    printf("[SBMAT] home screen backdrop: %s, material %s (%s)\n", r_is_objc_ptr(backdrop) ? "found" : "not found",
+           reloaded ? "reloaded" : "not reloaded", (recipe ?: @"none yet").UTF8String);
+}
+
 #pragma mark - Items and apply
 
 NSString * const kSBMatConfigKey = @"CYSpringBoardToolsConfig";
@@ -297,6 +340,9 @@ bool sbmat_apply_in_session(NSDictionary<NSString *, NSDictionary *> *config, NS
         SBMatMode mode = (SBMatMode)[c[@"mode"] integerValue];
         NSArray *rgba = [c[@"color"] isKindOfClass:NSArray.class] ? c[@"color"] : nil;
         double blur = c[@"blur"] ? [c[@"blur"] doubleValue] : item->defaultBlur;
+        printf("[SBMAT] %s: %s%s\n", item->key, mode == SBMatModeColor ? "Color" : mode == SBMatModeDisabled ? "Disabled" : "Visible",
+               mode == SBMatModeColor ? [[NSString stringWithFormat:@" blur=%.0f tint=%@", blur,
+                                          [rgba componentsJoinedByString:@","] ?: @"default"] UTF8String] : "");
         for (NSString *name in sbmat_item_recipes(item)) {
             [allNames addObject:name];
             if (mode == SBMatModeVisible) continue;
@@ -366,11 +412,14 @@ bool sbmat_apply_in_session(NSDictionary<NSString *, NSDictionary *> *config, NS
         r_release(probe);
     }
 
-    // 4. Views that already exist: the dock. Folders, Control Center,
-    //    banners and the app switcher are made when needed and get the new
-    //    recipes from the cache.
+    // 4. Views that already exist: the dock, Control Center (once opened)
+    //    and the Home Screen backdrop behind the app switcher. Folders and
+    //    banners are made when needed and get the new recipes from the cache.
     uint64_t dockView = sbmat_dock_material_view();
     bool dockOK = dockView && sbmat_reload_view(dockView);
+    NSSet<NSString *> *managed = [NSSet setWithArray:allNames];
+    sbmat_reload_control_center(managed);
+    sbmat_reload_home_backdrop(managed);
     printf("[SBMAT] applied: %lu recipe(s) changed, dock %s\n", (unsigned long)files.count,
            dockOK ? "reloaded" : dockView ? "not reloaded" : "not found");
     return true;
