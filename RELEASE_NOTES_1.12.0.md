@@ -11,7 +11,7 @@
 - **SpringBoard Tools** (Settings → Lara). Idea from [lara](https://github.com/rooootdev/lara) by rooootdev, built differently: nothing in `/System` is changed.
   - Dock, Folder Background, Folder Blur, Control Center Modules, Control Center Blur, App Switcher Blur and Notification Banners.
   - Each one **Visible** (Apple's look), **Color** (your own tint and blur) or **Disabled** (no background).
-  - Tap **Apply**: the dock, Control Center and the app switcher change right away; folders and notifications the next time they appear. A respring undoes everything, so apply again after one.
+  - Tap **Apply**: the dock, folder icons, Control Center and the app switcher change right away; opened folders and notifications the next time they appear. A respring undoes everything, so apply again after one.
 
 ## Fixes
 
