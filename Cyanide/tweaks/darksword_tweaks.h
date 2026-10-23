@@ -12,6 +12,10 @@ bool darksword_tweak_disable_icon_fly_in_in_session(void);
 bool darksword_tweak_zero_wake_animation_in_session(void);
 bool darksword_tweak_zero_backlight_fade_in_session(void);
 bool darksword_tweak_double_tap_to_lock_in_session(void);
+// No blue "new" dot next to the names of newly installed or updated apps:
+// clears the existing ones (SpringBoard's own clear, which also drops their
+// stored state) and makes SBApplication report none until the next respring.
+bool darksword_tweak_hide_new_app_dots_in_session(void);
 
 // Extends the lock-screen idle timer (the short "dim then sleep" countdown
 // that is separate from Settings > Auto-Lock) to the given number of seconds.

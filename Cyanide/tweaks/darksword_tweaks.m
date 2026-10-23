@@ -590,6 +590,28 @@ bool darksword_tweak_disable_icon_fly_in_in_session(void)
     return ok;
 }
 
+bool darksword_tweak_hide_new_app_dots_in_session(void)
+{
+    printf("[DST:DOTS] hiding new app dots\n");
+    // Future ones: the apps' own answer is "not new" until the next respring.
+    bool newly = ds_force_method_zero("SBApplication", "_isNewlyInstalled");
+    bool updated = ds_force_method_zero("SBApplication", "_isRecentlyUpdated");
+
+    // Existing ones: SpringBoard's own clear (what its home screen service
+    // offers other processes), which drops the stored state and refreshes the
+    // icons.
+    uint64_t app = r_msg2(r_class("UIApplication"), "sharedApplication", 0, 0, 0, 0);
+    uint64_t service = r_is_objc_ptr(app) ? r_ivar_value(app, "_homeScreenService") : 0;
+    bool cleared = false;
+    if (r_is_objc_ptr(service) && r_responds(service, "clearNewlyInstalledAndRecentlyUpdatedAppIndicators")) {
+        r_msg2_main(service, "clearNewlyInstalledAndRecentlyUpdatedAppIndicators", 0, 0, 0, 0);
+        cleared = r_last_main_ok();
+    }
+    printf("[DST:DOTS] hooks newlyInstalled=%d recentlyUpdated=%d, existing cleared=%d (service=%d)\n",
+           newly, updated, cleared, r_is_objc_ptr(service));
+    return cleared || (newly && updated);
+}
+
 bool darksword_tweak_zero_backlight_fade_in_session(void)
 {
     printf("[DST:BLF] zeroing backlight fade durations\n");

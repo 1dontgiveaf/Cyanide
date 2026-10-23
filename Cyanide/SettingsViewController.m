@@ -1071,6 +1071,7 @@ static NSString * const kSettingsPowercuffNominalNoticeShown = @"cyanide.powercu
 
 NSString * const kSettingsDSDisableAppLibrary = @"DSDisableAppLibrary";
 NSString * const kSettingsDSDisableIconFlyIn  = @"DSDisableIconFlyIn";
+NSString * const kSettingsDSHideNewAppDots    = @"DSHideNewAppDots";
 NSString * const kSettingsDSZeroWakeAnimation = @"DSZeroWakeAnimation";
 NSString * const kSettingsDSZeroBacklightFade = @"DSZeroBacklightFade";
 NSString * const kSettingsDSDoubleTapToLock   = @"DSDoubleTapToLock";
@@ -2055,6 +2056,7 @@ static NSArray<NSString *> *settings_rc_backed_tweak_keys(void)
             kSettingsPowercuffEnabled,
             kSettingsDSDisableAppLibrary,
             kSettingsDSDisableIconFlyIn,
+            kSettingsDSHideNewAppDots,
             kSettingsDSZeroWakeAnimation,
             kSettingsDSZeroBacklightFade,
             kSettingsDSDoubleTapToLock,
@@ -4615,6 +4617,7 @@ static BOOL settings_dark_tweaks_any_enabled(NSUserDefaults *d)
 {
     return [d boolForKey:kSettingsDSDisableAppLibrary] ||
            [d boolForKey:kSettingsDSDisableIconFlyIn] ||
+           [d boolForKey:kSettingsDSHideNewAppDots] ||
            [d boolForKey:kSettingsDSZeroWakeAnimation] ||
            [d boolForKey:kSettingsDSZeroBacklightFade] ||
            [d boolForKey:kSettingsDSDoubleTapToLock];
@@ -4780,6 +4783,7 @@ static BOOL settings_dark_tweaks_should_run(NSUserDefaults *d, BOOL pendingOnly)
     NSArray<NSString *> *keys = @[
         kSettingsDSDisableAppLibrary,
         kSettingsDSDisableIconFlyIn,
+        kSettingsDSHideNewAppDots,
         kSettingsDSZeroWakeAnimation,
         kSettingsDSZeroBacklightFade,
         kSettingsDSDoubleTapToLock,
@@ -4795,6 +4799,7 @@ typedef struct {
     bool any;
     bool disableAppLibrary;
     bool disableIconFlyIn;
+    bool hideNewAppDots;
     bool zeroWakeAnimation;
     bool zeroBacklightFade;
     bool doubleTapToLock;
@@ -4806,6 +4811,7 @@ static bool settings_dark_tweaks_result_all_ok(SettingsDarkTweaksResult result)
     return result.any &&
            result.disableAppLibrary &&
            result.disableIconFlyIn &&
+           result.hideNewAppDots &&
            result.zeroWakeAnimation &&
            result.zeroBacklightFade &&
            result.doubleTapToLock &&
@@ -4820,6 +4826,7 @@ static SettingsDarkTweaksResult settings_apply_dark_tweaks_from_defaults_locked(
     // if it does not work the tweak reports failure rather than misbehaving.
     BOOL disableAppLibrary = [d boolForKey:kSettingsDSDisableAppLibrary];
     BOOL disableIconFlyIn = [d boolForKey:kSettingsDSDisableIconFlyIn];
+    BOOL hideNewAppDots = [d boolForKey:kSettingsDSHideNewAppDots];
     BOOL zeroWakeAnimation = [d boolForKey:kSettingsDSZeroWakeAnimation];
     BOOL zeroBacklightFade = [d boolForKey:kSettingsDSZeroBacklightFade];
     BOOL doubleTapToLock = [d boolForKey:kSettingsDSDoubleTapToLock];
@@ -4827,6 +4834,7 @@ static SettingsDarkTweaksResult settings_apply_dark_tweaks_from_defaults_locked(
     SettingsDarkTweaksResult result = {
         .disableAppLibrary = true,
         .disableIconFlyIn = true,
+        .hideNewAppDots = true,
         .zeroWakeAnimation = true,
         .zeroBacklightFade = true,
         .doubleTapToLock = true,
@@ -4848,6 +4856,10 @@ static SettingsDarkTweaksResult settings_apply_dark_tweaks_from_defaults_locked(
     if (disableIconFlyIn) {
         result.any = true;
         result.disableIconFlyIn = darksword_tweak_disable_icon_fly_in_in_session();
+    }
+    if (hideNewAppDots) {
+        result.any = true;
+        result.hideNewAppDots = darksword_tweak_hide_new_app_dots_in_session();
     }
     if (zeroWakeAnimation) {
         result.any = true;
@@ -8602,6 +8614,7 @@ static BOOL settings_key_is_dark_tweak(NSString *key)
 {
     return [key isEqualToString:kSettingsDSDisableAppLibrary] ||
            [key isEqualToString:kSettingsDSDisableIconFlyIn] ||
+           [key isEqualToString:kSettingsDSHideNewAppDots] ||
            [key isEqualToString:kSettingsDSZeroWakeAnimation] ||
            [key isEqualToString:kSettingsDSZeroBacklightFade] ||
            [key isEqualToString:kSettingsDSDoubleTapToLock] ||
@@ -8949,6 +8962,8 @@ static void settings_schedule_live_apply_for_key(NSString *key)
                     settings_mark_tweak_applied(kSettingsDSDisableAppLibrary, result.disableAppLibrary);
                 if ([d boolForKey:kSettingsDSDisableIconFlyIn])
                     settings_mark_tweak_applied(kSettingsDSDisableIconFlyIn, result.disableIconFlyIn);
+                if ([d boolForKey:kSettingsDSHideNewAppDots])
+                    settings_mark_tweak_applied(kSettingsDSHideNewAppDots, result.hideNewAppDots);
                 if ([d boolForKey:kSettingsDSZeroWakeAnimation])
                     settings_mark_tweak_applied(kSettingsDSZeroWakeAnimation, result.zeroWakeAnimation);
                 if ([d boolForKey:kSettingsDSZeroBacklightFade])
@@ -9149,6 +9164,7 @@ void settings_register_defaults(void)
 
         kSettingsDSDisableAppLibrary: @NO,
         kSettingsDSDisableIconFlyIn:  @NO,
+        kSettingsDSHideNewAppDots:    @NO,
         kSettingsDSZeroWakeAnimation: @NO,
         kSettingsDSZeroBacklightFade: @NO,
         kSettingsDSDoubleTapToLock:   @NO,
@@ -9650,6 +9666,8 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                             settings_mark_tweak_applied(kSettingsDSDisableAppLibrary, result.disableAppLibrary);
                         if ([d boolForKey:kSettingsDSDisableIconFlyIn])
                             settings_mark_tweak_applied(kSettingsDSDisableIconFlyIn, result.disableIconFlyIn);
+                        if ([d boolForKey:kSettingsDSHideNewAppDots])
+                            settings_mark_tweak_applied(kSettingsDSHideNewAppDots, result.hideNewAppDots);
                         if ([d boolForKey:kSettingsDSZeroWakeAnimation])
                             settings_mark_tweak_applied(kSettingsDSZeroWakeAnimation, result.zeroWakeAnimation);
                         if ([d boolForKey:kSettingsDSZeroBacklightFade])

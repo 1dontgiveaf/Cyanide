@@ -57,6 +57,7 @@ Cyanide, and the Cache Cleaner deletes what you select.
 | **QuickLoader** | Executes custom .js code |
 | **Disable App Library** | Remove the App Library page |
 | **Disable Icon Fly-In** | Skip the icon spring animation |
+| **Hide New App Dots** | No blue dot next to new or updated apps |
 | **Zero Wake Animation** | Snap on instantly when waking |
 | **Zero Backlight Fade** | Instant lock/unlock backlight |
 | **Double-Tap to Lock** | Lock with a wallpaper double-tap |

@@ -515,6 +515,18 @@ static const NSInteger kSecOTA              = SectionOTA;
                                      enabledKey:kSettingsDSDisableIconFlyIn
                                           isNew:NO],
 
+            [[Package alloc] initWithIdentifier:@"com.darksword.hide-new-app-dots"
+                                           name:@"Hide New App Dots"
+                               shortDescription:@"No blue dot next to new or updated apps"
+                                longDescription:@"Removes the blue dot iOS shows next to the names of newly installed and recently updated apps, and keeps new ones from appearing until the next respring."
+                                        version:version
+                                         author:@"kolbicz"
+                                       category:@"SpringBoard"
+                                     symbolName:@"circle.slash"
+                                           kind:PackageInstallKindToggle
+                                     enabledKey:kSettingsDSHideNewAppDots
+                                          isNew:YES],
+
             [[Package alloc] initWithIdentifier:@"com.darksword.zero-wake-animation"
                                            name:@"Zero Wake Animation"
                                shortDescription:@"Snap on instantly when waking"
