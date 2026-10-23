@@ -67,6 +67,11 @@ bool powercuff_apply(const char *level)
         // or may not have run: report failure rather than "applied" (a
         // re-apply sets the same mode, so retrying it is harmless).
         ok = r_last_call_ok();
+        // 1.3.6 (where Heavy worked) always settled 50 ms after every remote
+        // message before detaching; r_msg2 now settles by the "Tweak apply
+        // speed" option (5 ms or none). Give thermalmonitord time to act on
+        // the new mode before Cyanide detaches, whatever that option says.
+        usleep(500000);
         // modeStr is deliberately not released: thermalmonitord keeps using
         // the string after the call returns (1.3.6 never released it and
         // worked; releasing it here left Heavy reported as applied but not in
