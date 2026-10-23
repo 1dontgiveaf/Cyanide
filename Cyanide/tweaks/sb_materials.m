@@ -374,7 +374,7 @@ static const SBMatItem kSBMatItems[] = {
     { "dock",         "Dock",                   "dock.rectangle",              "dockDark,dockLight", 30 },
     { "folder",       "Folder Background",      "folder",                      "folderDark,folderLight,folderDarkSimplified,folderLightSimplified", 30 },
     { "folderBlur",   "Folder Blur",            "folder.circle",               "folderExpandedBackgroundHome,folderExpandedBackgroundHomeSimplified,homeScreenOverlay", 9 },
-    { "ccModules",    "Control Center Modules", "switch.2",                    "modulesSheer", 30 },
+    { "ccModules",    "Control Center Modules", "switch.2",                    "modulesSheer", 15 },
     { "ccBackground", "Control Center Blur",    "square.on.square",            "modulesBackground", 30 },
     { "switcher",     "App Switcher Blur",      "apps.iphone",                 "homeScreenBackdrop-application", 20 },
     { "notifications","Notification Banners",   "platter.filled.top.iphone",   "platters,plattersDark", 30 },
@@ -414,7 +414,10 @@ bool sbmat_apply_in_session(NSDictionary<NSString *, NSDictionary *> *config, NS
             NSData *data = sbmat_edited_recipe(name, mode, rgba, blur, itemSquare);
             if (data) { files[[name stringByAppendingPathExtension:@"materialrecipe"]] = data; continue; }
             // A descendant recipe: ours points at an edited copy of its
-            // ancestor (under our own name) and adds no changes of its own.
+            // ancestor (under our own name) and keeps Apple's changes --
+            // for Control Center's modulesSheer those make 25 module blurs
+            // cheap (backdropScale 0.05, low quality); without them
+            // dismissing Control Center got slow. Only the blur radius is ours.
             NSDictionary *desc = sbmat_system_descendant(name);
             NSString *ancestor = [desc[@"ancestorRecipe"] isKindOfClass:NSString.class] ? desc[@"ancestorRecipe"] : nil;
             NSData *base = ancestor ? sbmat_edited_recipe(ancestor, mode, rgba, blur, itemSquare) : nil;
@@ -423,8 +426,19 @@ bool sbmat_apply_in_session(NSDictionary<NSString *, NSDictionary *> *config, NS
                    [[desc.description componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet] componentsJoinedByString:@" "].UTF8String);
             NSString *ours = [@"cyanide-" stringByAppendingString:name];
             files[[ours stringByAppendingPathExtension:@"materialrecipe"]] = base;
+            NSMutableDictionary *changes = [desc[@"descendantDescription"] isKindOfClass:NSDictionary.class]
+                ? [desc[@"descendantDescription"] mutableCopy] : [NSMutableDictionary dictionary];
+            NSMutableDictionary *dBase = [changes[@"baseMaterial"] isKindOfClass:NSDictionary.class]
+                ? [changes[@"baseMaterial"] mutableCopy] : [NSMutableDictionary dictionary];
+            NSMutableDictionary *dFilter = [dBase[@"materialFiltering"] isKindOfClass:NSDictionary.class]
+                ? [dBase[@"materialFiltering"] mutableCopy] : [NSMutableDictionary dictionary];
+            dFilter[@"blurRadius"] = mode == SBMatModeDisabled ? @0 : @(isfinite(blur) ? MIN(MAX(blur, 0), 100) : 0);
+            if (mode == SBMatModeDisabled) [dFilter removeObjectForKey:@"backdropScale"];
+            dBase[@"materialFiltering"] = dFilter;
+            [dBase removeObjectForKey:@"tinting"];
+            changes[@"baseMaterial"] = dBase;
             files[[name stringByAppendingPathExtension:@"descendantrecipe"]] =
-                [NSPropertyListSerialization dataWithPropertyList:@{ @"ancestorRecipe": ours, @"descendantDescription": @{} }
+                [NSPropertyListSerialization dataWithPropertyList:@{ @"ancestorRecipe": ours, @"descendantDescription": changes }
                                                            format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
         }
     }
