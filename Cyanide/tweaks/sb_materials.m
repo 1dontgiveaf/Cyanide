@@ -143,6 +143,9 @@ static NSData *sbmat_edited_recipe(NSString *name, SBMatMode mode, NSArray<NSNum
     NSData *data = url ? [NSData dataWithContentsOfURL:url] : nil;
     NSDictionary *plist = data ? [NSPropertyListSerialization propertyListWithData:data options:0 format:NULL error:nil] : nil;
     if (![plist isKindOfClass:NSDictionary.class]) return nil;
+    if ([name hasPrefix:@"platters"] || [name hasPrefix:@"modules"])
+        printf("[SBMAT] %s original: %s\n", name.UTF8String,
+               [[plist.description componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet] componentsJoinedByString:@" "].UTF8String);
     NSMutableDictionary *changed = [plist mutableCopy];
     NSMutableDictionary *base = [plist[@"baseMaterial"] isKindOfClass:NSDictionary.class] ? [plist[@"baseMaterial"] mutableCopy]
                                                                                        : [NSMutableDictionary dictionary];
@@ -313,7 +316,7 @@ static const SBMatItem kSBMatItems[] = {
     { "dock",         "Dock",                   "dock.rectangle",              "dockDark,dockLight", 30 },
     { "folder",       "Folder Background",      "folder",                      "folderDark,folderLight,folderDarkSimplified,folderLightSimplified", 30 },
     { "folderBlur",   "Folder Blur",            "folder.circle",               "folderExpandedBackgroundHome,folderExpandedBackgroundHomeSimplified,homeScreenOverlay", 9 },
-    { "ccModules",    "Control Center Modules", "switch.2",                    "modules", 30 },
+    { "ccModules",    "Control Center Modules", "switch.2",                    "modulesSheer", 30 },
     { "ccBackground", "Control Center Blur",    "square.on.square",            "modulesBackground", 30 },
     { "switcher",     "App Switcher Blur",      "apps.iphone",                 "homeScreenBackdrop-application", 20 },
     { "notifications","Notification Banners",   "platter.filled.top.iphone",   "platters,plattersDark", 30 },
@@ -364,6 +367,15 @@ bool sbmat_apply_in_session(NSDictionary<NSString *, NSDictionary *> *config, NS
         *why = @"This iOS version has no CoreMaterial override.";
         return false;
     }
+    // Which recipes SpringBoard has used so far (open Control Center etc.
+    // first to see theirs).
+    uint64_t keys = r_msg2_main(cache, "allKeys", 0, 0, 0, 0);
+    uint64_t sep = r_cfstr(", ");
+    uint64_t joined = r_is_objc_ptr(keys) ? r_msg2_main(keys, "componentsJoinedByString:", sep, 0, 0, 0) : 0;
+    sbmat_cfrelease(sep);
+    char list[1600] = {0};
+    if (r_is_objc_ptr(joined)) r_read_nsstring(joined, list, sizeof(list));
+    printf("[SBMAT] recipes SpringBoard has used: %s\n", list);
 
     // 1. The override folder (a new one each time: NSBundle caches a
     //    folder's contents), or none.
