@@ -226,7 +226,10 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
 {
     const SBMatItem *item = [self sbItemForSection:seg.tag];
     if (!item) return;
-    [self sbSet:@(seg.selectedSegmentIndex) forKey:@"mode" item:item];
+    // Items without Color have two segments: Visible, Disabled.
+    SBMatMode mode = item->allowsColor ? (SBMatMode)seg.selectedSegmentIndex
+                                       : (seg.selectedSegmentIndex == 1 ? SBMatModeDisabled : SBMatModeVisible);
+    [self sbSet:@(mode) forKey:@"mode" item:item];
     [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:seg.tag] withRowAnimation:UITableViewRowAnimationAutomatic];
 }
 
@@ -285,7 +288,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
         case LaraToolSpringBoard: {
             if (section == 0) return 2;
             const SBMatItem *item = [self sbItemForSection:section];
-            return item && [[self sbChoiceFor:item][@"mode"] integerValue] == SBMatModeColor ? 3 : 1;
+            return item && item->allowsColor && [[self sbChoiceFor:item][@"mode"] integerValue] == SBMatModeColor ? 3 : 1;
         }
         case LaraToolHiddenSettings: {
             NSInteger n = 0;
@@ -384,8 +387,10 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             if (!item) break;
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
             if (indexPath.row == 0) {
-                UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:@[ @"Visible", @"Color", @"Disabled" ]];
-                seg.selectedSegmentIndex = MIN(MAX([[self sbChoiceFor:item][@"mode"] integerValue], 0), 2);
+                NSInteger mode = MIN(MAX([[self sbChoiceFor:item][@"mode"] integerValue], 0), 2);
+                UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:item->allowsColor
+                    ? @[ @"Visible", @"Color", @"Disabled" ] : @[ @"Visible", @"Disabled" ]];
+                seg.selectedSegmentIndex = item->allowsColor ? mode : (mode == SBMatModeDisabled ? 1 : 0);
                 seg.tag = indexPath.section;
                 seg.enabled = !self.busy;
                 [seg addTarget:self action:@selector(sbModeChanged:) forControlEvents:UIControlEventValueChanged];

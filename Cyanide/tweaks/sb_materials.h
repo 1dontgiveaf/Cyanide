@@ -25,6 +25,7 @@ typedef struct {
     const char *icon;        // SF Symbol
     const char *recipes;     // comma-separated recipe names
     double defaultBlur;      // blur radius offered for Color
+    bool allowsColor;        // false: Visible / Disabled only (a tint would be drawn unrounded)
 } SBMatItem;
 
 // The items, terminated by an entry with key == NULL.

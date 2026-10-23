@@ -71,6 +71,26 @@ static NSURL *sbmat_system_recipe_url(NSString *name)
     return ((id (*)(id, SEL, id))objc_msgSend)(bundle, urlSel, name);
 }
 
+// The system's <name>.descendantrecipe (an ancestor recipe plus changes,
+// e.g. Control Center's modulesSheer), as a dictionary, or nil.
+static NSDictionary *sbmat_system_descendant(NSString *name)
+{
+    NSURL *url = nil;
+    for (NSString *framework in @[ @"CoreMaterial", @"SpringBoardHome", @"SpringBoard", @"ControlCenterUI", @"ControlCenterUIKit" ]) {
+        NSString *path = [NSString stringWithFormat:@"/System/Library/PrivateFrameworks/%@.framework/%@.descendantrecipe",
+                          framework, name];
+        if ([NSFileManager.defaultManager fileExistsAtPath:path]) { url = [NSURL fileURLWithPath:path]; break; }
+    }
+    if (!url && sbmat_load_corematerial()) {
+        SEL bundleSel = sel_registerName("coreMaterialRecipeBundle"), urlSel = sel_registerName("URLForMaterialRecipeDescendant:");
+        NSBundle *bundle = [NSBundle respondsToSelector:bundleSel] ? ((id (*)(id, SEL))objc_msgSend)(NSBundle.class, bundleSel) : nil;
+        if ([bundle respondsToSelector:urlSel]) url = ((id (*)(id, SEL, id))objc_msgSend)(bundle, urlSel, name);
+    }
+    NSData *data = url ? [NSData dataWithContentsOfURL:url] : nil;
+    NSDictionary *plist = data ? [NSPropertyListSerialization propertyListWithData:data options:0 format:NULL error:nil] : nil;
+    return [plist isKindOfClass:NSDictionary.class] ? plist : nil;
+}
+
 // Address of CoreMaterial's recipe cache variable (the same in every
 // process), found by loading `probe` here and looking for the dictionary
 // holding it. 0 when not found.
@@ -312,15 +332,18 @@ static void sbmat_reload_home_backdrop(NSSet<NSString *> *names)
 
 NSString * const kSBMatConfigKey = @"CYSpringBoardToolsConfig";
 
+// Notification platters only capture their backdrop for a shared group; for
+// those CoreMaterial puts the tint into the layer's background color, which
+// isn't rounded -- so they get Visible / Disabled only.
 static const SBMatItem kSBMatItems[] = {
-    { "dock",         "Dock",                   "dock.rectangle",              "dockDark,dockLight", 30 },
-    { "folder",       "Folder Background",      "folder",                      "folderDark,folderLight,folderDarkSimplified,folderLightSimplified", 30 },
-    { "folderBlur",   "Folder Blur",            "folder.circle",               "folderExpandedBackgroundHome,folderExpandedBackgroundHomeSimplified,homeScreenOverlay", 9 },
-    { "ccModules",    "Control Center Modules", "switch.2",                    "modulesSheer", 30 },
-    { "ccBackground", "Control Center Blur",    "square.on.square",            "modulesBackground", 30 },
-    { "switcher",     "App Switcher Blur",      "apps.iphone",                 "homeScreenBackdrop-application", 20 },
-    { "notifications","Notification Banners",   "platter.filled.top.iphone",   "platters,plattersDark", 30 },
-    { NULL, NULL, NULL, NULL, 0 },
+    { "dock",         "Dock",                   "dock.rectangle",              "dockDark,dockLight", 30, true },
+    { "folder",       "Folder Background",      "folder",                      "folderDark,folderLight,folderDarkSimplified,folderLightSimplified", 30, true },
+    { "folderBlur",   "Folder Blur",            "folder.circle",               "folderExpandedBackgroundHome,folderExpandedBackgroundHomeSimplified,homeScreenOverlay", 9, true },
+    { "ccModules",    "Control Center Modules", "switch.2",                    "modulesSheer", 30, true },
+    { "ccBackground", "Control Center Blur",    "square.on.square",            "modulesBackground", 30, true },
+    { "switcher",     "App Switcher Blur",      "apps.iphone",                 "homeScreenBackdrop-application", 20, true },
+    { "notifications","Notification Banners",   "platter.filled.top.iphone",   "platters,plattersDark", 30, false },
+    { NULL, NULL, NULL, NULL, 0, false },
 };
 
 const SBMatItem *sbmat_items(void) { return kSBMatItems; }
@@ -346,12 +369,25 @@ bool sbmat_apply_in_session(NSDictionary<NSString *, NSDictionary *> *config, NS
         printf("[SBMAT] %s: %s%s\n", item->key, mode == SBMatModeColor ? "Color" : mode == SBMatModeDisabled ? "Disabled" : "Visible",
                mode == SBMatModeColor ? [[NSString stringWithFormat:@" blur=%.0f tint=%@", blur,
                                           [rgba componentsJoinedByString:@","] ?: @"default"] UTF8String] : "");
+        if (!item->allowsColor && mode == SBMatModeColor) mode = SBMatModeVisible;
         for (NSString *name in sbmat_item_recipes(item)) {
             [allNames addObject:name];
             if (mode == SBMatModeVisible) continue;
             NSData *data = sbmat_edited_recipe(name, mode, rgba, blur);
-            if (data) files[[name stringByAppendingPathExtension:@"materialrecipe"]] = data;
-            else printf("[SBMAT] %s: not on this iOS version, skipped\n", name.UTF8String);
+            if (data) { files[[name stringByAppendingPathExtension:@"materialrecipe"]] = data; continue; }
+            // A descendant recipe: ours points at an edited copy of its
+            // ancestor (under our own name) and adds no changes of its own.
+            NSDictionary *desc = sbmat_system_descendant(name);
+            NSString *ancestor = [desc[@"ancestorRecipe"] isKindOfClass:NSString.class] ? desc[@"ancestorRecipe"] : nil;
+            NSData *base = ancestor ? sbmat_edited_recipe(ancestor, mode, rgba, blur) : nil;
+            if (!base) { printf("[SBMAT] %s: not on this iOS version, skipped\n", name.UTF8String); continue; }
+            printf("[SBMAT] %s: descendant of %s, original: %s\n", name.UTF8String, ancestor.UTF8String,
+                   [[desc.description componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet] componentsJoinedByString:@" "].UTF8String);
+            NSString *ours = [@"cyanide-" stringByAppendingString:name];
+            files[[ours stringByAppendingPathExtension:@"materialrecipe"]] = base;
+            files[[name stringByAppendingPathExtension:@"descendantrecipe"]] =
+                [NSPropertyListSerialization dataWithPropertyList:@{ @"ancestorRecipe": ours, @"descendantDescription": @{} }
+                                                           format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
         }
     }
 
