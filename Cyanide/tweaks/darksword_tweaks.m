@@ -10,6 +10,7 @@
 #import <string.h>
 #import <unistd.h>
 #import "../LogTextView.h"
+#import "sb_walk.h"
 
 static int ds_ios_major_version(void)
 {
@@ -590,26 +591,90 @@ bool darksword_tweak_disable_icon_fly_in_in_session(void)
     return ok;
 }
 
+// iOS 17 has no clear-all on SpringBoard's home screen service: reset the
+// flags app by app (only the marked ones: a few hundred apps, so reading is
+// cheap and setting is rare). Must run before the getters are forced to NO.
+static int ds_dots_reset_apps(void)
+{
+    uint64_t ctrl = r_msg2(r_class("SBApplicationController"), "sharedInstance", 0, 0, 0, 0);
+    uint64_t list = r_is_objc_ptr(ctrl) && r_responds(ctrl, "allApplications")
+        ? r_msg2_main_retained(ctrl, "allApplications") : 0;
+    if (!r_is_objc_ptr(list)) {
+        printf("[DST:DOTS] application list unavailable\n");
+        return -1;
+    }
+    static uint64_t apps[1024];
+    int n = r_array_items_of_class(list, r_class("SBApplication"), apps, 1024);
+    int reset = 0;
+    for (int i = 0; i < n; i++) {
+        bool newly = r_msg2(apps[i], "_isNewlyInstalled", 0, 0, 0, 0) & 1;
+        bool updated = r_msg2(apps[i], "_isRecentlyUpdated", 0, 0, 0, 0) & 1;
+        if (newly) r_msg2_main(apps[i], "_setNewlyInstalled:", 0, 0, 0, 0);
+        if (updated) r_msg2_main(apps[i], "_setRecentlyUpdated:", 0, 0, 0, 0);
+        if (newly || updated) reset++;
+    }
+    r_release(list);
+    printf("[DST:DOTS] %d app(s), %d with a dot reset\n", n, reset);
+    return reset;
+}
+
+// Redraws the name-label dot of the icons on every Home Screen page and in
+// the dock.
+static int ds_dots_refresh_icons(void)
+{
+    uint64_t ctrl = r_msg2_main(r_class("SBIconController"), "sharedInstance", 0, 0, 0, 0);
+    uint64_t mgr = r_is_objc_ptr(ctrl) ? r_msg2_main(ctrl, "iconManager", 0, 0, 0, 0) : 0;
+    uint64_t root = r_is_objc_ptr(mgr) ? r_msg2_main(mgr, "rootFolderController", 0, 0, 0, 0) : 0;
+    uint64_t rootView = r_is_objc_ptr(root) ? r_msg2_main(root, "rootFolderView", 0, 0, 0, 0) : 0;
+    if (!r_is_objc_ptr(rootView)) return 0;
+    uint64_t lists[48];
+    int nLists = 0;
+    uint64_t pages = r_responds_main(rootView, "iconListViews") ? r_msg2_main_retained(rootView, "iconListViews") : 0;
+    if (r_is_objc_ptr(pages)) {
+        nLists = r_array_items_of_class(pages, r_class("SBIconListView"), lists, 47);
+        r_release(pages);
+    }
+    uint64_t dock = r_responds_main(rootView, "dockListView") ? r_msg2_main(rootView, "dockListView", 0, 0, 0, 0) : 0;
+    if (r_is_objc_ptr(dock)) lists[nLists++] = dock;
+    uint64_t iconViewCls = r_class("SBIconView");
+    static uint64_t icons[128];
+    int refreshed = 0;
+    for (int l = 0; l < nLists; l++) {
+        int n = sb_collect_views_main(lists[l], iconViewCls, icons, 128);
+        for (int i = 0; i < n; i++) {
+            if (!r_responds_main(icons[i], "_updateLabelAccessoryView")) continue;
+            r_msg2_main(icons[i], "_updateLabelAccessoryView", 0, 0, 0, 0);
+            refreshed++;
+        }
+    }
+    return refreshed;
+}
+
 bool darksword_tweak_hide_new_app_dots_in_session(void)
 {
     printf("[DST:DOTS] hiding new app dots\n");
-    // Future ones: the apps' own answer is "not new" until the next respring.
-    bool newly = ds_force_method_zero("SBApplication", "_isNewlyInstalled");
-    bool updated = ds_force_method_zero("SBApplication", "_isRecentlyUpdated");
-
-    // Existing ones: SpringBoard's own clear (what its home screen service
-    // offers other processes), which drops the stored state and refreshes the
-    // icons.
+    // Existing ones. iOS 18: SpringBoard's own clear (what its home screen
+    // service offers other processes), which drops the stored state and
+    // refreshes the icons. iOS 17 doesn't have it: reset the apps' flags and
+    // redraw the icons ourselves.
     uint64_t app = r_msg2(r_class("UIApplication"), "sharedApplication", 0, 0, 0, 0);
     uint64_t service = r_is_objc_ptr(app) ? r_ivar_value(app, "_homeScreenService") : 0;
-    bool cleared = false;
+    bool cleared = false, perApp = false;
     if (r_is_objc_ptr(service) && r_responds(service, "clearNewlyInstalledAndRecentlyUpdatedAppIndicators")) {
         r_msg2_main(service, "clearNewlyInstalledAndRecentlyUpdatedAppIndicators", 0, 0, 0, 0);
         cleared = r_last_main_ok();
+    } else {
+        perApp = true;
+        cleared = ds_dots_reset_apps() >= 0;
     }
-    printf("[DST:DOTS] hooks newlyInstalled=%d recentlyUpdated=%d, existing cleared=%d (service=%d)\n",
-           newly, updated, cleared, r_is_objc_ptr(service));
-    return cleared || (newly && updated);
+
+    // Future ones: the apps' own answer is "not new" until the next respring.
+    bool newly = ds_force_method_zero("SBApplication", "_isNewlyInstalled");
+    bool updated = ds_force_method_zero("SBApplication", "_isRecentlyUpdated");
+    int refreshed = perApp ? ds_dots_refresh_icons() : 0;
+    printf("[DST:DOTS] existing cleared=%d (%s), icons redrawn=%d, hooks newlyInstalled=%d recentlyUpdated=%d\n",
+           cleared, perApp ? "per app" : "home screen service", refreshed, newly, updated);
+    return cleared && newly && updated;
 }
 
 bool darksword_tweak_zero_backlight_fade_in_session(void)

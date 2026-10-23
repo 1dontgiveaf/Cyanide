@@ -210,6 +210,9 @@ static bool r_selector_is_pure_query(const char *selName)
         "iconListViewAtIndex:",
         "visibleIconListViews",
         "iconListViews",
+        // SBApplication flags read for every app by Hide New App Dots.
+        "_isNewlyInstalled",
+        "_isRecentlyUpdated",
         NULL,
     };
     for (int i = 0; kPureQueries[i]; i++) {
