@@ -167,8 +167,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView
 {
     // App limit: action, then the apps. Decrypt: finished IPAs, then the apps.
-    // Apply/Reset, one per item, then Square Notifications.
-    if (self.tool == LaraToolSpringBoard) return 2 + (NSInteger)[self sbItemCount];
+    if (self.tool == LaraToolSpringBoard) return 1 + (NSInteger)[self sbItemCount];   // Apply/Reset, then one per item
     return (self.tool == LaraToolAppLimit || self.tool == LaraToolDecrypt) ? 2 : 1;
 }
 
@@ -194,25 +193,6 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
         _sbConfig = saved ? [saved mutableCopy] : [NSMutableDictionary dictionary];
     }
     return _sbConfig;
-}
-
-- (BOOL)sbIsSquaresSection:(NSInteger)section
-{
-    return self.tool == LaraToolSpringBoard && (NSUInteger)section == [self sbItemCount] + 1;
-}
-
-- (NSDictionary *)sbSquares
-{
-    NSDictionary *c = self.sbConfig[kSBMatSquaresKey];
-    return [c isKindOfClass:NSDictionary.class] ? c : @{};
-}
-
-- (void)sbSetSquares:(id)value forKey:(NSString *)key
-{
-    NSMutableDictionary *c = [[self sbSquares] mutableCopy];
-    c[key] = value;
-    self.sbConfig[kSBMatSquaresKey] = c;
-    [NSUserDefaults.standardUserDefaults setObject:self.sbConfig forKey:kSBMatConfigKey];
 }
 
 - (NSDictionary *)sbChoiceFor:(const SBMatItem *)item
@@ -248,20 +228,6 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
     if (!item) return;
     [self sbSet:@(seg.selectedSegmentIndex) forKey:@"mode" item:item];
     [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:seg.tag] withRowAnimation:UITableViewRowAnimationAutomatic];
-}
-
-- (void)sbSquareChanged:(UISwitch *)sw
-{
-    [self sbSetSquares:@(sw.on) forKey:@"on"];
-    [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:sw.tag] withRowAnimation:UITableViewRowAnimationAutomatic];
-}
-
-- (void)sbSquareColorChanged:(UIColorWell *)well
-{
-    CGFloat r = 0, g = 0, b = 0, a = 1;
-    if (![well.selectedColor getRed:&r green:&g blue:&b alpha:&a]) return;
-    CGFloat (^unit)(CGFloat) = ^CGFloat(CGFloat v) { return MIN(MAX(v, 0), 1); };
-    [self sbSetSquares:@[ @(unit(r)), @(unit(g)), @(unit(b)), @(unit(a)) ] forKey:@"color"];
 }
 
 - (void)sbColorChanged:(UIColorWell *)well
@@ -318,7 +284,6 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
         case LaraToolUpsideDown:     return 1;
         case LaraToolSpringBoard: {
             if (section == 0) return 2;
-            if ([self sbIsSquaresSection:section]) return [[self sbSquares][@"on"] boolValue] ? 2 : 1;
             const SBMatItem *item = [self sbItemForSection:section];
             return item && [[self sbChoiceFor:item][@"mode"] integerValue] == SBMatModeColor ? 3 : 1;   // mode, tint, blur
         }
@@ -338,7 +303,6 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section
 {
     if (self.tool == LaraToolSpringBoard) {
-        if ([self sbIsSquaresSection:section]) return @"Square Notifications";
         const SBMatItem *item = [self sbItemForSection:section];
         return item ? @(item->title) : nil;
     }
@@ -375,7 +339,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             about = @"With a free Apple ID, iOS allows only 3 sideloaded apps: installd marks each one, and only marked apps count. Removing the marks frees the slots. Run it again after installing or refreshing (re-signing) an app, which marks it again.";
             break;
         case LaraToolSpringBoard:
-            about = @"Changes the material behind the dock, folders, Control Center, notification banners and the app switcher: Apple's (Visible), your own tint and blur (Color), or none (Disabled). Tap Apply after changing something. It works in SpringBoard's memory, so a respring undoes it: apply again after one.\n\nOn the Lock Screen, iOS draws notifications as one shared blur cut into rounded shapes; a changed notification material drops out of it and is drawn square (lara's files do the same). Square Notifications paints those squares in a color of your choice.";
+            about = @"Changes the material behind the dock, folders, Control Center, notification banners and the app switcher: Apple's (Visible), your own tint and blur (Color), or none (Disabled). Tap Apply after changing something. It works in SpringBoard's memory, so a respring undoes it: apply again after one.\n\nNotification Banners: on the Lock Screen, iOS draws notifications as one shared blur cut into rounded shapes. With Color they drop out of it and show square there (with lara's files too); banners elsewhere stay rounded.";
             break;
         case LaraToolJIT:
             about = @"Tap an app to open it with JIT (for emulators and similar apps). Only apps signed with a development profile can get it. JIT lasts until the app quits; some apps can't tell it's on.";
@@ -417,30 +381,6 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
                 break;
             }
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
-            if ([self sbIsSquaresSection:indexPath.section]) {
-                if (indexPath.row == 0) {
-                    c.text = @"Square on Lock Screen";
-                    c.secondaryText = @"Paints lock screen notifications and their buttons as squares in this color.";
-                    c.secondaryTextProperties.color = UIColor.secondaryLabelColor;
-                    UISwitch *sw = [UISwitch new];
-                    sw.on = [[self sbSquares][@"on"] boolValue];
-                    sw.tag = indexPath.section;
-                    [sw addTarget:self action:@selector(sbSquareChanged:) forControlEvents:UIControlEventValueChanged];
-                    cell.accessoryView = sw;
-                } else {
-                    c.text = @"Color";
-                    NSArray<NSNumber *> *rgba = [self sbSquares][@"color"];
-                    UIColorWell *well = [UIColorWell new];
-                    well.supportsAlpha = YES;
-                    well.selectedColor = [rgba isKindOfClass:NSArray.class] && rgba.count >= 4
-                        ? [UIColor colorWithRed:rgba[0].doubleValue green:rgba[1].doubleValue blue:rgba[2].doubleValue alpha:rgba[3].doubleValue]
-                        : [UIColor colorWithWhite:0 alpha:0.5];
-                    [well addTarget:self action:@selector(sbSquareColorChanged:) forControlEvents:UIControlEventValueChanged];
-                    [well sizeToFit];
-                    cell.accessoryView = well;
-                }
-                break;
-            }
             const SBMatItem *item = [self sbItemForSection:indexPath.section];
             if (!item) break;
             if (indexPath.row == 0) {

@@ -171,12 +171,12 @@ static double sbmat_unit(NSArray<NSNumber *> *rgba, NSUInteger i, double fallbac
 //    plain tint (Control Center's background: with the color matrix its
 //    fade made dismissing Control Center slow).
 //  - Visible: Apple's filter.
-// squareTint: a plain tint on top. Lock screen platters only capture their
-// backdrop for a shared group, and CoreMaterial draws a plain tint as such a
-// layer's background color, unrounded -- square notifications, on purpose.
-// nil when the system has no such recipe.
+// On the lock screen, iOS draws notifications as one shared blur cut into
+// rounded shapes; one with a changed material drops out of it and is drawn
+// square (lara's recipe files do the same). nil when the system has no such
+// recipe.
 static NSData *sbmat_edited_recipe(NSString *name, SBMatMode mode, NSArray<NSNumber *> *rgba, double blur,
-                                   NSArray<NSNumber *> *squareTint, bool plainTint)
+                                   bool plainTint)
 {
     NSURL *url = sbmat_system_recipe_url(name);
     NSData *data = url ? [NSData dataWithContentsOfURL:url] : nil;
@@ -207,12 +207,6 @@ static NSData *sbmat_edited_recipe(NSString *name, SBMatMode mode, NSArray<NSNum
             base[@"materialFiltering"] = filtering;
             [base removeObjectForKey:@"tinting"];
         }
-    }
-    if (squareTint) {
-        base[@"tinting"] = @{ @"tintAlpha": @(sbmat_unit(squareTint, 3, 0.5)),
-                              @"tintColor": @{ @"alpha": @1.0, @"red": @(sbmat_unit(squareTint, 0, 0)),
-                                               @"green": @(sbmat_unit(squareTint, 1, 0)),
-                                               @"blue": @(sbmat_unit(squareTint, 2, 0)) } };
     }
     changed[@"baseMaterial"] = base;
     return [NSPropertyListSerialization dataWithPropertyList:changed format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
@@ -387,7 +381,6 @@ static void sbmat_reload_home_backdrop(NSSet<NSString *> *names)
 #pragma mark - Items and apply
 
 NSString * const kSBMatConfigKey = @"CYSpringBoardToolsConfig";
-NSString * const kSBMatSquaresKey = @"CYSpringBoardToolsSquares";
 
 static const SBMatItem kSBMatItems[] = {
     { "dock",         "Dock",                   "dock.rectangle",              "dockDark,dockLight", 30, false },
@@ -409,10 +402,6 @@ static NSArray<NSString *> *sbmat_item_recipes(const SBMatItem *item)
 
 bool sbmat_apply_in_session(NSDictionary<NSString *, NSDictionary *> *config, NSString **why)
 {
-    NSDictionary *squares = [config[kSBMatSquaresKey] isKindOfClass:NSDictionary.class] ? config[kSBMatSquaresKey] : nil;
-    NSArray *squareTint = [squares[@"on"] boolValue]
-        ? ([squares[@"color"] isKindOfClass:NSArray.class] ? squares[@"color"] : @[ @0, @0, @0, @0.5 ]) : nil;
-    printf("[SBMAT] square notifications: %s\n", squareTint ? [[squareTint componentsJoinedByString:@","] UTF8String] : "off");
     __autoreleasing NSString *dummy = nil;
     if (!why) why = &dummy;
 
@@ -428,14 +417,12 @@ bool sbmat_apply_in_session(NSDictionary<NSString *, NSDictionary *> *config, NS
         printf("[SBMAT] %s: %s%s\n", item->key, mode == SBMatModeColor ? "Color" : mode == SBMatModeDisabled ? "Disabled" : "Visible",
                mode == SBMatModeColor ? [[NSString stringWithFormat:@" blur=%.0f tint=%@", blur,
                                           [rgba componentsJoinedByString:@","] ?: @"default"] UTF8String] : "");
-        bool isNotifications = !strcmp(item->key, "notifications");
-        NSArray *itemSquare = isNotifications ? squareTint : nil;
 
         if (mode == SBMatModeDisabled) [disabled addObjectsFromArray:sbmat_item_recipes(item)];
         for (NSString *name in sbmat_item_recipes(item)) {
             [allNames addObject:name];
-            if (mode == SBMatModeVisible && !itemSquare) continue;
-            NSData *data = sbmat_edited_recipe(name, mode, rgba, blur, itemSquare, item->plainTint);
+            if (mode == SBMatModeVisible) continue;
+            NSData *data = sbmat_edited_recipe(name, mode, rgba, blur, item->plainTint);
             if (data) { files[[name stringByAppendingPathExtension:@"materialrecipe"]] = data; continue; }
             // A descendant recipe: ours points at an edited copy of its
             // ancestor (under our own name) and keeps Apple's changes --
@@ -444,7 +431,7 @@ bool sbmat_apply_in_session(NSDictionary<NSString *, NSDictionary *> *config, NS
             // dismissing Control Center got slow. Only the blur radius is ours.
             NSDictionary *desc = sbmat_system_descendant(name);
             NSString *ancestor = [desc[@"ancestorRecipe"] isKindOfClass:NSString.class] ? desc[@"ancestorRecipe"] : nil;
-            NSData *base = ancestor ? sbmat_edited_recipe(ancestor, mode, rgba, blur, itemSquare, item->plainTint) : nil;
+            NSData *base = ancestor ? sbmat_edited_recipe(ancestor, mode, rgba, blur, item->plainTint) : nil;
             if (!base) { printf("[SBMAT] %s: not on this iOS version, skipped\n", name.UTF8String); continue; }
             printf("[SBMAT] %s: descendant of %s, original: %s\n", name.UTF8String, ancestor.UTF8String,
                    [[desc.description componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet] componentsJoinedByString:@" "].UTF8String);
