@@ -205,6 +205,8 @@ BOOL settings_has_reappliable_tweaks(void);
 
 void settings_register_defaults(void);
 BOOL settings_device_supported(void);
+// Why this device / iOS version isn't supported (for the unsupported screen).
+NSString *settings_unsupported_message(void);
 // The Process Viewer and File Browser screens, for pushing from elsewhere
 // (Home's quick tools).
 UIViewController *settings_make_process_viewer(void);

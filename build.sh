@@ -9,7 +9,7 @@
 #   build/Cyanide.ipa -> Cyanide-<version>.ipa
 #
 # Optional overrides:
-#   SDK=iphoneos26.2 ARCHS=arm64e IPHONEOS_DEPLOYMENT_TARGET=17.0 ./build.sh
+#   SDK=iphoneos26.2 ARCHS=arm64e IPHONEOS_DEPLOYMENT_TARGET=16.0 ./build.sh
 #   SCHEME=CyanideVPhone ./build.sh
 
 set -euo pipefail
@@ -24,7 +24,7 @@ else
 fi
 export SDK="${SDK:-iphoneos}"
 export ARCHS="${ARCHS:-arm64e}"
-export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-17.0}"
+export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-16.0}"
 
 # scripts/build.sh owns the one missing-resource check so direct CI builds and
 # this Release wrapper cannot recurse or generate twice. An existing resource

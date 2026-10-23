@@ -442,7 +442,7 @@ CHANGELOG_PENDING_SKIP_LOG="$CHANGELOG_SKIP_LOG" \
 #     refreshes a build/Cyanide.ipa symlink. We build *before* committing so the
 #     actual IPA size can be baked into source.json in the same commit.
 # Build through the root ./build.sh, exactly like every tested build: Release,
-# ARCHS=arm64e, deployment target 17.0. Calling scripts/build.sh directly fell
+# ARCHS=arm64e, deployment target 16.0. Calling scripts/build.sh directly fell
 # back to the project defaults -- Debug (-O0, ~2x the code, differently timed
 # exploit/RemoteCall code) or, with CONFIG=Release, a fat arm64+arm64e binary
 # (v1.7.3's first upload) whose arm64 slice has no PAC and was never tested.

@@ -3287,7 +3287,7 @@ BOOL settings_device_supported(void)
     return ios17to18 || ios26;
 }
 
-static NSString *settings_unsupported_message(void)
+NSString *settings_unsupported_message(void)
 {
     NSString *version = UIDevice.currentDevice.systemVersion ?: @"unknown";
 #if CYANIDE_VPHONE_DEBUG
