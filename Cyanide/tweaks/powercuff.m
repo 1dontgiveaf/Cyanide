@@ -62,7 +62,10 @@ bool powercuff_apply(const char *level)
         // or may not have run: report failure rather than "applied" (a
         // re-apply sets the same mode, so retrying it is harmless).
         ok = r_last_call_ok();
-        r_dlsym_call(R_TIMEOUT, "CFRelease", modeStr, 0, 0, 0, 0, 0, 0, 0);
+        // modeStr is deliberately not released: thermalmonitord keeps using
+        // the string after the call returns (1.3.6 never released it and
+        // worked; releasing it here left Heavy reported as applied but not in
+        // effect). One small string per apply.
         printf("[POWERCUFF] %s: %s\n", ok ? "applied" : "result unknown (reply lost)", level);
     } while (0);
 
