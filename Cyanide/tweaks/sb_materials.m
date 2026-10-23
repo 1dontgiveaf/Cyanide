@@ -276,8 +276,13 @@ static uint64_t sbmat_dock_material_view(void)
     return r_is_objc_ptr(bg) && r_msg2_main(bg, "isKindOfClass:", r_class("MTMaterialView"), 0, 0, 0) ? bg : 0;
 }
 
+// Recipes of items set to Disabled, during an apply.
+static NSSet<NSString *> *g_sbmat_disabled;
+
 // Makes an existing material view load its recipe again (from the cache,
-// which now holds ours or Apple's) and show it fully.
+// which now holds ours or Apple's) and show it fully. Disabled hides it: an
+// existing layer keeps its old filters when the new settings are an identity
+// (CoreMaterial's preservingFiltersIfIdentity), so its blur would stay.
 static bool sbmat_reload_view(uint64_t view)
 {
     uint64_t layer = r_is_objc_ptr(view) ? r_msg2_main(view, "layer", 0, 0, 0, 0) : 0;
@@ -301,7 +306,10 @@ static bool sbmat_reload_view(uint64_t view)
     if (r_responds_main(layer, "_setNeedsConfiguring"))
         r_msg2_main(layer, "_setNeedsConfiguring", 0, 0, 0, 0);
     r_msg2_main(layer, "layoutIfNeeded", 0, 0, 0, 0);
-    printf("[SBMAT] %s reloaded (%s)\n", recipe.UTF8String, before != after ? "new settings" : "same settings");
+    bool hide = [g_sbmat_disabled containsObject:recipe];
+    r_msg2_main(view, "setHidden:", hide, 0, 0, 0);
+    printf("[SBMAT] %s reloaded (%s)%s\n", recipe.UTF8String, before != after ? "new settings" : "same settings",
+           hide ? ", hidden (Disabled)" : "");
     return before != after;
 }
 
@@ -398,6 +406,7 @@ bool sbmat_apply_in_session(NSDictionary<NSString *, NSDictionary *> *config, NS
 
     // Our recipes, and every name we manage (Visible ones get Apple's back).
     NSMutableArray<NSString *> *allNames = [NSMutableArray array];
+    NSMutableSet<NSString *> *disabled = [NSMutableSet set];
     NSMutableDictionary<NSString *, NSData *> *files = [NSMutableDictionary dictionary];
     for (const SBMatItem *item = kSBMatItems; item->key; item++) {
         NSDictionary *c = [config[@(item->key)] isKindOfClass:NSDictionary.class] ? config[@(item->key)] : nil;
@@ -408,6 +417,7 @@ bool sbmat_apply_in_session(NSDictionary<NSString *, NSDictionary *> *config, NS
                mode == SBMatModeColor ? [[NSString stringWithFormat:@" blur=%.0f tint=%@", blur,
                                           [rgba componentsJoinedByString:@","] ?: @"default"] UTF8String] : "");
         NSArray *itemSquare = !strcmp(item->key, "notifications") ? squareTint : nil;
+        if (mode == SBMatModeDisabled) [disabled addObjectsFromArray:sbmat_item_recipes(item)];
         for (NSString *name in sbmat_item_recipes(item)) {
             [allNames addObject:name];
             if (mode == SBMatModeVisible && !itemSquare) continue;
@@ -515,6 +525,7 @@ bool sbmat_apply_in_session(NSDictionary<NSString *, NSDictionary *> *config, NS
     // 4. Views that already exist: the dock, Control Center (once opened)
     //    and the Home Screen backdrop behind the app switcher. Folders and
     //    banners are made when needed and get the new recipes from the cache.
+    g_sbmat_disabled = [disabled copy];
     uint64_t dockView = sbmat_dock_material_view();
     bool dockOK = dockView && sbmat_reload_view(dockView);
     NSSet<NSString *> *managed = [NSSet setWithArray:allNames];
