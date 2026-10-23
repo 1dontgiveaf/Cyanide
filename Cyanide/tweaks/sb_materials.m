@@ -152,53 +152,59 @@ static uint64_t sbmat_cache_slot(NSString *probe)
     return slot;
 }
 
+// CoreMaterial asserts (and SpringBoard aborts) on a color component outside
+// 0…1; the color picker hands out extended sRGB (P3 colors go past it).
+static double sbmat_unit(NSArray<NSNumber *> *rgba, NSUInteger i, double fallback)
+{
+    double v = i < rgba.count && [rgba[i] isKindOfClass:NSNumber.class] ? rgba[i].doubleValue : fallback;
+    return isfinite(v) ? MIN(MAX(v, 0.0), 1.0) : fallback;
+}
+
 // Apple's recipe edited for `mode`. Version-2 recipes keep the backdrop
-// filter in baseMaterial.materialFiltering and the tint next to it in
+// filter in baseMaterial.materialFiltering and a tint next to it in
 // baseMaterial.tinting; materialSettingsVersion stays (it names the format).
-// Disabled: no blur and no tint, an identity, so CoreMaterial switches the
-// backdrop off. nil when the system has no such recipe.
-static NSData *sbmat_edited_recipe(NSString *name, SBMatMode mode, NSArray<NSNumber *> *rgba, double blur, bool filterTint)
+//  - Disabled: no blur and no tint, an identity, so CoreMaterial switches the
+//    backdrop off.
+//  - Color: the blur radius, and the tint as part of the filter (a color
+//    matrix: each channel becomes (1 - a) * itself + a * color), which is
+//    drawn with the material's rounding everywhere.
+//  - Visible: Apple's filter.
+// squareTint: a plain tint on top. Lock screen platters only capture their
+// backdrop for a shared group, and CoreMaterial draws a plain tint as such a
+// layer's background color, unrounded -- square notifications, on purpose.
+// nil when the system has no such recipe.
+static NSData *sbmat_edited_recipe(NSString *name, SBMatMode mode, NSArray<NSNumber *> *rgba, double blur,
+                                   NSArray<NSNumber *> *squareTint)
 {
     NSURL *url = sbmat_system_recipe_url(name);
     NSData *data = url ? [NSData dataWithContentsOfURL:url] : nil;
     NSDictionary *plist = data ? [NSPropertyListSerialization propertyListWithData:data options:0 format:NULL error:nil] : nil;
     if (![plist isKindOfClass:NSDictionary.class]) return nil;
-    if ([name hasPrefix:@"platters"] || [name hasPrefix:@"modules"])
-        printf("[SBMAT] %s original: %s\n", name.UTF8String,
-               [[plist.description componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet] componentsJoinedByString:@" "].UTF8String);
     NSMutableDictionary *changed = [plist mutableCopy];
     NSMutableDictionary *base = [plist[@"baseMaterial"] isKindOfClass:NSDictionary.class] ? [plist[@"baseMaterial"] mutableCopy]
                                                                                        : [NSMutableDictionary dictionary];
     if (mode == SBMatModeDisabled) {
         base[@"materialFiltering"] = @{ @"blurRadius": @0 };
         [base removeObjectForKey:@"tinting"];
-    } else {
+    } else if (mode == SBMatModeColor) {
         NSMutableDictionary *filtering = [base[@"materialFiltering"] isKindOfClass:NSDictionary.class]
             ? [base[@"materialFiltering"] mutableCopy] : [NSMutableDictionary dictionary];
         filtering[@"blurRadius"] = @(isfinite(blur) ? MIN(MAX(blur, 0), 100) : 0);
+        double r = sbmat_unit(rgba, 0, 0), g = sbmat_unit(rgba, 1, 0), b = sbmat_unit(rgba, 2, 0), a = sbmat_unit(rgba, 3, 0.5);
+        double k = 1.0 - a;
+        filtering[@"colorMatrix"] = @{
+            @"m11": @(k), @"m12": @0, @"m13": @0, @"m14": @0, @"m15": @(a * r),
+            @"m21": @0, @"m22": @(k), @"m23": @0, @"m24": @0, @"m25": @(a * g),
+            @"m31": @0, @"m32": @0, @"m33": @(k), @"m34": @0, @"m35": @(a * b),
+            @"m41": @0, @"m42": @0, @"m43": @0, @"m44": @1, @"m45": @0 };
         base[@"materialFiltering"] = filtering;
-        // CoreMaterial asserts (and SpringBoard aborts) on a component outside
-        // 0…1; the color picker hands out extended sRGB (P3 colors go past it).
-        double (^unit)(NSUInteger, double) = ^double(NSUInteger i, double fallback) {
-            double v = i < rgba.count && [rgba[i] isKindOfClass:NSNumber.class] ? rgba[i].doubleValue : fallback;
-            return isfinite(v) ? MIN(MAX(v, 0.0), 1.0) : fallback;
-        };
-        double r = unit(0, 0), g = unit(1, 0), b = unit(2, 0), alpha = unit(3, 0.5);
-        if (filterTint) {
-            // The tint as part of the backdrop filter: each channel becomes
-            // (1 - a) * itself + a * color. Drawn by the layer that does the
-            // rounding, unlike a plain tint on a capture-only layer.
-            double k = 1.0 - alpha;
-            filtering[@"colorMatrix"] = @{
-                @"m11": @(k), @"m12": @0, @"m13": @0, @"m14": @0, @"m15": @(alpha * r),
-                @"m21": @0, @"m22": @(k), @"m23": @0, @"m24": @0, @"m25": @(alpha * g),
-                @"m31": @0, @"m32": @0, @"m33": @(k), @"m34": @0, @"m35": @(alpha * b),
-                @"m41": @0, @"m42": @0, @"m43": @0, @"m44": @1, @"m45": @0 };
-            [base removeObjectForKey:@"tinting"];
-        } else {
-            base[@"tinting"] = @{ @"tintAlpha": @(alpha),
-                                  @"tintColor": @{ @"alpha": @1.0, @"red": @(r), @"green": @(g), @"blue": @(b) } };
-        }
+        [base removeObjectForKey:@"tinting"];
+    }
+    if (squareTint) {
+        base[@"tinting"] = @{ @"tintAlpha": @(sbmat_unit(squareTint, 3, 0.5)),
+                              @"tintColor": @{ @"alpha": @1.0, @"red": @(sbmat_unit(squareTint, 0, 0)),
+                                               @"green": @(sbmat_unit(squareTint, 1, 0)),
+                                               @"blue": @(sbmat_unit(squareTint, 2, 0)) } };
     }
     changed[@"baseMaterial"] = base;
     return [NSPropertyListSerialization dataWithPropertyList:changed format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
@@ -325,7 +331,14 @@ static int sbmat_reload_views_under(uint64_t root, NSSet<NSString *> *names, con
 // through its view controller, or else its window.
 static void sbmat_reload_control_center(NSSet<NSString *> *names)
 {
-    uint64_t cc = r_msg2_main(r_class("SBControlCenterController"), "sharedInstance", 0, 0, 0, 0);
+    // iOS 18: one per window scene (the shared instance is nil).
+    uint64_t app = r_msg2_main(r_class("UIApplication"), "sharedApplication", 0, 0, 0, 0);
+    uint64_t manager = r_is_objc_ptr(app) && r_responds_main(app, "windowSceneManager") ? r_msg2_main(app, "windowSceneManager", 0, 0, 0, 0) : 0;
+    uint64_t scene = r_is_objc_ptr(manager) && r_responds_main(manager, "embeddedDisplayWindowScene")
+        ? r_msg2_main(manager, "embeddedDisplayWindowScene", 0, 0, 0, 0) : 0;
+    uint64_t cc = r_is_objc_ptr(scene) && r_responds_main(scene, "controlCenterController")
+        ? r_msg2_main(scene, "controlCenterController", 0, 0, 0, 0) : 0;
+    if (!r_is_objc_ptr(cc)) cc = r_msg2_main(r_class("SBControlCenterController"), "sharedInstanceIfExists", 0, 0, 0, 0);
     uint64_t vc = r_is_objc_ptr(cc) && r_responds_main(cc, "viewController") ? r_msg2_main(cc, "viewController", 0, 0, 0, 0) : 0;
     if (!r_is_objc_ptr(vc) && r_is_objc_ptr(cc)) vc = r_ivar_value(cc, "_viewController");
     bool loaded = r_is_objc_ptr(vc) && r_msg2_main(vc, "isViewLoaded", 0, 0, 0, 0);
@@ -355,19 +368,17 @@ static void sbmat_reload_home_backdrop(NSSet<NSString *> *names)
 #pragma mark - Items and apply
 
 NSString * const kSBMatConfigKey = @"CYSpringBoardToolsConfig";
+NSString * const kSBMatSquaresKey = @"CYSpringBoardToolsSquares";
 
-// Notification platters on the lock screen only capture their backdrop for a
-// shared group; CoreMaterial then draws a plain tint as the layer's background
-// color, which isn't rounded -- offered as an option ("square").
 static const SBMatItem kSBMatItems[] = {
-    { "dock",         "Dock",                   "dock.rectangle",              "dockDark,dockLight", 30, false },
-    { "folder",       "Folder Background",      "folder",                      "folderDark,folderLight,folderDarkSimplified,folderLightSimplified", 30, false },
-    { "folderBlur",   "Folder Blur",            "folder.circle",               "folderExpandedBackgroundHome,folderExpandedBackgroundHomeSimplified,homeScreenOverlay", 9, false },
-    { "ccModules",    "Control Center Modules", "switch.2",                    "modulesSheer", 30, false },
-    { "ccBackground", "Control Center Blur",    "square.on.square",            "modulesBackground", 30, false },
-    { "switcher",     "App Switcher Blur",      "apps.iphone",                 "homeScreenBackdrop-application", 20, false },
-    { "notifications","Notification Banners",   "platter.filled.top.iphone",   "platters,plattersDark", 30, true },
-    { NULL, NULL, NULL, NULL, 0, false },
+    { "dock",         "Dock",                   "dock.rectangle",              "dockDark,dockLight", 30 },
+    { "folder",       "Folder Background",      "folder",                      "folderDark,folderLight,folderDarkSimplified,folderLightSimplified", 30 },
+    { "folderBlur",   "Folder Blur",            "folder.circle",               "folderExpandedBackgroundHome,folderExpandedBackgroundHomeSimplified,homeScreenOverlay", 9 },
+    { "ccModules",    "Control Center Modules", "switch.2",                    "modulesSheer", 30 },
+    { "ccBackground", "Control Center Blur",    "square.on.square",            "modulesBackground", 30 },
+    { "switcher",     "App Switcher Blur",      "apps.iphone",                 "homeScreenBackdrop-application", 20 },
+    { "notifications","Notification Banners",   "platter.filled.top.iphone",   "platters,plattersDark", 30 },
+    { NULL, NULL, NULL, NULL, 0 },
 };
 
 const SBMatItem *sbmat_items(void) { return kSBMatItems; }
@@ -379,6 +390,9 @@ static NSArray<NSString *> *sbmat_item_recipes(const SBMatItem *item)
 
 bool sbmat_apply_in_session(NSDictionary<NSString *, NSDictionary *> *config, NSString **why)
 {
+    NSDictionary *squares = [config[kSBMatSquaresKey] isKindOfClass:NSDictionary.class] ? config[kSBMatSquaresKey] : nil;
+    NSArray *squareTint = [squares[@"on"] boolValue]
+        ? ([squares[@"color"] isKindOfClass:NSArray.class] ? squares[@"color"] : @[ @0, @0, @0, @0.5 ]) : nil;
     __autoreleasing NSString *dummy = nil;
     if (!why) why = &dummy;
 
@@ -393,19 +407,17 @@ bool sbmat_apply_in_session(NSDictionary<NSString *, NSDictionary *> *config, NS
         printf("[SBMAT] %s: %s%s\n", item->key, mode == SBMatModeColor ? "Color" : mode == SBMatModeDisabled ? "Disabled" : "Visible",
                mode == SBMatModeColor ? [[NSString stringWithFormat:@" blur=%.0f tint=%@", blur,
                                           [rgba componentsJoinedByString:@","] ?: @"default"] UTF8String] : "");
-        // Color tints through the filter's color matrix, which is drawn with
-        // the material's rounding everywhere; "square" uses a plain tint.
-        bool filterTint = !(item->squareOption && [c[@"square"] boolValue]);
+        NSArray *itemSquare = !strcmp(item->key, "notifications") ? squareTint : nil;
         for (NSString *name in sbmat_item_recipes(item)) {
             [allNames addObject:name];
-            if (mode == SBMatModeVisible) continue;
-            NSData *data = sbmat_edited_recipe(name, mode, rgba, blur, filterTint);
+            if (mode == SBMatModeVisible && !itemSquare) continue;
+            NSData *data = sbmat_edited_recipe(name, mode, rgba, blur, itemSquare);
             if (data) { files[[name stringByAppendingPathExtension:@"materialrecipe"]] = data; continue; }
             // A descendant recipe: ours points at an edited copy of its
             // ancestor (under our own name) and adds no changes of its own.
             NSDictionary *desc = sbmat_system_descendant(name);
             NSString *ancestor = [desc[@"ancestorRecipe"] isKindOfClass:NSString.class] ? desc[@"ancestorRecipe"] : nil;
-            NSData *base = ancestor ? sbmat_edited_recipe(ancestor, mode, rgba, blur, filterTint) : nil;
+            NSData *base = ancestor ? sbmat_edited_recipe(ancestor, mode, rgba, blur, itemSquare) : nil;
             if (!base) { printf("[SBMAT] %s: not on this iOS version, skipped\n", name.UTF8String); continue; }
             printf("[SBMAT] %s: descendant of %s, original: %s\n", name.UTF8String, ancestor.UTF8String,
                    [[desc.description componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet] componentsJoinedByString:@" "].UTF8String);
