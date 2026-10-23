@@ -294,22 +294,33 @@ static int sbmat_reload_views_under(uint64_t root, NSSet<NSString *> *names, con
     static uint64_t views[256];
     int n = sb_collect_views_main(root, r_class("MTMaterialView"), views, 256);
     int reloaded = 0;
+    NSCountedSet *seen = [NSCountedSet set];
     for (int i = 0; i < n; i++) {
         uint64_t layer = r_msg2_main(views[i], "layer", 0, 0, 0, 0);
         NSString *recipe = sbmat_recipe_name(layer);
+        [seen addObject:recipe ?: @"?"];
         if (recipe && [names containsObject:recipe] && sbmat_reload_view(views[i])) reloaded++;
     }
-    printf("[SBMAT] %s: %d material view(s), %d reloaded\n", what, n, reloaded);
+    NSMutableArray *list = [NSMutableArray array];
+    for (NSString *r in seen) [list addObject:[NSString stringWithFormat:@"%@x%lu", r, (unsigned long)[seen countForObject:r]]];
+    printf("[SBMAT] %s: %d material view(s) [%s], %d reloaded\n", what, n,
+           [list componentsJoinedByString:@", "].UTF8String, reloaded);
     return reloaded;
 }
 
-// Control Center keeps its views once it has been opened.
+// Control Center keeps its views once it has been opened: reach them
+// through its view controller, or else its window.
 static void sbmat_reload_control_center(NSSet<NSString *> *names)
 {
     uint64_t cc = r_msg2_main(r_class("SBControlCenterController"), "sharedInstance", 0, 0, 0, 0);
     uint64_t vc = r_is_objc_ptr(cc) && r_responds_main(cc, "viewController") ? r_msg2_main(cc, "viewController", 0, 0, 0, 0) : 0;
+    if (!r_is_objc_ptr(vc) && r_is_objc_ptr(cc)) vc = r_ivar_value(cc, "_viewController");
     bool loaded = r_is_objc_ptr(vc) && r_msg2_main(vc, "isViewLoaded", 0, 0, 0, 0);
-    sbmat_reload_views_under(loaded ? r_msg2_main(vc, "view", 0, 0, 0, 0) : 0, names, "Control Center");
+    uint64_t window = r_is_objc_ptr(cc) ? r_ivar_value(cc, "_window") : 0;
+    printf("[SBMAT] Control Center: controller=%d viewController=%d viewLoaded=%d window=%d\n",
+           r_is_objc_ptr(cc), r_is_objc_ptr(vc), loaded, r_is_objc_ptr(window));
+    int n = sbmat_reload_views_under(loaded ? r_msg2_main(vc, "view", 0, 0, 0, 0) : 0, names, "Control Center view");
+    if (!n && r_is_objc_ptr(window)) sbmat_reload_views_under(window, names, "Control Center window");
 }
 
 // The blur behind the app switcher (and over the Home Screen): one
