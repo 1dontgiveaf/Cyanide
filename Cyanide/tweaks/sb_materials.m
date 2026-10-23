@@ -173,13 +173,19 @@ static double sbmat_unit(NSArray<NSNumber *> *rgba, NSUInteger i, double fallbac
 // backdrop for a shared group, and CoreMaterial draws a plain tint as such a
 // layer's background color, unrounded -- square notifications, on purpose.
 // nil when the system has no such recipe.
+// Test: lara's recipe for Color, exactly (rooootdev's ColorSwapManager.setColor):
+// no materialSettingsVersion (so CoreMaterial reads the older format) and the
+// tint nested inside materialFiltering, which replaces Apple's filter.
+static NSData *sbmat_lara_recipe(NSDictionary *plist, NSArray<NSNumber *> *rgba, double blur);
+
 static NSData *sbmat_edited_recipe(NSString *name, SBMatMode mode, NSArray<NSNumber *> *rgba, double blur,
-                                   NSArray<NSNumber *> *squareTint)
+                                   NSArray<NSNumber *> *squareTint, bool laraFormat)
 {
     NSURL *url = sbmat_system_recipe_url(name);
     NSData *data = url ? [NSData dataWithContentsOfURL:url] : nil;
     NSDictionary *plist = data ? [NSPropertyListSerialization propertyListWithData:data options:0 format:NULL error:nil] : nil;
     if (![plist isKindOfClass:NSDictionary.class]) return nil;
+    if (laraFormat && mode == SBMatModeColor) return sbmat_lara_recipe(plist, rgba, blur);
     NSMutableDictionary *changed = [plist mutableCopy];
     NSMutableDictionary *base = [plist[@"baseMaterial"] isKindOfClass:NSDictionary.class] ? [plist[@"baseMaterial"] mutableCopy]
                                                                                        : [NSMutableDictionary dictionary];
@@ -208,6 +214,36 @@ static NSData *sbmat_edited_recipe(NSString *name, SBMatMode mode, NSArray<NSNum
     }
     changed[@"baseMaterial"] = base;
     return [NSPropertyListSerialization dataWithPropertyList:changed format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
+}
+
+// lara's changeValue: every key named `key`, at any depth, replaced by
+// `newKey: replacement`.
+static id sbmat_lara_change(id obj, NSString *key, NSString *newKey, id replacement)
+{
+    if (![obj isKindOfClass:NSDictionary.class]) return obj;
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    [(NSDictionary *)obj enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) {
+        if ([k isEqual:key]) out[newKey] = replacement;
+        else out[k] = sbmat_lara_change(v, key, newKey, replacement);
+    }];
+    return out;
+}
+
+static NSData *sbmat_lara_recipe(NSDictionary *plist, NSArray<NSNumber *> *rgba, double blur)
+{
+    NSMutableDictionary *changed = [plist mutableCopy];
+    [changed removeObjectsForKeys:@[ @"materialSettingsVersion", @"visualStyleSetVersion", @"MdC" ]];
+    double a = sbmat_unit(rgba, 3, 0.5);   // lara's alpha multiplier for notifications is 1
+    NSDictionary *tinting = @{ @"tintAlpha": @(a),
+                               @"tintColor": @{ @"alpha": @(a), @"red": @(sbmat_unit(rgba, 0, 0)),
+                                                @"green": @(sbmat_unit(rgba, 1, 0)), @"blue": @(sbmat_unit(rgba, 2, 0)) } };
+    NSNumber *radius = @((NSInteger)(isfinite(blur) ? MIN(MAX(blur, 0), 100) : 0));
+    id out = sbmat_lara_change(changed, @"blurRadius", @"blurRadius", radius);
+    out = sbmat_lara_change(out, @"materialFiltering", @"materialFiltering", @{ @"blurRadius": radius, @"tinting": tinting });
+    out = sbmat_lara_change(out, @"filtering", @"tinting", tinting);
+    printf("[SBMAT] lara format: %s\n",
+           [[[out description] componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet] componentsJoinedByString:@" "].UTF8String);
+    return [NSPropertyListSerialization dataWithPropertyList:out format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
 }
 
 #pragma mark - SpringBoard
@@ -420,12 +456,14 @@ bool sbmat_apply_in_session(NSDictionary<NSString *, NSDictionary *> *config, NS
         printf("[SBMAT] %s: %s%s\n", item->key, mode == SBMatModeColor ? "Color" : mode == SBMatModeDisabled ? "Disabled" : "Visible",
                mode == SBMatModeColor ? [[NSString stringWithFormat:@" blur=%.0f tint=%@", blur,
                                           [rgba componentsJoinedByString:@","] ?: @"default"] UTF8String] : "");
-        NSArray *itemSquare = !strcmp(item->key, "notifications") ? squareTint : nil;
+        bool isNotifications = !strcmp(item->key, "notifications");
+        NSArray *itemSquare = isNotifications ? squareTint : nil;
+        bool laraFormat = isNotifications && [c[@"lara"] boolValue];
         if (mode == SBMatModeDisabled) [disabled addObjectsFromArray:sbmat_item_recipes(item)];
         for (NSString *name in sbmat_item_recipes(item)) {
             [allNames addObject:name];
             if (mode == SBMatModeVisible && !itemSquare) continue;
-            NSData *data = sbmat_edited_recipe(name, mode, rgba, blur, itemSquare);
+            NSData *data = sbmat_edited_recipe(name, mode, rgba, blur, itemSquare, laraFormat);
             if (data) { files[[name stringByAppendingPathExtension:@"materialrecipe"]] = data; continue; }
             // A descendant recipe: ours points at an edited copy of its
             // ancestor (under our own name) and keeps Apple's changes --
@@ -434,7 +472,7 @@ bool sbmat_apply_in_session(NSDictionary<NSString *, NSDictionary *> *config, NS
             // dismissing Control Center got slow. Only the blur radius is ours.
             NSDictionary *desc = sbmat_system_descendant(name);
             NSString *ancestor = [desc[@"ancestorRecipe"] isKindOfClass:NSString.class] ? desc[@"ancestorRecipe"] : nil;
-            NSData *base = ancestor ? sbmat_edited_recipe(ancestor, mode, rgba, blur, itemSquare) : nil;
+            NSData *base = ancestor ? sbmat_edited_recipe(ancestor, mode, rgba, blur, itemSquare, false) : nil;
             if (!base) { printf("[SBMAT] %s: not on this iOS version, skipped\n", name.UTF8String); continue; }
             printf("[SBMAT] %s: descendant of %s, original: %s\n", name.UTF8String, ancestor.UTF8String,
                    [[desc.description componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet] componentsJoinedByString:@" "].UTF8String);

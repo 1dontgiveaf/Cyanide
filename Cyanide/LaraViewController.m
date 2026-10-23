@@ -256,6 +256,12 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
     [self.tableView reloadSections:[NSIndexSet indexSetWithIndex:sw.tag] withRowAnimation:UITableViewRowAnimationAutomatic];
 }
 
+- (void)sbLaraFormatChanged:(UISwitch *)sw
+{
+    const SBMatItem *item = [self sbItemForSection:sw.tag];
+    if (item) [self sbSet:@(sw.on) forKey:@"lara" item:item];
+}
+
 - (void)sbSquareColorChanged:(UIColorWell *)well
 {
     CGFloat r = 0, g = 0, b = 0, a = 1;
@@ -320,7 +326,8 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             if (section == 0) return 2;
             if ([self sbIsSquaresSection:section]) return [[self sbSquares][@"on"] boolValue] ? 2 : 1;
             const SBMatItem *item = [self sbItemForSection:section];
-            return item && [[self sbChoiceFor:item][@"mode"] integerValue] == SBMatModeColor ? 3 : 1;   // mode, tint, blur
+            if (!item || [[self sbChoiceFor:item][@"mode"] integerValue] != SBMatModeColor) return 1;
+            return !strcmp(item->key, "notifications") ? 4 : 3;   // mode, tint, blur (, lara's format: test)
         }
         case LaraToolHiddenSettings: {
             NSInteger n = 0;
@@ -470,6 +477,15 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
                 [well addTarget:self action:@selector(sbColorChanged:) forControlEvents:UIControlEventValueChanged];
                 [well sizeToFit];
                 cell.accessoryView = well;
+            } else if (indexPath.row == 3) {
+                c.text = @"lara's Format (Test)";
+                c.secondaryText = @"Writes the recipe the way lara does, to see whether lock screen notifications stay rounded.";
+                c.secondaryTextProperties.color = UIColor.secondaryLabelColor;
+                UISwitch *sw = [UISwitch new];
+                sw.on = [[self sbChoiceFor:item][@"lara"] boolValue];
+                sw.tag = indexPath.section;
+                [sw addTarget:self action:@selector(sbLaraFormatChanged:) forControlEvents:UIControlEventValueChanged];
+                cell.accessoryView = sw;
             } else {
                 c.text = @"Blur";
                 c.secondaryText = [NSString stringWithFormat:@"%.0f", [self sbBlurFor:item]];
