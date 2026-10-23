@@ -9,6 +9,9 @@
 #import <string.h>
 #import <unistd.h>
 #import "../LogTextView.h"
+#import <Foundation/Foundation.h>
+#import <errno.h>
+#import <signal.h>
 
 static bool valid_level(const char *level) {
     if (!level) return false;
@@ -31,6 +34,8 @@ bool powercuff_apply(const char *level)
     }
 
     bool ok = false;
+    int daemonPid = remote_call_current_pid();
+    long thermalBefore = (long)NSProcessInfo.processInfo.thermalState;
     do {
         uint64_t cls = r_class("CPMSHelper");
         if (!cls) { printf("[POWERCUFF] CPMSHelper class missing - wrong process?\n"); break; }
@@ -70,5 +75,22 @@ bool powercuff_apply(const char *level)
     } while (0);
 
     destroy_remote_call();
+
+    // Check that it took: thermalmonitord must still be the same process
+    // (a restart forgets the simulated level) and the system thermal state
+    // should follow (Heavy reports Critical in apps like CPU X).
+    if (ok) {
+        usleep(1500000);
+        int alive = daemonPid > 0 ? kill(daemonPid, 0) : -1;
+        int aliveErr = alive == 0 ? 0 : errno;
+        long thermalAfter = (long)NSProcessInfo.processInfo.thermalState;
+        static const char *names[] = { "nominal", "fair", "serious", "critical" };
+        printf("[POWERCUFF] check: thermalmonitord pid %d %s; thermal state %s -> %s\n", daemonPid,
+               alive == 0 || aliveErr == EPERM ? "still running" : "GONE (restarted? the level is lost)",
+               thermalBefore >= 0 && thermalBefore < 4 ? names[thermalBefore] : "?",
+               thermalAfter >= 0 && thermalAfter < 4 ? names[thermalAfter] : "?");
+        log_user("[POWERCUFF] %s: system thermal state now %s.\n", level,
+                 thermalAfter >= 0 && thermalAfter < 4 ? names[thermalAfter] : "unknown");
+    }
     return ok;
 }
