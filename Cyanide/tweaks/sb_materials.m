@@ -283,7 +283,10 @@ static NSSet<NSString *> *g_sbmat_disabled;
 // which now holds ours or Apple's) and show it fully. Disabled hides it: an
 // existing layer keeps its old filters when the new settings are an identity
 // (CoreMaterial's preservingFiltersIfIdentity), so its blur would stay.
-static bool sbmat_reload_view(uint64_t view)
+// setWeighting: false for views whose owner animates the weighting itself
+// (Control Center on every open and dismiss): forcing it there left the
+// background behind for a moment when dismissing.
+static bool sbmat_reload_view(uint64_t view, bool setWeighting)
 {
     uint64_t layer = r_is_objc_ptr(view) ? r_msg2_main(view, "layer", 0, 0, 0, 0) : 0;
     NSString *recipe = r_is_objc_ptr(layer) && r_responds_main(layer, "setRecipeName:") ? sbmat_recipe_name(layer) : nil;
@@ -298,9 +301,9 @@ static bool sbmat_reload_view(uint64_t view)
     // Weighting 0 shows the previous settings, 1 the new ones; the material
     // view manages it, the layer follows.
     double one = 1.0;
-    if (r_responds_main(view, "setWeighting:"))
+    if (setWeighting && r_responds_main(view, "setWeighting:"))
         r_msg2_main_raw(view, "setWeighting:", &one, sizeof(one), NULL, 0, NULL, 0, NULL, 0);
-    if (r_responds_main(layer, "setWeighting:"))
+    if (setWeighting && r_responds_main(layer, "setWeighting:"))
         r_msg2_main_raw(layer, "setWeighting:", &one, sizeof(one), NULL, 0, NULL, 0, NULL, 0);
     // The filters are rebuilt in -layoutSublayers only while _needsConfiguring is set.
     if (r_responds_main(layer, "_setNeedsConfiguring"))
@@ -315,7 +318,7 @@ static bool sbmat_reload_view(uint64_t view)
 
 // Existing material views under `root` whose recipe is one of `names`,
 // reloaded (main-thread walk: only for small subtrees).
-static int sbmat_reload_views_under(uint64_t root, NSSet<NSString *> *names, const char *what)
+static int sbmat_reload_views_under(uint64_t root, NSSet<NSString *> *names, const char *what, bool setWeighting)
 {
     if (!r_is_objc_ptr(root)) { printf("[SBMAT] %s: not loaded, nothing to reload\n", what); return 0; }
     static uint64_t views[256];
@@ -326,7 +329,7 @@ static int sbmat_reload_views_under(uint64_t root, NSSet<NSString *> *names, con
         uint64_t layer = r_msg2_main(views[i], "layer", 0, 0, 0, 0);
         NSString *recipe = sbmat_recipe_name(layer);
         [seen addObject:recipe ?: @"?"];
-        if (recipe && [names containsObject:recipe] && sbmat_reload_view(views[i])) reloaded++;
+        if (recipe && [names containsObject:recipe] && sbmat_reload_view(views[i], setWeighting)) reloaded++;
     }
     NSMutableArray *list = [NSMutableArray array];
     for (NSString *r in seen) [list addObject:[NSString stringWithFormat:@"%@x%lu", r, (unsigned long)[seen countForObject:r]]];
@@ -353,8 +356,8 @@ static void sbmat_reload_control_center(NSSet<NSString *> *names)
     uint64_t window = r_is_objc_ptr(cc) ? r_ivar_value(cc, "_window") : 0;
     printf("[SBMAT] Control Center: controller=%d viewController=%d viewLoaded=%d window=%d\n",
            r_is_objc_ptr(cc), r_is_objc_ptr(vc), loaded, r_is_objc_ptr(window));
-    int n = sbmat_reload_views_under(loaded ? r_msg2_main(vc, "view", 0, 0, 0, 0) : 0, names, "Control Center view");
-    if (!n && r_is_objc_ptr(window)) sbmat_reload_views_under(window, names, "Control Center window");
+    int n = sbmat_reload_views_under(loaded ? r_msg2_main(vc, "view", 0, 0, 0, 0) : 0, names, "Control Center view", false);
+    if (!n && r_is_objc_ptr(window)) sbmat_reload_views_under(window, names, "Control Center window", false);
 }
 
 // The blur behind the app switcher (and over the Home Screen): one
@@ -366,7 +369,7 @@ static void sbmat_reload_home_backdrop(NSSet<NSString *> *names)
     uint64_t backdrop = r_is_objc_ptr(ui) ? r_ivar_value(ui, "_homeScreenBackdropView") : 0;
     uint64_t material = r_is_objc_ptr(backdrop) ? r_ivar_value(backdrop, "_materialView") : 0;
     NSString *recipe = r_is_objc_ptr(material) ? sbmat_recipe_name(r_msg2_main(material, "layer", 0, 0, 0, 0)) : nil;
-    bool reloaded = recipe && [names containsObject:recipe] && sbmat_reload_view(material);
+    bool reloaded = recipe && [names containsObject:recipe] && sbmat_reload_view(material, true);
     if (r_is_objc_ptr(backdrop) && r_responds_main(backdrop, "_invalidateBackdropSnapshot"))
         r_msg2_main(backdrop, "_invalidateBackdropSnapshot", 0, 0, 0, 0);
     printf("[SBMAT] home screen backdrop: %s, material %s (%s)\n", r_is_objc_ptr(backdrop) ? "found" : "not found",
@@ -401,6 +404,7 @@ bool sbmat_apply_in_session(NSDictionary<NSString *, NSDictionary *> *config, NS
     NSDictionary *squares = [config[kSBMatSquaresKey] isKindOfClass:NSDictionary.class] ? config[kSBMatSquaresKey] : nil;
     NSArray *squareTint = [squares[@"on"] boolValue]
         ? ([squares[@"color"] isKindOfClass:NSArray.class] ? squares[@"color"] : @[ @0, @0, @0, @0.5 ]) : nil;
+    printf("[SBMAT] square notifications: %s\n", squareTint ? [[squareTint componentsJoinedByString:@","] UTF8String] : "off");
     __autoreleasing NSString *dummy = nil;
     if (!why) why = &dummy;
 
@@ -527,7 +531,7 @@ bool sbmat_apply_in_session(NSDictionary<NSString *, NSDictionary *> *config, NS
     //    banners are made when needed and get the new recipes from the cache.
     g_sbmat_disabled = [disabled copy];
     uint64_t dockView = sbmat_dock_material_view();
-    bool dockOK = dockView && sbmat_reload_view(dockView);
+    bool dockOK = dockView && sbmat_reload_view(dockView, true);
     NSSet<NSString *> *managed = [NSSet setWithArray:allNames];
     sbmat_reload_control_center(managed);
     sbmat_reload_home_backdrop(managed);
