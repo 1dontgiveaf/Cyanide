@@ -28,6 +28,9 @@ bool powercuff_apply(const char *level)
     }
     printf("[POWERCUFF] === entry === target=%s\n", level);
 
+    // Match the v1.3.6 arm count for this daemon without changing the
+    // launchd-oriented default or the shared RemoteCall safety checks.
+    remote_call_set_next_init_target_threads("thermalmonitord", 2);
     if (init_remote_call("thermalmonitord", false) != 0) {
         printf("[POWERCUFF] init_remote_call(thermalmonitord) failed\n");
         return false;
