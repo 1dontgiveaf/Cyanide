@@ -178,19 +178,41 @@ static bool fontow_write_file_cache(NSString *path, NSData *data, NSString **why
     bool ok = vmMap && fontow_entry_for(vmMap, (uint64_t)(uintptr_t)map, &e) && e.object &&
               e.end - e.start >= ((size + page - 1) & ~(page - 1));
     if (!ok) *why = @"The font file's object wasn't found in Cyanide's memory map.";
+    else printf("[FONTOW] %s: %zu bytes, entry 0x%llx-0x%llx object=0x%llx offset=0x%llx\n",
+                cpath, size, e.start, e.end, e.object, e.offset);
     const uint8_t *src = data.bytes;
     const size_t chunk = 1u << 20;
     for (size_t off = 0; ok && off < size; off += chunk) {
         size_t len = MIN(chunk, ((size - off) + page - 1) & ~(page - 1));
         uint64_t addr = (uint64_t)(uintptr_t)(map + off);
-        struct VMShmem w = vm_map_object_range(e.object, e.offset + (addr - e.start), len);
-        if (!w.used) { *why = @"A page of the font couldn't be mapped writable."; ok = false; break; }
-        uint8_t *dst = (uint8_t *)(uintptr_t)w.localAddress;
         size_t valid = MIN(len, size - off);                       // bytes of the file in this chunk
         size_t fromData = off < data.length ? MIN(valid, data.length - off) : 0;
-        if (fromData) memcpy(dst, src + off, fromData);
-        if (valid > fromData) memset(dst + fromData, 0, valid - fromData);
-        vm_shmem_release(&w, len);
+        struct VMShmem w = vm_map_object_range(e.object, e.offset + (addr - e.start), len);
+        if (w.used) {
+            uint8_t *dst = (uint8_t *)(uintptr_t)w.localAddress;
+            if (fromData) memcpy(dst, src + off, fromData);
+            if (valid > fromData) memset(dst + fromData, 0, valid - fromData);
+            vm_shmem_release(&w, len);
+            continue;
+        }
+        // A whole chunk wouldn't map (the object can report a smaller size
+        // than the file): page by page, as the write test did.
+        printf("[FONTOW] chunk at 0x%zx (0x%zx bytes) didn't map; page by page\n", off, len);
+        for (size_t p = 0; p < valid; p += page) {
+            struct VMShmem pw = vm_map_object_range(e.object, e.offset + (addr - e.start) + p, page);
+            if (!pw.used) {
+                printf("[FONTOW] page at 0x%zx didn't map either\n", off + p);
+                *why = @"A page of the font couldn't be mapped writable.";
+                ok = false;
+                break;
+            }
+            uint8_t *dst = (uint8_t *)(uintptr_t)pw.localAddress;
+            size_t n = MIN(page, valid - p);
+            size_t fromHere = p < fromData ? MIN(n, fromData - p) : 0;
+            if (fromHere) memcpy(dst, src + off + p, fromHere);
+            if (n > fromHere) memset(dst + fromHere, 0, n - fromHere);
+            vm_shmem_release(&pw, page);
+        }
     }
     munmap(map, size);
     if (!ok) return false;
@@ -241,6 +263,17 @@ bool fontow_apply(FontOWTarget target, NSString *fontPath, NSString **result)
     NSString *why = nil;
     bool ok = fontow_write_file_cache(path, font, &why);
     if (ok) fontow_set_replaced(target, true);
+    else if (!fontow_is_replaced(target)) {
+        // A failure part-way leaves the new font in the pages before it: put
+        // the original back (the failed page and everything after it were
+        // never touched, so this restores the whole file).
+        NSData *original = [NSData dataWithContentsOfFile:backup options:NSDataReadingMappedIfSafe error:nil];
+        NSString *ignored = nil;
+        bool undone = original.length && fontow_write_file_cache(path, original, &ignored);
+        printf("[FONTOW] after the failure, original written back: %s\n", undone ? "yes" : "partly");
+        why = [why stringByAppendingString:undone ? @" Nothing was changed."
+                                                  : @" Restart the device before respringing, to be safe."];
+    }
     *result = ok ? [NSString stringWithFormat:@"%@ replaced with %@. Respring to see it; restart or Restore to undo.",
                     fontow_target_title(target), fontPath.lastPathComponent]
                  : why;

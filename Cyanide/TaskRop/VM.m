@@ -318,7 +318,9 @@ static struct VMShmem vm_create_shmem_with_object_len(struct VMObject *object, u
                        (memory_object_offset_t)object->entryOffset,
                        FALSE, curProt, maxProt, VM_INHERIT_NONE);
     if (ret != KERN_SUCCESS) {
-        printf("[%s:%d] mach_vm_map failed: %s\n", __FUNCTION__, __LINE__, mach_error_string(ret));
+        printf("[%s:%d] mach_vm_map failed: %s (len=%#llx entryOffset=%#llx entry=%#llx object size=%#llx)\n",
+               __FUNCTION__, __LINE__, mach_error_string(ret), (unsigned long long)len,
+               (unsigned long long)object->entryOffset, (unsigned long long)roundedSize, (unsigned long long)objectSize);
         mappedAddr = 0;
     }
  
