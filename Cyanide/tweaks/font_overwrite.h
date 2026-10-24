@@ -10,7 +10,9 @@
 //  Cyanide instead maps the file's own VM object a second time, writable,
 //  through the same path App Decrypt and RemoteCall use (vm_map_object_range).
 //
-//  Needs kernel access; blocking, run off-main.
+//  Needs kernel access and an open SpringBoard session (the Lock Screen's
+//  PosterBoard and chronod are restarted from there after a change); blocking,
+//  run off-main.
 //
 
 #import <Foundation/Foundation.h>

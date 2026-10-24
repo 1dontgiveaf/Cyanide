@@ -9,6 +9,8 @@
 
 #import "font_overwrite.h"
 #import "font_patcher.h"
+#import "remote_objc.h"
+#import <signal.h>
 #import "../LogTextView.h"
 #import "../TaskRop/RemoteCall.h"
 #import "../TaskRop/VM.h"
@@ -240,6 +242,25 @@ static bool fontow_write_file_cache(NSString *path, NSData *data, NSString **why
     return true;
 }
 
+#pragma mark - Processes holding the old font
+
+// The Lock Screen isn't SpringBoard: PosterBoard draws the clock and chronod
+// the widgets, and a respring leaves both running with the font they loaded
+// (and their rendered images). Ended from inside SpringBoard (Cyanide may not
+// signal them; it runs in a SpringBoard session here), launchd starts them
+// again and they load the font as it is now.
+static void fontow_restart_font_users(void)
+{
+    static procmgr_entry_t entries[2048];
+    int n = procmgr_list(entries, 2048);
+    for (int i = 0; i < n; i++) {
+        if (strcmp(entries[i].name, "PosterBoard") != 0 && strcmp(entries[i].name, "chronod") != 0) continue;
+        uint64_t rc = r_dlsym_call(R_TIMEOUT, "kill", (uint64_t)entries[i].pid, SIGKILL, 0, 0, 0, 0, 0, 0);
+        printf("[FONTOW] restarted %s (pid %d): %s\n", entries[i].name, entries[i].pid,
+               r_last_call_ok() && rc == 0 ? "ok" : "not allowed or failed");
+    }
+}
+
 #pragma mark - Apply and restore
 
 // Apple's system fonts: the SF families (".SF UI", "SF Pro", ...).
@@ -304,8 +325,10 @@ bool fontow_apply(FontOWTarget target, NSString *fontPath, NSString **result)
     NSString *why = nil;
     size_t stopped = 0;
     bool ok = fontow_write_file_cache(path, font, &why, &stopped);
-    if (ok) fontow_set_replaced(target, true);
-    else if (!fontow_is_replaced(target)) {
+    if (ok) {
+        fontow_set_replaced(target, true);
+        fontow_restart_font_users();
+    } else if (!fontow_is_replaced(target)) {
         // A failure part-way leaves the new font in the pages before it: put
         // the original back. The failed page and everything after it were
         // never touched, so stopping at the same page again still means the
@@ -351,7 +374,10 @@ bool fontow_restore(FontOWTarget target, NSString **result)
     }
     NSString *why = nil;
     bool ok = fontow_write_file_cache(fontow_target_path(target), original, &why, NULL);
-    if (ok) fontow_set_replaced(target, false);
+    if (ok) {
+        fontow_set_replaced(target, false);
+        fontow_restart_font_users();
+    }
     *result = ok ? [NSString stringWithFormat:@"%@ restored. Respring to see it.", fontow_target_title(target)] : why;
     log_user("[FONTOW] %s\n", (*result).UTF8String);
     return ok;
