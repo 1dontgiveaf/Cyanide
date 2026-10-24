@@ -8,6 +8,7 @@
 //
 
 #import "font_overwrite.h"
+#import "font_patcher.h"
 #import "../LogTextView.h"
 #import "../TaskRop/RemoteCall.h"
 #import "../TaskRop/VM.h"
@@ -265,6 +266,23 @@ bool fontow_apply(FontOWTarget target, NSString *fontPath, NSString **result)
         return false;
     }
 
+    // A plain font in place of a variable system font: iOS wouldn't find the
+    // weights it asks for and fall back to another font. Adapt it first,
+    // against the original (the file itself may hold a replaced font now).
+    NSString *note = nil;
+    NSData *originalForPatch = [NSData dataWithContentsOfFile:backup options:NSDataReadingMappedIfSafe error:nil];
+    if (originalForPatch && fontpatch_needed(originalForPatch, font)) {
+        NSString *patchError = nil;
+        NSData *adapted = fontpatch_adapt(originalForPatch, font, &patchError, &note);
+        if (!adapted) {
+            *result = [NSString stringWithFormat:@"%@ can't be used as the %@: %@", fontPath.lastPathComponent,
+                       fontow_target_title(target).lowercaseString, patchError];
+            log_user("[FONTOW] %s\n", (*result).UTF8String);
+            return false;
+        }
+        font = adapted;
+    }
+
     NSString *why = nil;
     size_t stopped = 0;
     bool ok = fontow_write_file_cache(path, font, &why, &stopped);
@@ -284,8 +302,9 @@ bool fontow_apply(FontOWTarget target, NSString *fontPath, NSString **result)
         why = [why stringByAppendingString:undone ? @" Nothing was changed."
                                                   : @" Restart the device before respringing, to be safe."];
     }
-    *result = ok ? [NSString stringWithFormat:@"%@ replaced with %@. Respring to see it; restart or Restore to undo.",
-                    fontow_target_title(target), fontPath.lastPathComponent]
+    *result = ok ? [NSString stringWithFormat:@"%@ replaced with %@%@. Respring to see it; restart or Restore to undo.",
+                    fontow_target_title(target), fontPath.lastPathComponent,
+                    note ? [NSString stringWithFormat:@" (%@)", note] : @""]
                  : why;
     log_user("[FONTOW] %s\n", (*result).UTF8String);
     return ok;
