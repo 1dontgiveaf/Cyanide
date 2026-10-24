@@ -147,8 +147,12 @@ static bool fontow_entry_for(uint64_t map, uint64_t address, struct VMEntryInfo 
 // Replaces the contents of `path` in the file cache with `data` (zero-filled
 // to the file's size). The file is mapped read-only (which also faults its
 // pages in) and its VM object mapped a second time, writable, chunk by chunk.
-static bool fontow_write_file_cache(NSString *path, NSData *data, NSString **why)
+// *stoppedAt: on a failure, the offset of the first byte not written.
+static bool fontow_write_file_cache(NSString *path, NSData *data, NSString **why, size_t *stoppedAt)
 {
+    size_t stoppedDummy = 0;
+    if (!stoppedAt) stoppedAt = &stoppedDummy;
+    *stoppedAt = 0;
     const char *cpath = path.fileSystemRepresentation;
     int fd = open(cpath, O_RDONLY | O_CLOEXEC);
     struct stat st;
@@ -187,7 +191,7 @@ static bool fontow_write_file_cache(NSString *path, NSData *data, NSString **why
         uint64_t addr = (uint64_t)(uintptr_t)(map + off);
         size_t valid = MIN(len, size - off);                       // bytes of the file in this chunk
         size_t fromData = off < data.length ? MIN(valid, data.length - off) : 0;
-        struct VMShmem w = vm_map_object_range(e.object, e.offset + (addr - e.start), len);
+        struct VMShmem w = vm_map_file_object_range(e.object, e.offset + (addr - e.start), len);
         if (w.used) {
             uint8_t *dst = (uint8_t *)(uintptr_t)w.localAddress;
             if (fromData) memcpy(dst, src + off, fromData);
@@ -199,9 +203,10 @@ static bool fontow_write_file_cache(NSString *path, NSData *data, NSString **why
         // than the file): page by page, as the write test did.
         printf("[FONTOW] chunk at 0x%zx (0x%zx bytes) didn't map; page by page\n", off, len);
         for (size_t p = 0; p < valid; p += page) {
-            struct VMShmem pw = vm_map_object_range(e.object, e.offset + (addr - e.start) + p, page);
+            struct VMShmem pw = vm_map_file_object_range(e.object, e.offset + (addr - e.start) + p, page);
             if (!pw.used) {
                 printf("[FONTOW] page at 0x%zx didn't map either\n", off + p);
+                *stoppedAt = off + p;
                 *why = @"A page of the font couldn't be mapped writable.";
                 ok = false;
                 break;
@@ -261,15 +266,20 @@ bool fontow_apply(FontOWTarget target, NSString *fontPath, NSString **result)
     }
 
     NSString *why = nil;
-    bool ok = fontow_write_file_cache(path, font, &why);
+    size_t stopped = 0;
+    bool ok = fontow_write_file_cache(path, font, &why, &stopped);
     if (ok) fontow_set_replaced(target, true);
     else if (!fontow_is_replaced(target)) {
         // A failure part-way leaves the new font in the pages before it: put
-        // the original back (the failed page and everything after it were
-        // never touched, so this restores the whole file).
+        // the original back. The failed page and everything after it were
+        // never touched, so stopping at the same page again still means the
+        // whole file is the original.
         NSData *original = [NSData dataWithContentsOfFile:backup options:NSDataReadingMappedIfSafe error:nil];
         NSString *ignored = nil;
-        bool undone = original.length && fontow_write_file_cache(path, original, &ignored);
+        size_t undoStopped = 0;
+        bool undone = stopped == 0 ||   // nothing was written
+                      (original.length && (fontow_write_file_cache(path, original, &ignored, &undoStopped) ||
+                                           (undoStopped && undoStopped >= stopped)));
         printf("[FONTOW] after the failure, original written back: %s\n", undone ? "yes" : "partly");
         why = [why stringByAppendingString:undone ? @" Nothing was changed."
                                                   : @" Restart the device before respringing, to be safe."];
@@ -293,7 +303,7 @@ bool fontow_restore(FontOWTarget target, NSString **result)
         return false;
     }
     NSString *why = nil;
-    bool ok = fontow_write_file_cache(fontow_target_path(target), original, &why);
+    bool ok = fontow_write_file_cache(fontow_target_path(target), original, &why, NULL);
     if (ok) fontow_set_replaced(target, false);
     *result = ok ? [NSString stringWithFormat:@"%@ restored. Respring to see it.", fontow_target_title(target)] : why;
     log_user("[FONTOW] %s\n", (*result).UTF8String);

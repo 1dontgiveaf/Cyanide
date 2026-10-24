@@ -102,4 +102,8 @@ bool vm_map_entry_info(uint64_t entryAddr, struct VMEntryInfo *out);
 // `objectOffset` (page aligned) into this process; release with
 // vm_shmem_release(&shmem, len).
 struct VMShmem vm_map_object_range(uint64_t object, uint64_t objectOffset, uint64_t len);
+// As vm_map_object_range, for the object behind a file the caller has mapped
+// itself (and faulted in): not capped at the object's reported size, which
+// for some system files is far smaller than the file (SFUI.ttf: 16 KB of 8.3 MB).
+struct VMShmem vm_map_file_object_range(uint64_t object, uint64_t objectOffset, uint64_t len);
 void vm_shmem_release(struct VMShmem *shmem, uint64_t len);

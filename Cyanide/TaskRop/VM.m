@@ -163,15 +163,19 @@ struct VMObject vm_get_object(uint64_t map, uint64_t address)
 }
  
 
-static struct VMShmem vm_create_shmem_with_object_len(struct VMObject *object, uint64_t len);
+static struct VMShmem vm_create_shmem_with_object_len(struct VMObject *object, uint64_t len, bool capToObject);
 
 struct VMShmem vm_create_shmem_with_object(struct VMObject *object)
 {
-    return vm_create_shmem_with_object_len(object, PAGE_SIZE);
+    return vm_create_shmem_with_object_len(object, PAGE_SIZE, true);
 }
 
 // As above, for `len` bytes (a page multiple) instead of one page.
-static struct VMShmem vm_create_shmem_with_object_len(struct VMObject *object, uint64_t len)
+// capToObject: keep the mapping inside the size the object reports. Off only
+// for a caller that knows the range is valid from elsewhere: a vnode object
+// can report far less than its file (SFUI.ttf: 16 KB for 8.3 MB) while every
+// page of it faults in fine through the file's own mapping.
+static struct VMShmem vm_create_shmem_with_object_len(struct VMObject *object, uint64_t len, bool capToObject)
 {
     struct VMShmem shmem = {0};
     if (!object || !is_kaddr_valid(object->address)) {
@@ -192,7 +196,7 @@ static struct VMShmem vm_create_shmem_with_object_len(struct VMObject *object, u
     // cannot be satisfied; that is why the launchd persistence anchor failed
     // every time on iOS 17 while SpringBoard, whose objects are small, worked.
     uint64_t roundedSize = mach_vm_round_page(object->entryOffset + len);
-    if (objectSize && roundedSize > objectSize) roundedSize = objectSize;
+    if (capToObject && objectSize && roundedSize > objectSize) roundedSize = objectSize;
  
     mach_vm_address_t localAddr = 0;
     kern_return_t ret = mach_vm_allocate(mach_task_self_, &localAddr, roundedSize, VM_FLAGS_ANYWHERE);
@@ -380,7 +384,13 @@ struct VMShmem vm_map_object_range(uint64_t object, uint64_t objectOffset, uint6
     // patched with vme_offset = objectOffset (0 here), so the mapping offset
     // alone selects the bytes.
     struct VMObject o = { .vmAddress = 0, .address = object, .objectOffset = 0, .entryOffset = objectOffset };
-    return vm_create_shmem_with_object_len(&o, len);
+    return vm_create_shmem_with_object_len(&o, len, true);
+}
+
+struct VMShmem vm_map_file_object_range(uint64_t object, uint64_t objectOffset, uint64_t len)
+{
+    struct VMObject o = { .vmAddress = 0, .address = object, .objectOffset = 0, .entryOffset = objectOffset };
+    return vm_create_shmem_with_object_len(&o, len, false);
 }
 
 void vm_shmem_release(struct VMShmem *shmem, uint64_t len)
