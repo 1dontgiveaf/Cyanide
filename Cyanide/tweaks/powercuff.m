@@ -39,6 +39,7 @@ bool powercuff_apply(const char *level)
     bool ok = false;
     int daemonPid = remote_call_current_pid();
     long thermalBefore = (long)NSProcessInfo.processInfo.thermalState;
+    long thermalAttached = -1;
     do {
         uint64_t cls = r_class("CPMSHelper");
         if (!cls) { printf("[POWERCUFF] CPMSHelper class missing - wrong process?\n"); break; }
@@ -63,6 +64,13 @@ bool powercuff_apply(const char *level)
 
         uint64_t modeStr = r_cfstr(level);
         if (!modeStr) { printf("[POWERCUFF] CFString create failed\n"); break; }
+        // r_alloc_str doesn't check its remote write: read the string back
+        // before it reaches the mutating call.
+        char echo[32] = {0};
+        if (!r_read_nsstring(modeStr, echo, sizeof(echo)) || strcmp(echo, level) != 0) {
+            printf("[POWERCUFF] mode string read back as '%s', expected '%s' - not sending it\n", echo, level);
+            break;
+        }
 
         printf("[POWERCUFF] -[CommonProduct putDeviceInThermalSimulationMode:'%s']\n", level);
         r_msg2(product, "putDeviceInThermalSimulationMode:", modeStr, 0, 0, 0);
@@ -70,35 +78,40 @@ bool powercuff_apply(const char *level)
         // or may not have run: report failure rather than "applied" (a
         // re-apply sets the same mode, so retrying it is harmless).
         ok = r_last_call_ok();
-        // 1.3.6 (where Heavy worked) always settled 50 ms after every remote
-        // message before detaching; r_msg2 now settles by the "Tweak apply
-        // speed" option (5 ms or none). Give thermalmonitord time to act on
-        // the new mode before Cyanide detaches, whatever that option says.
-        usleep(500000);
-        // modeStr is deliberately not released: thermalmonitord keeps using
-        // the string after the call returns (1.3.6 never released it and
-        // worked; releasing it here left Heavy reported as applied but not in
-        // effect). One small string per apply.
-        printf("[POWERCUFF] %s: %s\n", ok ? "applied" : "result unknown (reply lost)", level);
+        // Observation window while still attached: compared with the state
+        // after teardown, it tells "never took effect" from "lost when Cyanide
+        // detached" (e.g. thermalmonitord restarting). Not a settle: 1.3.6
+        // settled before each message, as r_msg2 still does.
+        usleep(1000000);
+        thermalAttached = (long)NSProcessInfo.processInfo.thermalState;
+        // modeStr is not released, as in 1.3.6: whether this private method
+        // retains its argument is unknown. One small string per apply.
+        printf("[POWERCUFF] %s: %s\n", ok ? "call completed" : "result unknown (reply lost)", level);
     } while (0);
 
     destroy_remote_call();
 
-    // Check that it took: thermalmonitord must still be the same process
-    // (a restart forgets the simulated level) and the system thermal state
-    // should follow (Heavy reports Critical in apps like CPU X).
+    // Check that it took. A restarted thermalmonitord has forgotten the
+    // simulated level: that is a failure. An unchanged public thermal state is
+    // not conclusive on its own (it may lag or already match), so it's
+    // reported, not counted against the result.
     if (ok) {
         usleep(1500000);
         int alive = daemonPid > 0 ? kill(daemonPid, 0) : -1;
-        int aliveErr = alive == 0 ? 0 : errno;
+        bool running = alive == 0 || errno == EPERM;
         long thermalAfter = (long)NSProcessInfo.processInfo.thermalState;
         static const char *names[] = { "nominal", "fair", "serious", "critical" };
-        printf("[POWERCUFF] check: thermalmonitord pid %d %s; thermal state %s -> %s\n", daemonPid,
-               alive == 0 || aliveErr == EPERM ? "still running" : "GONE (restarted? the level is lost)",
-               thermalBefore >= 0 && thermalBefore < 4 ? names[thermalBefore] : "?",
-               thermalAfter >= 0 && thermalAfter < 4 ? names[thermalAfter] : "?");
-        log_user("[POWERCUFF] %s: system thermal state now %s.\n", level,
-                 thermalAfter >= 0 && thermalAfter < 4 ? names[thermalAfter] : "unknown");
+        #define PC_NAME(v) ((v) >= 0 && (v) < 4 ? names[(v)] : "?")
+        const char *outcome = !running ? "thermalmonitord GONE after detaching - the level is lost"
+            : thermalAfter != thermalBefore ? "effect observed"
+            : thermalAttached != thermalBefore ? "effect seen while attached, LOST after detaching"
+            : "call completed, effect not confirmed (thermal state unchanged)";
+        printf("[POWERCUFF] check: pid %d %s; thermal state before %s, attached %s, after detach %s -> %s\n",
+               daemonPid, running ? "running" : "gone", PC_NAME(thermalBefore), PC_NAME(thermalAttached),
+               PC_NAME(thermalAfter), outcome);
+        log_user("[POWERCUFF] %s: %s (system thermal state %s).\n", level, outcome, PC_NAME(thermalAfter));
+        #undef PC_NAME
+        if (!running) ok = false;
     }
     return ok;
 }
