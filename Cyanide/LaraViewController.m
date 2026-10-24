@@ -16,6 +16,7 @@
 #import "FileBrowserViewController.h"
 #import <errno.h>
 #import <PhotosUI/PhotosUI.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 static NSString * const kLaraCredit = @"Ported from lara by rooootdev.";
 
@@ -26,7 +27,7 @@ static const LaraHUDMode kLaraHUDModes[] = {
 };
 static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraHUDModes[0]);
 
-@interface LaraViewController () <PHPickerViewControllerDelegate>
+@interface LaraViewController () <PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
 @property (nonatomic) LaraTool tool;
 @property (nonatomic) BOOL busy;
 @property (nonatomic, copy) NSString *status;        // shown in the first footer
@@ -36,6 +37,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
 @property (nonatomic, strong) NSDictionary *pickingCard;          // card whose image is being picked
 @property (nonatomic, strong) UIProgressView *progressBar;        // under the navigation bar while decrypting
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSDictionary *> *sbConfig;   // SpringBoard Tools choices
+@property (nonatomic, copy) NSArray<NSString *> *fonts;          // Font Overwrite: imported fonts
 @end
 
 @implementation LaraViewController
@@ -70,6 +72,84 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
     if (self.tool == LaraToolPerformanceHUD || self.tool == LaraToolHiddenSettings) [self readState];
     if (self.tool == LaraToolJIT || self.tool == LaraToolAppLimit || self.tool == LaraToolCards ||
         self.tool == LaraToolDecrypt) [self listJITApps];
+    if (self.tool == LaraToolFonts) self.fonts = fontow_imported_fonts();
+}
+
+#pragma mark Font Overwrite
+
+- (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath
+{
+    return self.tool == LaraToolFonts && indexPath.section == 0 && indexPath.row < (NSInteger)self.fonts.count;
+}
+
+- (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)editingStyle
+ forRowAtIndexPath:(NSIndexPath *)indexPath
+{
+    if (editingStyle != UITableViewCellEditingStyleDelete || ![self tableView:tableView canEditRowAtIndexPath:indexPath]) return;
+    [NSFileManager.defaultManager removeItemAtPath:self.fonts[indexPath.row] error:nil];
+    self.fonts = fontow_imported_fonts();
+    [tableView reloadData];
+}
+
+- (void)fontsImport
+{
+    UIDocumentPickerViewController *picker =
+        [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[ UTTypeFont ] asCopy:YES];
+    picker.delegate = self;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls
+{
+    if (self.tool != LaraToolFonts) return;
+    NSString *error = nil;
+    for (NSURL *url in urls) fontow_import(url, &error);
+    self.fonts = fontow_imported_fonts();
+    self.status = error;
+    [self.tableView reloadData];
+}
+
+- (void)fontsChooseTargetFor:(NSString *)fontPath at:(NSIndexPath *)indexPath
+{
+    unsigned long long fontSize = [NSFileManager.defaultManager attributesOfItemAtPath:fontPath error:nil].fileSize;
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:fontPath.lastPathComponent
+        message:[NSString stringWithFormat:@"%@. Replace which system font? It has to be the same size or smaller.",
+                 [NSByteCountFormatter stringFromByteCount:(long long)fontSize countStyle:NSByteCountFormatterCountStyleFile]]
+        preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) weakSelf = self;
+    for (FontOWTarget t = 0; t < FontOWTargetCount; t++) {
+        unsigned long long max = fontow_target_size(t);
+        if (!max) continue;
+        NSString *title = [NSString stringWithFormat:@"%@ (up to %@)", fontow_target_title(t),
+                           [NSByteCountFormatter stringFromByteCount:(long long)max countStyle:NSByteCountFormatterCountStyleFile]];
+        UIAlertAction *a = [UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction *x) {
+            [weakSelf fontsRun:YES target:t font:fontPath];
+        }];
+        a.enabled = fontSize <= max;
+        [sheet addAction:a];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    UITableViewCell *cell = [self.tableView cellForRowAtIndexPath:indexPath];
+    sheet.popoverPresentationController.sourceView = cell ?: self.view;
+    sheet.popoverPresentationController.sourceRect = cell ? cell.bounds : self.view.bounds;
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)fontsRun:(BOOL)apply target:(FontOWTarget)target font:(NSString *)fontPath
+{
+    __block NSString *outcome = nil;
+    __weak typeof(self) weakSelf = self;
+    [self runNamed:apply ? @"Replacing the font" : @"Restoring the font"
+              work:^BOOL{ return apply ? fontow_apply(target, fontPath, &outcome) : fontow_restore(target, &outcome); }
+              done:^(BOOL ok) {
+        typeof(self) me = weakSelf;
+        if (!me) return;
+        me.status = outcome ?: (ok ? nil : @"It didn't work. Check the log.");
+        if (ok && me.view.window)
+            settings_present_respring_prompt(me, @"Respring Now?",
+                [NSString stringWithFormat:@"SpringBoard loads the %@ again after a respring. If it keeps crashing afterwards, force-restart the device: the original font comes back.",
+                 fontow_target_title(target).lowercaseString]);
+    }];
 }
 
 // Apps signed with get-task-allow; needs the filesystem sandbox lifted.
@@ -168,6 +248,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView
 {
+    if (self.tool == LaraToolFonts) return 2;   // your fonts, system fonts
     // App limit: action, then the apps. Decrypt: finished IPAs, then the apps.
     if (self.tool == LaraToolSpringBoard) return 1 + (NSInteger)[self sbItemCount];   // Apply/Reset, then one per item
     return (self.tool == LaraToolAppLimit || self.tool == LaraToolDecrypt) ? 2 : 1;
@@ -283,8 +364,8 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
     switch (self.tool) {
         case LaraToolPerformanceHUD: return kLaraHUDModeCount;
         case LaraToolDebugOverlay:
-        case LaraToolUpsideDown:
-        case LaraToolFonts:          return 1;
+        case LaraToolUpsideDown:     return 1;
+        case LaraToolFonts:          return section == 0 ? (NSInteger)self.fonts.count + 1 : FontOWTargetCount;
         case LaraToolSpringBoard: {
             if (section == 0) return 2;
             const SBMatItem *item = [self sbItemForSection:section];
@@ -305,6 +386,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section
 {
+    if (self.tool == LaraToolFonts) return section == 0 ? @"Your Fonts" : @"System Fonts";
     if (self.tool == LaraToolSpringBoard) {
         const SBMatItem *item = [self sbItemForSection:section];
         return item ? @(item->title) : nil;
@@ -345,7 +427,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             about = @"Changes the material behind the dock, folders, Control Center, notification banners and the app switcher: Apple's (Visible), your own tint and blur (Color), or none (Disabled). Tap Apply after changing something. It works in SpringBoard's memory, so a respring undoes it: apply again after one.\n\nNotification Banners: on the Lock Screen, iOS draws notifications as one shared blur cut into rounded shapes. With Color they drop out of it and show square there (with lara's files too); banners elsewhere stay rounded.\n\nControl Center Blur: with Color, Control Center's own uncolored blur shows for a moment while it closes; iOS fades it separately.";
             break;
         case LaraToolFonts:
-            about = @"Test build. Font Overwrite will replace the system font in memory: nothing on the sealed system volume changes, and a reboot always brings the original back. This test first checks whether this device allows that, on a rarely used font: it changes one byte, reads it back and restores it right away.";
+            about = @"Replaces a system font in memory: nothing on the sealed system volume changes, and a restart always brings the original back; Restore does it without one (the original is backed up first). Import a .ttf, .otf or .ttc from Files, tap it and pick the font to replace; it has to be the same size or smaller. Some fonts only work in parts of iOS. If SpringBoard keeps crashing after the respring, force-restart the device.";
             break;
         case LaraToolJIT:
             about = @"Tap an app to open it with JIT (for emulators and similar apps). Only apps signed with a development profile can get it. JIT lasts until the app quits; some apps can't tell it's on.";
@@ -379,10 +461,33 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             c.text = @"Enable Upside Down";
             c.textProperties.color = self.busy ? UIColor.secondaryLabelColor : UIColor.systemBlueColor;
             break;
-        case LaraToolFonts:
-            c.text = @"Run Write Test";
-            c.textProperties.color = self.busy ? UIColor.secondaryLabelColor : UIColor.systemBlueColor;
+        case LaraToolFonts: {
+            if (indexPath.section == 0 && indexPath.row == (NSInteger)self.fonts.count) {
+                c.text = @"Import Font…";
+                c.image = [UIImage systemImageNamed:@"plus.circle.fill"];
+                c.textProperties.color = self.busy ? UIColor.secondaryLabelColor : UIColor.systemBlueColor;
+                break;
+            }
+            if (indexPath.section == 0) {
+                NSString *font = self.fonts[indexPath.row];
+                c.text = font.lastPathComponent.stringByDeletingPathExtension;
+                c.secondaryText = [NSByteCountFormatter stringFromByteCount:
+                    (long long)[NSFileManager.defaultManager attributesOfItemAtPath:font error:nil].fileSize
+                    countStyle:NSByteCountFormatterCountStyleFile];
+                c.secondaryTextProperties.color = UIColor.secondaryLabelColor;
+                c.image = [UIImage systemImageNamed:@"textformat"];
+                cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+                break;
+            }
+            FontOWTarget t = (FontOWTarget)indexPath.row;
+            bool replaced = fontow_is_replaced(t);
+            c.text = fontow_target_title(t);
+            c.secondaryText = !fontow_target_size(t) ? @"Not on this iOS version"
+                            : replaced ? @"Replaced — tap to restore the original" : @"Original";
+            c.secondaryTextProperties.color = replaced ? UIColor.systemOrangeColor : UIColor.secondaryLabelColor;
+            if (!replaced) cell.selectionStyle = UITableViewCellSelectionStyleNone;
             break;
+        }
         case LaraToolSpringBoard: {
             if (indexPath.section == 0) {
                 c.text = indexPath.row == 0 ? @"Apply" : @"Reset All";
@@ -547,12 +652,14 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             }
             [self sbApply];
             break;
-        case LaraToolFonts: {
-            __block NSString *outcome = nil;
-            [self runNamed:@"Testing" work:^BOOL{ return fontow_selftest(&outcome); }
-                      done:^(BOOL ok) { weakSelf.status = outcome ?: (ok ? @"Passed." : @"It didn't work. Check the log."); }];
+        case LaraToolFonts:
+            if (indexPath.section == 0) {
+                if (indexPath.row == (NSInteger)self.fonts.count) [self fontsImport];
+                else [self fontsChooseTargetFor:self.fonts[indexPath.row] at:indexPath];
+            } else if (fontow_is_replaced((FontOWTarget)indexPath.row)) {
+                [self fontsRun:NO target:(FontOWTarget)indexPath.row font:nil];
+            }
             break;
-        }
         case LaraToolHiddenSettings:
             break;
         case LaraToolAppLimit:

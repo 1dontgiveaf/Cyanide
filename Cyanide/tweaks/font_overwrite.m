@@ -2,7 +2,9 @@
 //  font_overwrite.m
 //  Cyanide
 //
-//  See font_overwrite.h.
+//  See font_overwrite.h. The write test (a byte flipped and restored on a
+//  CoreAddition font) passed on A18: a page written through the second
+//  mapping is what every new reader of the file gets.
 //
 
 #import "font_overwrite.h"
@@ -15,9 +17,113 @@
 #import <fcntl.h>
 #import <sys/mman.h>
 #import <sys/stat.h>
+#import <sys/sysctl.h>
 #import <unistd.h>
 
-// Cyanide's own VM map, through the kernel.
+#pragma mark - Targets and files
+
+NSString *fontow_target_title(FontOWTarget target)
+{
+    switch (target) {
+        case FontOWTargetSystem: return @"System Font";
+        case FontOWTargetItalic: return @"Italic";
+        case FontOWTargetMono:   return @"Monospaced";
+        default:                 return @"?";
+    }
+}
+
+NSString *fontow_target_path(FontOWTarget target)
+{
+    switch (target) {
+        case FontOWTargetSystem: return @"/System/Library/Fonts/Core/SFUI.ttf";
+        case FontOWTargetItalic: return @"/System/Library/Fonts/Core/SFUIItalic.ttf";
+        case FontOWTargetMono:   return @"/System/Library/Fonts/Core/SFUIMono.ttf";
+        default:                 return nil;
+    }
+}
+
+unsigned long long fontow_target_size(FontOWTarget target)
+{
+    struct stat st;
+    NSString *path = fontow_target_path(target);
+    return path && stat(path.fileSystemRepresentation, &st) == 0 ? (unsigned long long)st.st_size : 0;
+}
+
+static NSString *fontow_dir(NSString *sub)
+{
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSString *dir = [docs stringByAppendingPathComponent:sub];
+    [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    return dir;
+}
+
+static NSString *fontow_backup_path(FontOWTarget target)
+{
+    return [fontow_dir(@"Fonts/Originals") stringByAppendingPathComponent:fontow_target_path(target).lastPathComponent];
+}
+
+NSArray<NSString *> *fontow_imported_fonts(void)
+{
+    NSString *dir = fontow_dir(@"Fonts");
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSString *name in [NSFileManager.defaultManager contentsOfDirectoryAtPath:dir error:nil]) {
+        NSString *ext = name.pathExtension.lowercaseString;
+        if ([@[ @"ttf", @"otf", @"ttc" ] containsObject:ext]) [out addObject:[dir stringByAppendingPathComponent:name]];
+    }
+    [out sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+        NSDate *da = [NSFileManager.defaultManager attributesOfItemAtPath:a error:nil].fileModificationDate;
+        NSDate *db = [NSFileManager.defaultManager attributesOfItemAtPath:b error:nil].fileModificationDate;
+        return [db compare:da];
+    }];
+    return out;
+}
+
+NSString *fontow_import(NSURL *url, NSString **errorOut)
+{
+    NSString *ext = url.pathExtension.lowercaseString;
+    if (![@[ @"ttf", @"otf", @"ttc" ] containsObject:ext]) {
+        if (errorOut) *errorOut = @"Pick a .ttf, .otf or .ttc font.";
+        return nil;
+    }
+    BOOL scoped = [url startAccessingSecurityScopedResource];
+    NSString *dest = [fontow_dir(@"Fonts") stringByAppendingPathComponent:url.lastPathComponent];
+    [NSFileManager.defaultManager removeItemAtPath:dest error:nil];
+    NSError *err = nil;
+    BOOL ok = [NSFileManager.defaultManager copyItemAtURL:url toURL:[NSURL fileURLWithPath:dest] error:&err];
+    if (scoped) [url stopAccessingSecurityScopedResource];
+    if (!ok && errorOut) *errorOut = err.localizedDescription ?: @"The font couldn't be copied.";
+    return ok ? dest : nil;
+}
+
+#pragma mark - Replaced since boot
+
+static long long fontow_boot_epoch(void)
+{
+    struct timeval bt = {0};
+    size_t len = sizeof(bt);
+    return sysctlbyname("kern.boottime", &bt, &len, NULL, 0) == 0 ? (long long)bt.tv_sec : 0;
+}
+
+static NSString *fontow_marker_key(FontOWTarget target)
+{
+    return [@"FontOverwriteReplacedBoot_" stringByAppendingString:fontow_target_path(target).lastPathComponent];
+}
+
+bool fontow_is_replaced(FontOWTarget target)
+{
+    long long boot = fontow_boot_epoch();
+    return boot && [NSUserDefaults.standardUserDefaults integerForKey:fontow_marker_key(target)] == boot;
+}
+
+static void fontow_set_replaced(FontOWTarget target, bool replaced)
+{
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+    if (replaced) [d setInteger:(NSInteger)fontow_boot_epoch() forKey:fontow_marker_key(target)];
+    else [d removeObjectForKey:fontow_marker_key(target)];
+}
+
+#pragma mark - Writing into the file cache
+
 static uint64_t fontow_own_vm_map(void)
 {
     char comm[64] = {0};
@@ -27,7 +133,6 @@ static uint64_t fontow_own_vm_map(void)
     return task ? task_get_vm_map(task) : 0;
 }
 
-// The VM map entry of ours that contains `address`.
 static bool fontow_entry_for(uint64_t map, uint64_t address, struct VMEntryInfo *out)
 {
     __block bool found = false;
@@ -39,95 +144,125 @@ static bool fontow_entry_for(uint64_t map, uint64_t address, struct VMEntryInfo 
     return found;
 }
 
-// A rarely used font to test on: one from CoreAddition (scripts most people
-// never display), not emoji and not San Francisco.
-static NSString *fontow_test_file(void)
+// Replaces the contents of `path` in the file cache with `data` (zero-filled
+// to the file's size). The file is mapped read-only (which also faults its
+// pages in) and its VM object mapped a second time, writable, chunk by chunk.
+static bool fontow_write_file_cache(NSString *path, NSData *data, NSString **why)
 {
-    NSString *dir = @"/System/Library/Fonts/CoreAddition";
-    NSArray *names = [[NSFileManager.defaultManager contentsOfDirectoryAtPath:dir error:nil]
-                      sortedArrayUsingSelector:@selector(compare:)];
-    for (NSString *name in names) {
-        NSString *ext = name.pathExtension.lowercaseString;
-        if (![ext isEqualToString:@"ttc"] && ![ext isEqualToString:@"ttf"]) continue;
-        if ([name containsString:@"Emoji"] || [name hasPrefix:@"SF"]) continue;
-        return [dir stringByAppendingPathComponent:name];
+    const char *cpath = path.fileSystemRepresentation;
+    int fd = open(cpath, O_RDONLY | O_CLOEXEC);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0 || st.st_size < 1) {
+        if (fd >= 0) close(fd);
+        *why = [NSString stringWithFormat:@"%@ can't be read.", path.lastPathComponent];
+        return false;
     }
-    return nil;
-}
-
-// The byte at `offset` as a fresh descriptor sees it (the file cache).
-static int fontow_read_byte(const char *path, off_t offset)
-{
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return -1;
-    uint8_t b = 0;
-    ssize_t n = pread(fd, &b, 1, offset);
+    size_t size = (size_t)st.st_size;
+    if (data.length > size) {
+        close(fd);
+        *why = [NSString stringWithFormat:@"The font is %@, larger than the system's %@: it has to fit.",
+                [NSByteCountFormatter stringFromByteCount:(long long)data.length countStyle:NSByteCountFormatterCountStyleFile],
+                [NSByteCountFormatter stringFromByteCount:(long long)size countStyle:NSByteCountFormatterCountStyleFile]];
+        return false;
+    }
+    uint8_t *map = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
     close(fd);
-    return n == 1 ? b : -1;
+    if (map == MAP_FAILED) { *why = @"The system font couldn't be mapped."; return false; }
+    size_t page = (size_t)getpagesize();
+    volatile uint8_t sink = 0;
+    for (size_t off = 0; off < size; off += page) sink ^= map[off];   // fault every page in
+    (void)sink;
+
+    uint64_t vmMap = fontow_own_vm_map();
+    struct VMEntryInfo e;
+    bool ok = vmMap && fontow_entry_for(vmMap, (uint64_t)(uintptr_t)map, &e) && e.object &&
+              e.end - e.start >= ((size + page - 1) & ~(page - 1));
+    if (!ok) *why = @"The font file's object wasn't found in Cyanide's memory map.";
+    const uint8_t *src = data.bytes;
+    const size_t chunk = 1u << 20;
+    for (size_t off = 0; ok && off < size; off += chunk) {
+        size_t len = MIN(chunk, ((size - off) + page - 1) & ~(page - 1));
+        uint64_t addr = (uint64_t)(uintptr_t)(map + off);
+        struct VMShmem w = vm_map_object_range(e.object, e.offset + (addr - e.start), len);
+        if (!w.used) { *why = @"A page of the font couldn't be mapped writable."; ok = false; break; }
+        uint8_t *dst = (uint8_t *)(uintptr_t)w.localAddress;
+        size_t valid = MIN(len, size - off);                       // bytes of the file in this chunk
+        size_t fromData = off < data.length ? MIN(valid, data.length - off) : 0;
+        if (fromData) memcpy(dst, src + off, fromData);
+        if (valid > fromData) memset(dst + fromData, 0, valid - fromData);
+        vm_shmem_release(&w, len);
+    }
+    munmap(map, size);
+    if (!ok) return false;
+
+    // What a new reader of the file gets now: the start and the last bytes.
+    fd = open(cpath, O_RDONLY | O_CLOEXEC);
+    uint8_t head[256] = {0}, tail = 0xAA;
+    size_t headLen = MIN(sizeof(head), size);
+    bool readOK = fd >= 0 && pread(fd, head, headLen, 0) == (ssize_t)headLen && pread(fd, &tail, 1, (off_t)size - 1) == 1;
+    if (fd >= 0) close(fd);
+    uint8_t expectTail = size <= data.length ? src[size - 1] : 0;
+    bool headOK = readOK && memcmp(head, src, MIN(headLen, data.length)) == 0;
+    printf("[FONTOW] %s: wrote %zu of %zu bytes, read back head=%d tail=%d\n", cpath, data.length, size, headOK,
+           readOK && tail == expectTail);
+    if (!headOK || tail != expectTail) {
+        *why = @"The font was written, but a new reader doesn't see it. Restart the device to be safe.";
+        return false;
+    }
+    return true;
 }
 
-bool fontow_selftest(NSString **result)
+#pragma mark - Apply and restore
+
+bool fontow_apply(FontOWTarget target, NSString *fontPath, NSString **result)
 {
     __autoreleasing NSString *dummy = nil;
     if (!result) result = &dummy;
     if (!kexploit_krw_ready()) { *result = @"Kernel access isn't active."; return false; }
-    NSString *file = fontow_test_file();
-    if (!file) { *result = @"No test font found in /System/Library/Fonts/CoreAddition."; return false; }
-    const char *path = file.fileSystemRepresentation;
+    NSString *path = fontow_target_path(target);
+    NSData *font = [NSData dataWithContentsOfFile:fontPath options:NSDataReadingMappedIfSafe error:nil];
+    if (!path || !font.length) { *result = @"The font couldn't be read."; return false; }
 
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    struct stat st;
-    if (fd < 0 || fstat(fd, &st) != 0 || st.st_size < 1) {
-        if (fd >= 0) close(fd);
-        *result = [NSString stringWithFormat:@"%@ can't be read.", file.lastPathComponent];
+    // Back the original up while it still is the original.
+    NSString *backup = fontow_backup_path(target);
+    if (!fontow_is_replaced(target)) {
+        [NSFileManager.defaultManager removeItemAtPath:backup error:nil];
+        NSError *err = nil;
+        if (![NSFileManager.defaultManager copyItemAtPath:path toPath:backup error:&err]) {
+            *result = [NSString stringWithFormat:@"The original couldn't be backed up (%@); nothing was changed.",
+                       err.localizedDescription];
+            return false;
+        }
+    } else if (![NSFileManager.defaultManager fileExistsAtPath:backup]) {
+        *result = @"The original's backup is missing; restart the device before replacing it again.";
         return false;
     }
-    size_t page = (size_t)getpagesize();
-    off_t target = st.st_size - 1;                         // the last byte
-    off_t pageOff = target & ~(off_t)(page - 1);
-    uint8_t *map = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-    close(fd);
-    if (map == MAP_FAILED) { *result = @"The test font couldn't be mapped."; return false; }
-    uint8_t original = map[target];                        // also faults the page in
-    printf("[FONTOW] test file %s, %lld bytes, last byte 0x%02x\n", path, (long long)st.st_size, original);
 
-    bool ok = false;
     NSString *why = nil;
-    struct VMShmem w = {0};
-    do {
-        uint64_t vmMap = fontow_own_vm_map();
-        struct VMEntryInfo e;
-        uint64_t pageAddr = (uint64_t)(uintptr_t)(map + pageOff);
-        if (!vmMap || !fontow_entry_for(vmMap, pageAddr, &e) || !e.object) {
-            why = @"The mapping's file object wasn't found.";
-            break;
-        }
-        printf("[FONTOW] entry 0x%llx-0x%llx prot=%x object=0x%llx offset=0x%llx\n",
-               e.start, e.end, e.protection, e.object, e.offset);
-        w = vm_map_object_range(e.object, e.offset + (pageAddr - e.start), page);
-        if (!w.used) { why = @"The file's page couldn't be mapped writable."; break; }
-        uint8_t *dst = (uint8_t *)(uintptr_t)w.localAddress + (target - pageOff);
-        if (*dst != original) {
-            why = [NSString stringWithFormat:@"The writable mapping shows 0x%02x, the file 0x%02x: not the same page.", *dst, original];
-            break;
-        }
-        // The write, the check through a new descriptor, and the restore.
-        *dst = original ^ 0xFF;
-        int seen = fontow_read_byte(path, target);
-        *dst = original;
-        int restored = fontow_read_byte(path, target);
-        printf("[FONTOW] wrote 0x%02x, file read back 0x%02x, restored -> 0x%02x\n",
-               original ^ 0xFF, seen & 0xFF, restored & 0xFF);
-        if (seen != (original ^ 0xFF)) { why = @"The write didn't reach the file cache (other processes would still see the original)."; break; }
-        if (restored != original) { why = @"The write worked, but the restore didn't. A reboot brings the original back."; break; }
-        ok = true;
-    } while (0);
-    if (w.used) vm_shmem_release(&w, page);
-    munmap(map, (size_t)st.st_size);
-
-    *result = ok ? [NSString stringWithFormat:@"Write test passed on %@: changed in the file cache, seen by a new reader, and restored.",
-                    file.lastPathComponent]
+    bool ok = fontow_write_file_cache(path, font, &why);
+    if (ok) fontow_set_replaced(target, true);
+    *result = ok ? [NSString stringWithFormat:@"%@ replaced with %@. Respring to see it; restart or Restore to undo.",
+                    fontow_target_title(target), fontPath.lastPathComponent]
                  : why;
-    log_user("[FONTOW] Write test: %s\n", (*result).UTF8String);
+    log_user("[FONTOW] %s\n", (*result).UTF8String);
+    return ok;
+}
+
+bool fontow_restore(FontOWTarget target, NSString **result)
+{
+    __autoreleasing NSString *dummy = nil;
+    if (!result) result = &dummy;
+    if (!fontow_is_replaced(target)) { *result = @"It's the original already."; return true; }
+    if (!kexploit_krw_ready()) { *result = @"Kernel access isn't active."; return false; }
+    NSData *original = [NSData dataWithContentsOfFile:fontow_backup_path(target) options:NSDataReadingMappedIfSafe error:nil];
+    if (original.length != fontow_target_size(target)) {
+        *result = @"The backup doesn't match the system's font; restart the device to restore it.";
+        return false;
+    }
+    NSString *why = nil;
+    bool ok = fontow_write_file_cache(fontow_target_path(target), original, &why);
+    if (ok) fontow_set_replaced(target, false);
+    *result = ok ? [NSString stringWithFormat:@"%@ restored. Respring to see it.", fontow_target_title(target)] : why;
+    log_user("[FONTOW] %s\n", (*result).UTF8String);
     return ok;
 }

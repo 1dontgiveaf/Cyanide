@@ -233,6 +233,8 @@ BOOL settings_hide_home_bar_hidden(void);
 void settings_note_hide_home_bar_respring_pending(void);
 BOOL settings_hide_home_bar_respring_pending(void);
 void settings_present_hide_home_bar_respring_prompt(UIViewController *host);
+// "Respring?" with Later / Respring, doing the full pre-respring cleanup.
+void settings_present_respring_prompt(UIViewController *host, NSString *title, NSString *message);
 
 // Applies the selected passcode style (apply == YES) or writes the backed-up
 // original keypad digits back (apply == NO). Runs the keypad file edits

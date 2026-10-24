@@ -4740,12 +4740,17 @@ BOOL settings_hide_home_bar_respring_pending(void)
 void settings_present_hide_home_bar_respring_prompt(UIViewController *host)
 {
     BOOL targetHidden = [NSUserDefaults.standardUserDefaults boolForKey:kSettingsHideHomeBarPendingHidden];
-    UIAlertController *ac = [UIAlertController
-        alertControllerWithTitle:(targetHidden ? @"Respring to Hide Home Bar?" : @"Respring to Restore Home Bar?")
-                         message:(targetHidden
-                                  ? @"Hide Home Bar was applied, but SpringBoard needs to restart before the home indicator disappears."
-                                  : @"Home Bar restore was queued, but SpringBoard needs to restart before the stock home indicator returns.")
-                  preferredStyle:UIAlertControllerStyleAlert];
+    settings_present_respring_prompt(host,
+        (targetHidden ? @"Respring to Hide Home Bar?" : @"Respring to Restore Home Bar?"),
+        (targetHidden
+         ? @"Hide Home Bar was applied, but SpringBoard needs to restart before the home indicator disappears."
+         : @"Home Bar restore was queued, but SpringBoard needs to restart before the stock home indicator returns."));
+}
+
+void settings_present_respring_prompt(UIViewController *host, NSString *title, NSString *message)
+{
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:title message:message
+                                                         preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"Later"
                                            style:UIAlertActionStyleCancel
                                          handler:nil]];
@@ -4755,7 +4760,7 @@ void settings_present_hide_home_bar_respring_prompt(UIViewController *host)
                                          handler:^(UIAlertAction *_) {
         dispatch_async(dispatch_get_global_queue(0, 0), ^{
             if (__sync_val_compare_and_swap(&g_settings_actions_running, kSettingsLockFree, kSettingsLockAction)) {
-                printf("[SETTINGS] hide home bar respring blocked: actions already running\n");
+                printf("[SETTINGS] respring blocked: actions already running\n");
                 log_user("[RESPRING] Another action is still running. Try Respring again in a moment.\n");
                 return;
             }
