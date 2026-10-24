@@ -4,7 +4,7 @@
 
 # Cyanide 1.13.0
 
-A tweak to hide the "new app" dots, a clear message on unsupported devices, and another Powercuff fix.
+A tweak to hide the "new app" dots, a clear message on unsupported devices, and Powercuff attaching the way 1.3.6 did.
 
 ## New
 
@@ -16,7 +16,7 @@ A tweak to hide the "new app" dots, a clear message on unsupported devices, and 
 
 ## Fixes
 
-- **Powercuff:** Cyanide now gives thermalmonitord time to take the new level before it disconnects, as 1.3.6 did. The log shows whether it worked: the system thermal state should read Critical with Heavy (also visible in apps like CPU X). If it still doesn't throttle for you, please send the log.
+- **Powercuff:** Cyanide now attaches to thermalmonitord the way 1.3.6 did (two threads instead of six) and checks the level it sends. The log shows whether it worked: the system thermal state while attached and after detaching (with Heavy it should read Critical, also visible in apps like CPU X). If thermalmonitord restarts afterwards, Powercuff now reports a failure instead of "applied". If it still doesn't throttle for you, please send the log.
 
 ## About A18 / M4
 
