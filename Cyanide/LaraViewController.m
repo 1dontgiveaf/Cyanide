@@ -75,20 +75,26 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
     if (self.tool == LaraToolFonts) {
         self.fonts = fontow_imported_fonts();
         // Which files the Lock Screen clock styles use (diagnostic for adding
-        // them as targets): every system font named like a time/numeric font.
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            NSFileManager *fm = NSFileManager.defaultManager;
-            NSDirectoryEnumerator *en = [fm enumeratorAtPath:@"/System/Library/Fonts"];
-            for (NSString *rel in en) {
-                NSString *name = rel.lastPathComponent;
-                if (![@[ @"ttf", @"ttc", @"otf" ] containsObject:name.pathExtension.lowercaseString]) continue;
-                if (![name containsString:@"Time"] && ![name containsString:@"Numeric"] && ![name containsString:@"Soft"] &&
-                    ![name containsString:@"Rail"] && ![name containsString:@"Stencil"] && ![name containsString:@"Rounded"] &&
-                    ![name containsString:@"Clock"]) continue;
-                unsigned long long size = [fm attributesOfItemAtPath:[@"/System/Library/Fonts" stringByAppendingPathComponent:rel]
-                                                               error:nil].fileSize;
-                printf("[FONTOW] clock font candidate: /System/Library/Fonts/%s (%llu bytes)\n", rel.UTF8String, size);
-            }
+        // them as targets): every system font, and font assets (MobileAsset),
+        // which need the filesystem sandbox lifted.
+        settings_unlock_filesystem_async(NO, ^(BOOL ok, NSString *message) {
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                NSFileManager *fm = NSFileManager.defaultManager;
+                for (NSString *root in @[ @"/System/Library/Fonts", @"/private/var/MobileAsset/AssetsV2" ]) {
+                    NSUInteger fonts = 0;
+                    NSDirectoryEnumerator *en = [fm enumeratorAtPath:root];
+                    for (NSString *rel in en) {
+                        NSString *ext = rel.pathExtension.lowercaseString;
+                        if (![@[ @"ttf", @"ttc", @"otf" ] containsObject:ext]) continue;
+                        fonts++;
+                        unsigned long long size = [fm attributesOfItemAtPath:[root stringByAppendingPathComponent:rel] error:nil].fileSize;
+                        printf("[FONTOW] font file: %s/%s (%llu bytes)\n", root.UTF8String, rel.UTF8String, size);
+                    }
+                    printf("[FONTOW] %s: %lu font file(s)%s\n", root.UTF8String, (unsigned long)fonts,
+                           en ? "" : " (folder not readable)");
+                }
+                printf("[FONTOW] filesystem access for the asset search: %s\n", ok ? "yes" : (message ?: @"no").UTF8String);
+            });
         });
     }
 }
