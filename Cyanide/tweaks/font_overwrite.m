@@ -242,6 +242,13 @@ static bool fontow_write_file_cache(NSString *path, NSData *data, NSString **why
 
 #pragma mark - Apply and restore
 
+// Apple's system fonts: the SF families (".SF UI", "SF Pro", ...).
+static bool fontow_is_apple_family(NSString *family)
+{
+    NSString *f = [family stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@". "]];
+    return [f hasPrefix:@"SF"] || [f hasPrefix:@"San Francisco"];
+}
+
 bool fontow_apply(FontOWTarget target, NSString *fontPath, NSString **result)
 {
     __autoreleasing NSString *dummy = nil;
@@ -251,9 +258,20 @@ bool fontow_apply(FontOWTarget target, NSString *fontPath, NSString **result)
     NSData *font = [NSData dataWithContentsOfFile:fontPath options:NSDataReadingMappedIfSafe error:nil];
     if (!path || !font.length) { *result = @"The font couldn't be read."; return false; }
 
-    // Back the original up while it still is the original.
+    // Back the original up while it still is the original -- and only if it
+    // looks like Apple's (an SF family): a replaced font must never become
+    // the "original" Restore writes back.
     NSString *backup = fontow_backup_path(target);
     if (!fontow_is_replaced(target)) {
+        NSData *current = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
+        NSString *family = fontpatch_family_name(current);
+        printf("[FONTOW] %s is now '%s'\n", path.UTF8String, (family ?: @"?").UTF8String);
+        if (!fontow_is_apple_family(family)) {
+            *result = [NSString stringWithFormat:@"%@ is '%@' right now, not Apple's font, so it isn't backed up as the original. Restart the device, then try again.",
+                       path.lastPathComponent, family ?: @"unknown"];
+            log_user("[FONTOW] %s\n", (*result).UTF8String);
+            return false;
+        }
         [NSFileManager.defaultManager removeItemAtPath:backup error:nil];
         NSError *err = nil;
         if (![NSFileManager.defaultManager copyItemAtPath:path toPath:backup error:&err]) {
@@ -317,6 +335,16 @@ bool fontow_restore(FontOWTarget target, NSString **result)
     if (!fontow_is_replaced(target)) { *result = @"It's the original already."; return true; }
     if (!kexploit_krw_ready()) { *result = @"Kernel access isn't active."; return false; }
     NSData *original = [NSData dataWithContentsOfFile:fontow_backup_path(target) options:NSDataReadingMappedIfSafe error:nil];
+    NSString *backupFamily = fontpatch_family_name(original);
+    NSString *currentFamily = fontpatch_family_name([NSData dataWithContentsOfFile:fontow_target_path(target)
+                                                                          options:NSDataReadingMappedIfSafe error:nil]);
+    printf("[FONTOW] restore %s: file is '%s', backup is '%s'\n", fontow_target_path(target).UTF8String,
+           (currentFamily ?: @"?").UTF8String, (backupFamily ?: @"?").UTF8String);
+    if (!fontow_is_apple_family(backupFamily)) {
+        *result = [NSString stringWithFormat:@"The backup isn't Apple's font ('%@'). Restart the device: that always brings the original back.",
+                   backupFamily ?: @"unknown"];
+        return false;
+    }
     if (original.length != fontow_target_size(target)) {
         *result = @"The backup doesn't match the system's font; restart the device to restore it.";
         return false;

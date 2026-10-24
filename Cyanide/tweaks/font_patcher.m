@@ -161,6 +161,28 @@ static NSData *fp_merged_names(NSData *sourceName, NSData *targetName, NSSet<NSN
     return out;
 }
 
+NSString *fontpatch_family_name(NSData *font)
+{
+    NSString *why = nil;
+    NSData *name = fp_tables(font, &why)[@"name"];
+    if (name.length < 6) return nil;
+    const uint8_t *n = name.bytes;
+    uint16_t count = rd16(n + 2), storage = rd16(n + 4);
+    for (NSNumber *wanted in @[ @1, @4 ]) {
+        for (uint16_t i = 0; i < count; i++) {
+            size_t r = 6 + (size_t)i * 12;
+            if (r + 12 > name.length) break;
+            uint16_t platform = rd16(n + r), nameID = rd16(n + r + 6), len = rd16(n + r + 8), off = rd16(n + r + 10);
+            if (nameID != wanted.unsignedShortValue || (size_t)storage + off + len > name.length) continue;
+            NSData *bytes = [name subdataWithRange:NSMakeRange(storage + off, len)];
+            NSString *s = platform == 1 ? [[NSString alloc] initWithData:bytes encoding:NSMacOSRomanStringEncoding]
+                                        : [[NSString alloc] initWithData:bytes encoding:NSUTF16BigEndianStringEncoding];
+            if (s.length) return s;
+        }
+    }
+    return nil;
+}
+
 #pragma mark - Scaling
 
 // glyf/loca scaled by `f`, instructions dropped; loca in long format.

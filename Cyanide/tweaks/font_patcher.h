@@ -23,6 +23,9 @@
 // weight axes, source doesn't).
 BOOL fontpatch_needed(NSData *target, NSData *source);
 
+// The font's family name (name ID 1, else 4), or nil.
+NSString *fontpatch_family_name(NSData *font);
+
 // The adapted font, or nil with *errorOut. *noteOut: what was changed (e.g.
 // "scaled from 1000 to 2048 units, kerning dropped").
 NSData *fontpatch_adapt(NSData *target, NSData *source, NSString **errorOut, NSString **noteOut);
