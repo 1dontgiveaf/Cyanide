@@ -290,6 +290,14 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
     c[key] = value;
     self.sbConfig[@(item->key)] = c;
     [NSUserDefaults.standardUserDefaults setObject:self.sbConfig forKey:kSBMatConfigKey];
+    settings_sbtools_note(NO);   // due again with the tweaks
+}
+
+- (void)sbWithTweaksChanged:(UISwitch *)sw
+{
+    [NSUserDefaults.standardUserDefaults setBool:sw.on forKey:kSettingsSBToolsWithTweaks];
+    if (sw.on) settings_mark_tweak_needs_apply(kSettingsSBToolsWithTweaks);
+    settings_sbtools_note(NO);
 }
 
 - (UIColor *)sbColorFor:(const SBMatItem *)item
@@ -347,6 +355,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
               done:^(BOOL ok) {
         weakSelf.status = ok ? @"Applied. Open a folder, Control Center or the app switcher to see the rest."
                              : (why ?: @"It didn't work. Check the log.");
+        if (ok) settings_sbtools_note(YES);
     }];
 }
 
@@ -367,7 +376,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
         case LaraToolUpsideDown:     return 1;
         case LaraToolFonts:          return section == 0 ? (NSInteger)self.fonts.count + 1 : FontOWTargetCount;
         case LaraToolSpringBoard: {
-            if (section == 0) return 2;
+            if (section == 0) return 3;   // Apply, Reset All, Apply with Tweaks
             const SBMatItem *item = [self sbItemForSection:section];
             return item && [[self sbChoiceFor:item][@"mode"] integerValue] == SBMatModeColor ? 3 : 1;   // mode, tint, blur
         }
@@ -489,6 +498,17 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             break;
         }
         case LaraToolSpringBoard: {
+            if (indexPath.section == 0 && indexPath.row == 2) {
+                c.text = @"Apply with Tweaks";
+                c.secondaryText = @"Applies this look in every Apply Tweaks run too, e.g. after a respring.";
+                c.secondaryTextProperties.color = UIColor.secondaryLabelColor;
+                UISwitch *sw = [UISwitch new];
+                sw.on = [NSUserDefaults.standardUserDefaults boolForKey:kSettingsSBToolsWithTweaks];
+                [sw addTarget:self action:@selector(sbWithTweaksChanged:) forControlEvents:UIControlEventValueChanged];
+                cell.accessoryView = sw;
+                cell.selectionStyle = UITableViewCellSelectionStyleNone;
+                break;
+            }
             if (indexPath.section == 0) {
                 c.text = indexPath.row == 0 ? @"Apply" : @"Reset All";
                 c.textProperties.color = self.busy ? UIColor.secondaryLabelColor
@@ -644,7 +664,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             break;
         }
         case LaraToolSpringBoard:
-            if (indexPath.section != 0) break;
+            if (indexPath.section != 0 || indexPath.row == 2) break;
             if (indexPath.row == 1) {
                 [self.sbConfig removeAllObjects];
                 [NSUserDefaults.standardUserDefaults removeObjectForKey:kSBMatConfigKey];

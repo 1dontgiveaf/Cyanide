@@ -45,6 +45,7 @@
 #import "tweaks/hide_home_bar.h"
 #import "tweaks/QuickLoader.h"
 #import "tweaks/RepoTweaks.h"
+#import "tweaks/sb_materials.h"
 #import <CoreMotion/CoreMotion.h>
 #import <os/lock.h>
 
@@ -1250,6 +1251,7 @@ NSString * const kSettingsThemerCustomThemePath = @"ThemerCustomThemePath";
 NSString * const kSettingsThemerCustomThemeName = @"ThemerCustomThemeName";
 
 NSString * const kSettingsSnowBoardLiteEnabled = @"SnowBoardLiteEnabled";
+NSString * const kSettingsSBToolsWithTweaks = @"SBToolsApplyWithTweaks";
 NSString * const kSettingsSnowBoardLiteSelectedThemeID = @"SnowBoardLiteSelectedThemeID";
 
 NSString * const kSettingsLiveWPEnabled = @"LiveWPEnabled";
@@ -1996,6 +1998,23 @@ void settings_mark_tweak_needs_apply(NSString *key)
     settings_mark_tweak_applied(key, NO);
 }
 
+// SpringBoard Tools: anything set to something other than Apple's look.
+static BOOL settings_sbtools_has_changes(NSUserDefaults *d)
+{
+    NSDictionary *config = [d dictionaryForKey:kSBMatConfigKey];
+    for (id value in config.allValues) {
+        if ([value isKindOfClass:NSDictionary.class] && [((NSDictionary *)value)[@"mode"] integerValue] != SBMatModeVisible) return YES;
+    }
+    return NO;
+}
+
+void settings_sbtools_note(BOOL applied)
+{
+    if (![NSUserDefaults.standardUserDefaults boolForKey:kSettingsSBToolsWithTweaks]) return;
+    settings_mark_tweak_applied(kSettingsSBToolsWithTweaks, applied);
+    settings_notify_package_queue_changed_async();
+}
+
 // Re-queue every already-applied tweak so it shows in the queue and can be
 // applied again — without relaunching Cyanide. Relaunching normally re-queues
 // enabled tweaks because the in-memory applied set starts empty; this reproduces
@@ -2062,6 +2081,7 @@ static NSArray<NSString *> *settings_rc_backed_tweak_keys(void)
             kSettingsDSDoubleTapToLock,
             kSettingsDSDragCoefficientEnabled,
             kSettingsLayoutExtrasEnabled,
+            kSettingsSBToolsWithTweaks,
         ]];
         settings_each_springboard_cleanup_entry(^(const SettingsSpringBoardTweakCleanupEntry *entry) {
             if (entry->key && ![allKeys containsObject:entry->key]) {
@@ -9497,8 +9517,12 @@ static void settings_run_actions_internal(BOOL pendingOnly)
             if (stagePausesThemerLive) {
                 settings_note_themer_stage_conflict(YES);
             }
+            // SpringBoard Tools' saved look, with the tweaks (when that's on and
+            // something isn't Apple's).
+            BOOL runSBTools = settings_enabled_tweak_should_run(d, kSettingsSBToolsWithTweaks, springBoardPendingOnly) &&
+                              settings_sbtools_has_changes(d);
             BOOL cleanupDisabledSpringBoardTweaks = settings_disabled_applied_springboard_cleanup_needed(d);
-            BOOL needsSpringBoardWork = runSBC || runDarkTweaks || runStatBar || runNSBar || runNiceBarLite || runAxonLite || runGravityLite || runLayoutExtras || restoreLayoutExtras || runAppSwitcherGrid || runThemer || runSnowBoardLite || runLiveWP || runStageStrip || runFastLockXLite || runQuickLoader || runRepoTweaks || cleanupDisabledSpringBoardTweaks;
+            BOOL needsSpringBoardWork = runSBTools || runSBC || runDarkTweaks || runStatBar || runNSBar || runNiceBarLite || runAxonLite || runGravityLite || runLayoutExtras || restoreLayoutExtras || runAppSwitcherGrid || runThemer || runSnowBoardLite || runLiveWP || runStageStrip || runFastLockXLite || runQuickLoader || runRepoTweaks || cleanupDisabledSpringBoardTweaks;
             BOOL runSandboxEscape = [d boolForKey:kSettingsRunSandboxEscape] && (!pendingOnly || needsSpringBoardWork);
             BOOL needsSpringBoard = runSandboxEscape || needsSpringBoardWork || forceSpringBoardRefresh;
 
@@ -9520,6 +9544,7 @@ static void settings_run_actions_internal(BOOL pendingOnly)
             if (restoreLayoutExtras) total++;
             if (runThemer) total++;
             if (runSnowBoardLite) total++;
+            if (runSBTools) total++;
             if (runLiveWP) total++;
             if (runStatBar) total++;
             if (runNSBar) total++;
@@ -9550,6 +9575,7 @@ static void settings_run_actions_internal(BOOL pendingOnly)
             if (runDarkTweaks) [enabledTweaks addObject:@"dark"];
             if (runThemer) [enabledTweaks addObject:@"themer"];
             if (runSnowBoardLite) [enabledTweaks addObject:@"snowboardlite"];
+            if (runSBTools) [enabledTweaks addObject:@"springboard-tools"];
             if (runLiveWP) [enabledTweaks addObject:@"livewp"];
             if (runFastLockXLite) [enabledTweaks addObject:@"fastlockx"];
             if (runStageStrip) [enabledTweaks addObject:@"stagestrip"];
@@ -9723,6 +9749,16 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                             log_user("[SBL] Live repair is enabled; Cyanide will keep the SpringBoard channel open so repair ticks reuse it.\n");
                             settings_start_themer_live_loop();
                         }
+                    }
+
+                    if (runSBTools) {
+                        settings_progress(&step, total, "Applying SpringBoard Tools");
+                        NSString *why = nil;
+                        bool ok = sbmat_apply_in_session([d dictionaryForKey:kSBMatConfigKey], &why);
+                        settings_mark_tweak_applied(kSettingsSBToolsWithTweaks, ok);
+                        log_user("%s SpringBoard Tools %s.\n", ok ? "[OK]" : "[WARN]",
+                                 ok ? "applied" : (why ?: @"did not apply cleanly").UTF8String);
+                        if (!ok) [runWarnings addObject:@"SpringBoard Tools"];
                     }
 
                     if (runGravityLite) {

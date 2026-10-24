@@ -515,6 +515,18 @@ static const NSInteger kSecOTA              = SectionOTA;
                                      enabledKey:kSettingsDSDisableIconFlyIn
                                           isNew:NO],
 
+            [[Package alloc] initWithIdentifier:@"com.lara.springboard-tools"
+                                           name:@"SpringBoard Tools"
+                               shortDescription:@"Your dock, folder and Control Center look"
+                                longDescription:@"Applies the look set in Settings → Lara → SpringBoard Tools (dock, folders, Control Center, notifications, app switcher) together with the other tweaks, so it comes back with Apply Tweaks after a respring."
+                                        version:version
+                                         author:@"kolbicz"
+                                       category:@"SpringBoard"
+                                     symbolName:@"dock.rectangle"
+                                           kind:PackageInstallKindToggle
+                                     enabledKey:kSettingsSBToolsWithTweaks
+                                          isNew:YES],
+
             [[Package alloc] initWithIdentifier:@"com.darksword.hide-new-app-dots"
                                            name:@"Hide New App Dots"
                                shortDescription:@"No blue dot next to new or updated apps"

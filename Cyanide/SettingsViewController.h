@@ -195,6 +195,11 @@ void settings_rerun_last_actions(void);
 // SpringBoard RemoteCall session goes away.
 BOOL settings_tweak_is_applied(NSString *key);
 void settings_mark_tweak_needs_apply(NSString *key);
+// SpringBoard Tools applied with the tweaks (Settings → Lara → SpringBoard
+// Tools → Apply with Tweaks). settings_sbtools_note: its screen applied the
+// look itself (YES) or it changed and is due again (NO).
+extern NSString * const kSettingsSBToolsWithTweaks;
+void settings_sbtools_note(BOOL applied);
 // Re-queue already-applied tweaks so they can be applied again without
 // relaunching Cyanide (relaunch-equivalent; clears only process-local applied
 // state). Fires PackageQueueDidChangeNotification so the queue/bar repopulate.
