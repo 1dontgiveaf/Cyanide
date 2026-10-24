@@ -12,6 +12,7 @@
 #import "tweaks/lara_tools.h"
 #import "tweaks/app_decrypt.h"
 #import "tweaks/sb_materials.h"
+#import "tweaks/font_overwrite.h"
 #import "FileBrowserViewController.h"
 #import <errno.h>
 #import <PhotosUI/PhotosUI.h>
@@ -56,6 +57,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             case LaraToolCards:          self.title = @"Wallet Card Art"; break;
             case LaraToolDecrypt:        self.title = @"App Decrypt"; break;
             case LaraToolSpringBoard:    self.title = @"SpringBoard Tools"; break;
+            case LaraToolFonts:          self.title = @"Font Overwrite"; break;
         }
     }
     return self;
@@ -281,7 +283,8 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
     switch (self.tool) {
         case LaraToolPerformanceHUD: return kLaraHUDModeCount;
         case LaraToolDebugOverlay:
-        case LaraToolUpsideDown:     return 1;
+        case LaraToolUpsideDown:
+        case LaraToolFonts:          return 1;
         case LaraToolSpringBoard: {
             if (section == 0) return 2;
             const SBMatItem *item = [self sbItemForSection:section];
@@ -341,6 +344,9 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
         case LaraToolSpringBoard:
             about = @"Changes the material behind the dock, folders, Control Center, notification banners and the app switcher: Apple's (Visible), your own tint and blur (Color), or none (Disabled). Tap Apply after changing something. It works in SpringBoard's memory, so a respring undoes it: apply again after one.\n\nNotification Banners: on the Lock Screen, iOS draws notifications as one shared blur cut into rounded shapes. With Color they drop out of it and show square there (with lara's files too); banners elsewhere stay rounded.\n\nControl Center Blur: with Color, Control Center's own uncolored blur shows for a moment while it closes; iOS fades it separately.";
             break;
+        case LaraToolFonts:
+            about = @"Test build. Font Overwrite will replace the system font in memory: nothing on the sealed system volume changes, and a reboot always brings the original back. This test first checks whether this device allows that, on a rarely used font: it changes one byte, reads it back and restores it right away.";
+            break;
         case LaraToolJIT:
             about = @"Tap an app to open it with JIT (for emulators and similar apps). Only apps signed with a development profile can get it. JIT lasts until the app quits; some apps can't tell it's on.";
             break;
@@ -371,6 +377,10 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             break;
         case LaraToolUpsideDown:
             c.text = @"Enable Upside Down";
+            c.textProperties.color = self.busy ? UIColor.secondaryLabelColor : UIColor.systemBlueColor;
+            break;
+        case LaraToolFonts:
+            c.text = @"Run Write Test";
             c.textProperties.color = self.busy ? UIColor.secondaryLabelColor : UIColor.systemBlueColor;
             break;
         case LaraToolSpringBoard: {
@@ -537,6 +547,12 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             }
             [self sbApply];
             break;
+        case LaraToolFonts: {
+            __block NSString *outcome = nil;
+            [self runNamed:@"Testing" work:^BOOL{ return fontow_selftest(&outcome); }
+                      done:^(BOOL ok) { weakSelf.status = outcome ?: (ok ? @"Passed." : @"It didn't work. Check the log."); }];
+            break;
+        }
         case LaraToolHiddenSettings:
             break;
         case LaraToolAppLimit:

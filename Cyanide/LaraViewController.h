@@ -18,6 +18,7 @@ typedef NS_ENUM(NSInteger, LaraTool) {
     LaraToolCards,
     LaraToolDecrypt,
     LaraToolSpringBoard,
+    LaraToolFonts,
 };
 
 @interface LaraViewController : UITableViewController
