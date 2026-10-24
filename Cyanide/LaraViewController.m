@@ -72,7 +72,25 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
     if (self.tool == LaraToolPerformanceHUD || self.tool == LaraToolHiddenSettings) [self readState];
     if (self.tool == LaraToolJIT || self.tool == LaraToolAppLimit || self.tool == LaraToolCards ||
         self.tool == LaraToolDecrypt) [self listJITApps];
-    if (self.tool == LaraToolFonts) self.fonts = fontow_imported_fonts();
+    if (self.tool == LaraToolFonts) {
+        self.fonts = fontow_imported_fonts();
+        // Which files the Lock Screen clock styles use (diagnostic for adding
+        // them as targets): every system font named like a time/numeric font.
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            NSFileManager *fm = NSFileManager.defaultManager;
+            NSDirectoryEnumerator *en = [fm enumeratorAtPath:@"/System/Library/Fonts"];
+            for (NSString *rel in en) {
+                NSString *name = rel.lastPathComponent;
+                if (![@[ @"ttf", @"ttc", @"otf" ] containsObject:name.pathExtension.lowercaseString]) continue;
+                if (![name containsString:@"Time"] && ![name containsString:@"Numeric"] && ![name containsString:@"Soft"] &&
+                    ![name containsString:@"Rail"] && ![name containsString:@"Stencil"] && ![name containsString:@"Rounded"] &&
+                    ![name containsString:@"Clock"]) continue;
+                unsigned long long size = [fm attributesOfItemAtPath:[@"/System/Library/Fonts" stringByAppendingPathComponent:rel]
+                                                               error:nil].fileSize;
+                printf("[FONTOW] clock font candidate: /System/Library/Fonts/%s (%llu bytes)\n", rel.UTF8String, size);
+            }
+        });
+    }
 }
 
 #pragma mark Font Overwrite
