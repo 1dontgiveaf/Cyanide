@@ -244,17 +244,20 @@ static bool fontow_write_file_cache(NSString *path, NSData *data, NSString **why
 
 #pragma mark - Processes holding the old font
 
-// The Lock Screen isn't SpringBoard: PosterBoard draws the clock and chronod
-// the widgets, and a respring leaves both running with the font they loaded
-// (and their rendered images). Ended from inside SpringBoard (Cyanide may not
-// signal them; it runs in a SpringBoard session here), launchd starts them
+// The Lock Screen isn't SpringBoard: PosterBoard draws the clock, chronod
+// manages the widgets and each widget is drawn by its own extension process
+// (e.g. the clock widget's). A respring leaves them all running with the font
+// they already loaded. Ended from inside SpringBoard (Cyanide may not signal
+// them; it runs in a SpringBoard session here), launchd and chronod start them
 // again and they load the font as it is now.
 static void fontow_restart_font_users(void)
 {
     static procmgr_entry_t entries[2048];
     int n = procmgr_list(entries, 2048);
     for (int i = 0; i < n; i++) {
-        if (strcmp(entries[i].name, "PosterBoard") != 0 && strcmp(entries[i].name, "chronod") != 0) continue;
+        bool lockScreen = strcmp(entries[i].name, "PosterBoard") == 0 || strcmp(entries[i].name, "chronod") == 0 ||
+                          strstr(entries[i].name, "Widget") != NULL;
+        if (!lockScreen) continue;
         uint64_t rc = r_dlsym_call(R_TIMEOUT, "kill", (uint64_t)entries[i].pid, SIGKILL, 0, 0, 0, 0, 0, 0);
         printf("[FONTOW] restarted %s (pid %d): %s\n", entries[i].name, entries[i].pid,
                r_last_call_ok() && rc == 0 ? "ok" : "not allowed or failed");
