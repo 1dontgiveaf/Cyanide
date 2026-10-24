@@ -288,9 +288,12 @@ static uint64_t sbmat_dock_material_view(void)
 static NSSet<NSString *> *g_sbmat_disabled;
 
 // Makes an existing material view load its recipe again (from the cache,
-// which now holds ours or Apple's) and show it fully. Disabled hides it: an
-// existing layer keeps its old filters when the new settings are an identity
-// (CoreMaterial's preservingFiltersIfIdentity), so its blur would stay.
+// which now holds ours or Apple's) and show it fully. Disabled: an existing
+// layer keeps its old filters when the new settings are an identity
+// (CoreMaterial's preservingFiltersIfIdentity), so its blur would stay. Hiding
+// the view isn't enough on its own -- SpringBoard shows recycled folder icons
+// again while paging, old blur and all -- so the old filters are removed and
+// the backdrop switched off too; nothing is left to draw.
 // setWeighting: false for views whose owner animates the weighting itself
 // (Control Center on every open and dismiss): forcing it there left the
 // background behind for a moment when dismissing.
@@ -304,6 +307,9 @@ static bool sbmat_reload_view(uint64_t view, bool setWeighting)
     r_msg2_main(layer, "setRecipeName:", str, 0, 0, 0);
     uint64_t after = r_msg2_main(layer, "_recipeSettings", 0, 0, 0, 0);
     sbmat_cfrelease(str);
+    bool disabled = [g_sbmat_disabled containsObject:recipe];
+    // Back on before reconfiguring, in case an earlier Disabled switched it off.
+    if (!disabled && r_responds_main(layer, "setEnabled:")) r_msg2_main(layer, "setEnabled:", 1, 0, 0, 0);
     if (r_responds_main(layer, "_updateForChangeInRecipeAndConfiguration"))
         r_msg2_main(layer, "_updateForChangeInRecipeAndConfiguration", 0, 0, 0, 0);
     // Weighting 0 shows the previous settings, 1 the new ones; the material
@@ -317,10 +323,14 @@ static bool sbmat_reload_view(uint64_t view, bool setWeighting)
     if (r_responds_main(layer, "_setNeedsConfiguring"))
         r_msg2_main(layer, "_setNeedsConfiguring", 0, 0, 0, 0);
     r_msg2_main(layer, "layoutIfNeeded", 0, 0, 0, 0);
-    bool hide = [g_sbmat_disabled containsObject:recipe];
-    r_msg2_main(view, "setHidden:", hide, 0, 0, 0);
+    if (disabled) {
+        r_msg2_main(layer, "setFilters:", 0, 0, 0, 0);
+        if (r_responds_main(layer, "setEnabled:")) r_msg2_main(layer, "setEnabled:", 0, 0, 0, 0);
+        r_msg2_main(layer, "setBackgroundColor:", 0, 0, 0, 0);
+    }
+    r_msg2_main(view, "setHidden:", disabled, 0, 0, 0);
     printf("[SBMAT] %s reloaded (%s)%s\n", recipe.UTF8String, before != after ? "new settings" : "same settings",
-           hide ? ", hidden (Disabled)" : "");
+           disabled ? ", backdrop off and hidden (Disabled)" : "");
     return before != after;
 }
 
