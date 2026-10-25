@@ -14,6 +14,7 @@
 #import "tweaks/sb_materials.h"
 #import "tweaks/font_overwrite.h"
 #import "FileBrowserViewController.h"
+#import "LogTextView.h"
 #import <errno.h>
 #import <PhotosUI/PhotosUI.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
