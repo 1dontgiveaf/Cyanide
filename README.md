@@ -58,6 +58,7 @@ Cyanide, and the Cache Cleaner deletes what you select.
 | **Disable App Library** | Remove the App Library page |
 | **Disable Icon Fly-In** | Skip the icon spring animation |
 | **Hide New App Dots** | No blue dot next to new or updated apps |
+| **iPad Dock** | iPad-style Dock with the App Library button |
 | **Zero Wake Animation** | Snap on instantly when waking |
 | **Zero Backlight Fade** | Instant lock/unlock backlight |
 | **Double-Tap to Lock** | Lock with a wallpaper double-tap |
@@ -337,6 +338,7 @@ iOS/iPadOS 18.7.2 and 26.1. Later builds are outside this kernel exploit window.
 - [`d1y`](https://x.com/chenhonzhou): [`cyanide-ios`](https://github.com/d1y/cyanide-ios)
   AGPL-3.0 sources used for the NSBar, NiceBar Lite, SnowBoard Lite, and
   LiveWP ports.
+- Banana ([`hxhlb/cyanide`](https://github.com/hxhlb/cyanide)): iPad Dock, ported with changes for iOS 18 and a separate App Library for the Dock.
 - [`tomt000`](https://github.com/tomt000): [Dynamic Stage](https://havoc.app/package/dynamicstage) — the original Stage Manager-for-iPhone tweak whose split-view + scene-hosting design Dynamic Stage Lite re-implements over RemoteCall.
 
 ### UI inspiration
