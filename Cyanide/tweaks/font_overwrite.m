@@ -31,6 +31,7 @@ NSString *fontow_target_title(FontOWTarget target)
         case FontOWTargetSystem: return @"System Font";
         case FontOWTargetItalic: return @"Italic";
         case FontOWTargetMono:   return @"Monospaced";
+        case FontOWTargetClock:  return @"Lock Screen Clock";
         default:                 return @"?";
     }
 }
@@ -41,6 +42,9 @@ NSString *fontow_target_path(FontOWTarget target)
         case FontOWTargetSystem: return @"/System/Library/Fonts/Core/SFUI.ttf";
         case FontOWTargetItalic: return @"/System/Library/Fonts/Core/SFUIItalic.ttf";
         case FontOWTargetMono:   return @"/System/Library/Fonts/Core/SFUIMono.ttf";
+        // Every clock style's font (".SF Soft Numeric" for the default one,
+        // Rounded, Stencil, Rail, New York, ...): one collection.
+        case FontOWTargetClock:  return @"/System/Library/Fonts/Core/ADTNumeric.ttc";
         default:                 return nil;
     }
 }
@@ -266,11 +270,14 @@ static void fontow_restart_font_users(void)
 
 #pragma mark - Apply and restore
 
-// Apple's system fonts: the SF families (".SF UI", "SF Pro", ...).
-static bool fontow_is_apple_family(NSString *family)
+// Apple's system fonts: the SF families (".SF UI", "SF Pro", ...) and the
+// clock's (".SF Numeric", ".ADT Slab Numeric", ".New York Numeric") -- and
+// not adapted by Cyanide, which keeps a collection's names.
+static bool fontow_is_apple_font(NSData *font, NSString *family)
 {
     NSString *f = [family stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@". "]];
-    return [f hasPrefix:@"SF"] || [f hasPrefix:@"San Francisco"];
+    bool apple = [f hasPrefix:@"SF"] || [f hasPrefix:@"San Francisco"] || [f hasPrefix:@"ADT"] || [f hasPrefix:@"New York"];
+    return apple && !fontpatch_is_adapted(font);
 }
 
 bool fontow_apply(FontOWTarget target, NSString *fontPath, NSString **result)
@@ -283,16 +290,16 @@ bool fontow_apply(FontOWTarget target, NSString *fontPath, NSString **result)
     if (!path || !font.length) { *result = @"The font couldn't be read."; return false; }
 
     // Back the original up while it still is the original -- and only if it
-    // looks like Apple's (an SF family): a replaced font must never become
+    // looks like Apple's: a replaced font must never become
     // the "original" Restore writes back.
     NSString *backup = fontow_backup_path(target);
     if (!fontow_is_replaced(target)) {
         NSData *current = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil];
         NSString *family = fontpatch_family_name(current);
         printf("[FONTOW] %s is now '%s'\n", path.UTF8String, (family ?: @"?").UTF8String);
-        if (!fontow_is_apple_family(family)) {
-            *result = [NSString stringWithFormat:@"%@ is '%@' right now, not Apple's font, so it isn't backed up as the original. Restart the device, then try again.",
-                       path.lastPathComponent, family ?: @"unknown"];
+        if (!fontow_is_apple_font(current, family)) {
+            *result = [NSString stringWithFormat:@"%@ is '%@'%@ right now, not Apple's font, so it isn't backed up as the original. Restart the device, then try again.",
+                       path.lastPathComponent, family ?: @"unknown", fontpatch_is_adapted(current) ? @" from Cyanide" : @""];
             log_user("[FONTOW] %s\n", (*result).UTF8String);
             return false;
         }
@@ -309,7 +316,8 @@ bool fontow_apply(FontOWTarget target, NSString *fontPath, NSString **result)
     }
 
     // A plain font in place of a variable system font: iOS wouldn't find the
-    // weights it asks for and fall back to another font. Adapt it first,
+    // weights it asks for and fall back to another font; in place of a
+    // collection, it wouldn't find the other faces. Adapt it first,
     // against the original (the file itself may hold a replaced font now).
     NSString *note = nil;
     NSData *originalForPatch = [NSData dataWithContentsOfFile:backup options:NSDataReadingMappedIfSafe error:nil];
@@ -366,7 +374,7 @@ bool fontow_restore(FontOWTarget target, NSString **result)
                                                                           options:NSDataReadingMappedIfSafe error:nil]);
     printf("[FONTOW] restore %s: file is '%s', backup is '%s'\n", fontow_target_path(target).UTF8String,
            (currentFamily ?: @"?").UTF8String, (backupFamily ?: @"?").UTF8String);
-    if (!fontow_is_apple_family(backupFamily)) {
+    if (!fontow_is_apple_font(original, backupFamily)) {
         *result = [NSString stringWithFormat:@"The backup isn't Apple's font ('%@'). Restart the device: that always brings the original back.",
                    backupFamily ?: @"unknown"];
         return false;

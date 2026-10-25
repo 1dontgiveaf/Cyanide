@@ -8,6 +8,7 @@
 //
 
 #import "font_patcher.h"
+#import "../LogTextView.h"
 #import <math.h>
 
 #pragma mark - Big-endian access
@@ -26,19 +27,33 @@ static int16_t clamp16(double v)
     return (int16_t)(r < INT16_MIN ? INT16_MIN : r > INT16_MAX ? INT16_MAX : r);
 }
 
+// Added to every adapted font: a replaced file can keep Apple's names (a
+// collection keeps each face's own), and must still never be taken for the
+// original.
+static NSString *const kFPMarkerTag = @"CYAN";
+
 #pragma mark - Tables
 
-// tag -> table data (copies), from a TrueType font or the first face of a
+// Number of fonts in a collection, 1 for a single font.
+static uint32_t fp_face_count(NSData *font)
+{
+    const uint8_t *b = font.bytes;
+    if (font.length < 12 || memcmp(b, "ttcf", 4) != 0) return 1;
+    uint32_t n = rd32(b + 8);
+    return 12 + (size_t)n * 4 <= font.length ? n : 0;
+}
+
+// tag -> table data (copies), from a TrueType font or face `index` of a
 // collection. nil when it isn't one.
-static NSMutableDictionary<NSString *, NSData *> *fp_tables(NSData *font, NSString **why)
+static NSMutableDictionary<NSString *, NSData *> *fp_face_tables(NSData *font, uint32_t index, NSString **why)
 {
     const uint8_t *b = font.bytes;
     size_t n = font.length;
     if (n < 12) { *why = @"Not a font file."; return nil; }
     size_t base = 0;
     if (memcmp(b, "ttcf", 4) == 0) {
-        if (n < 16 || rd32(b + 8) < 1) { *why = @"Empty font collection."; return nil; }
-        base = rd32(b + 12);
+        if (index >= fp_face_count(font)) { *why = @"Empty font collection."; return nil; }
+        base = rd32(b + 12 + index * 4);
     }
     if (base + 12 > n) { *why = @"Damaged font."; return nil; }
     uint32_t version = rd32(b + base);
@@ -57,11 +72,24 @@ static NSMutableDictionary<NSString *, NSData *> *fp_tables(NSData *font, NSStri
     return tables;
 }
 
+static NSMutableDictionary<NSString *, NSData *> *fp_tables(NSData *font, NSString **why)
+{
+    return fp_face_tables(font, 0, why);
+}
+
 BOOL fontpatch_needed(NSData *target, NSData *source)
 {
     NSString *why = nil;
     NSDictionary *t = fp_tables(target, &why), *s = fp_tables(source, &why);
-    return t[@"fvar"] != nil && s != nil && s[@"fvar"] == nil;
+    if (!t || !s) return NO;
+    // A single font can't stand in for a whole collection.
+    return fp_face_count(target) > 1 || (t[@"fvar"] != nil && s[@"fvar"] == nil);
+}
+
+BOOL fontpatch_is_adapted(NSData *font)
+{
+    NSString *why = nil;
+    return fp_tables(font, &why)[kFPMarkerTag] != nil;
 }
 
 #pragma mark - Names
@@ -350,17 +378,15 @@ static NSData *fp_assemble(NSDictionary<NSString *, NSData *> *tables)
 
 #pragma mark - Adapt
 
-NSData *fontpatch_adapt(NSData *target, NSData *source, NSString **errorOut, NSString **noteOut)
+// The tables of `s` adapted to stand in for the system font `t`. With
+// `targetNames`, the system font's own name table is kept as it is: a face of
+// a collection is asked for by its name (".SFSoftNumeric-..."), and the faces
+// must stay apart.
+static NSMutableDictionary<NSString *, NSData *> *fp_adapt_tables(NSDictionary<NSString *, NSData *> *t,
+                                                                  NSDictionary<NSString *, NSData *> *s, BOOL targetNames,
+                                                                  NSString **errorOut, NSMutableArray<NSString *> *notes)
 {
-    __autoreleasing NSString *e = nil;
-    __autoreleasing NSString *nNote = nil;
-    if (!errorOut) errorOut = &e;
-    if (!noteOut) noteOut = &nNote;
     NSString *why = nil;
-    NSDictionary<NSString *, NSData *> *t = fp_tables(target, &why);
-    if (!t) { *errorOut = [@"System font: " stringByAppendingString:why]; return nil; }
-    NSDictionary<NSString *, NSData *> *s = fp_tables(source, &why);
-    if (!s) { *errorOut = why; return nil; }
     for (NSString *tag in @[ @"head", @"hhea", @"hmtx", @"maxp", @"glyf", @"loca", @"cmap" ]) {
         if (!s[tag]) { *errorOut = [NSString stringWithFormat:@"The font has no %@ table.", tag]; return nil; }
     }
@@ -378,13 +404,13 @@ NSData *fontpatch_adapt(NSData *target, NSData *source, NSString **errorOut, NSS
     // The new font's glyphs and metrics.
     for (NSString *tag in @[ @"cmap", @"maxp", @"OS/2", @"post", @"GSUB", @"GDEF", @"GPOS", @"gasp" ]) if (s[tag]) out[tag] = s[tag];
     if (!out[@"gasp"] && t[@"gasp"]) out[@"gasp"] = t[@"gasp"];
-    out[@"name"] = fp_merged_names(s[@"name"], t[@"name"], fp_axis_name_ids(t[@"fvar"], t[@"STAT"]));
+    out[@"name"] = targetNames && t[@"name"] ? t[@"name"]
+                                             : fp_merged_names(s[@"name"], t[@"name"], fp_axis_name_ids(t[@"fvar"], t[@"STAT"]));
 
     NSMutableData *head = [s[@"head"] mutableCopy], *hhea = [s[@"hhea"] mutableCopy], *hmtx = [s[@"hmtx"] mutableCopy];
     NSMutableData *glyf = [NSMutableData data], *loca = [NSMutableData data];
     if (!fp_scale_glyphs(s[@"glyf"], s[@"loca"], numGlyphs, longLoca, scale ? f : 1, glyf, loca, &why)) { *errorOut = why; return nil; }
     wr16((uint8_t *)head.mutableBytes + 50, 1);                    // long loca
-    NSMutableArray *notes = [NSMutableArray arrayWithObject:@"adapted to the system font"];
     if (scale) {
         wr16((uint8_t *)head.mutableBytes + 18, targetUPM);
         const size_t headF[] = { 36, 38, 40, 42 };
@@ -422,8 +448,12 @@ NSData *fontpatch_adapt(NSData *target, NSData *source, NSString **errorOut, NSS
         }
         // Kerning and positioning values are in the old units: drop them
         // rather than kern at the wrong scale.
-        if (out[@"GPOS"]) { [out removeObjectForKey:@"GPOS"]; [notes addObject:@"kerning dropped"]; }
-        [notes addObject:[NSString stringWithFormat:@"scaled from %u to %u units", sourceUPM, targetUPM]];
+        if (out[@"GPOS"]) {
+            [out removeObjectForKey:@"GPOS"];
+            if (![notes containsObject:@"kerning dropped"]) [notes addObject:@"kerning dropped"];
+        }
+        NSString *scaled = [NSString stringWithFormat:@"scaled from %u to %u units", sourceUPM, targetUPM];
+        if (![notes containsObject:scaled]) [notes addObject:scaled];
     }
     // maxp: no instructions any more.
     if (out[@"maxp"].length >= 32 && rd32(out[@"maxp"].bytes) == 0x00010000) {
@@ -443,9 +473,77 @@ NSData *fontpatch_adapt(NSData *target, NSData *source, NSString **errorOut, NSS
         [gvar increaseLengthBy:((size_t)numGlyphs + 1) * 4];
         out[@"gvar"] = gvar;
     }
-    NSData *font = fp_assemble(out);
+    uint8_t marker[4] = { 0, 1, 0, 0 };
+    out[kFPMarkerTag] = [NSData dataWithBytes:marker length:4];
+    return out;
+}
+
+// A collection whose fonts share every table they have in common (here: all
+// the glyph tables), so it's barely bigger than one font.
+static NSData *fp_assemble_collection(NSArray<NSDictionary<NSString *, NSData *> *> *faces)
+{
+    uint32_t count = (uint32_t)faces.count;
+    NSMutableData *out = [NSMutableData data];
+    ap32(out, 0x74746366); ap32(out, 0x00010000); ap32(out, count);   // 'ttcf' 1.0
+    [out increaseLengthBy:(size_t)count * 4];
+    NSMutableArray<NSArray<NSString *> *> *tagLists = [NSMutableArray array];
+    NSMutableArray<NSNumber *> *dirs = [NSMutableArray array];
+    for (uint32_t f = 0; f < count; f++) {
+        NSArray<NSString *> *tags = [faces[f].allKeys sortedArrayUsingSelector:@selector(compare:)];
+        [tagLists addObject:tags];
+        uint16_t n = (uint16_t)tags.count, entrySel = 0, range = 1;
+        while (range * 2 <= n) { range *= 2; entrySel++; }
+        wr32((uint8_t *)out.mutableBytes + 12 + f * 4, (uint32_t)out.length);
+        [dirs addObject:@(out.length)];
+        ap32(out, 0x00010000); ap16(out, n); ap16(out, range * 16); ap16(out, entrySel); ap16(out, n * 16 - range * 16);
+        [out increaseLengthBy:(size_t)n * 16];
+    }
+    NSMutableDictionary<NSData *, NSNumber *> *placed = [NSMutableDictionary dictionary];
+    for (uint32_t f = 0; f < count; f++) {
+        NSArray<NSString *> *tags = tagLists[f];
+        for (NSUInteger i = 0; i < tags.count; i++) {
+            NSData *t = faces[f][tags[i]];
+            NSNumber *at = placed[t];
+            if (!at) {
+                at = @(out.length);
+                placed[t] = at;
+                [out appendData:t];
+                while (out.length % 4) { uint8_t z = 0; [out appendBytes:&z length:1]; }
+            }
+            uint8_t *r = (uint8_t *)out.mutableBytes + dirs[f].unsignedLongValue + 12 + i * 16;
+            memcpy(r, tags[i].UTF8String, 4);
+            wr32(r + 4, fp_checksum((const uint8_t *)out.bytes + at.unsignedLongValue, t.length));
+            wr32(r + 8, at.unsignedIntValue); wr32(r + 12, (uint32_t)t.length);
+        }
+    }
+    return out;
+}
+
+NSData *fontpatch_adapt(NSData *target, NSData *source, NSString **errorOut, NSString **noteOut)
+{
+    __autoreleasing NSString *e = nil;
+    __autoreleasing NSString *nNote = nil;
+    if (!errorOut) errorOut = &e;
+    if (!noteOut) noteOut = &nNote;
+    NSString *why = nil;
+    NSDictionary<NSString *, NSData *> *s = fp_tables(source, &why);
+    if (!s) { *errorOut = why; return nil; }
+    uint32_t count = fp_face_count(target);
+    if (count < 1) { *errorOut = @"System font: empty font collection."; return nil; }
+    BOOL collection = memcmp(target.bytes, "ttcf", 4) == 0;
+    NSMutableArray<NSString *> *notes = [NSMutableArray arrayWithObject:collection
+        ? [NSString stringWithFormat:@"adapted to all %u system fonts", count] : @"adapted to the system font"];
+    NSMutableArray<NSDictionary<NSString *, NSData *> *> *faces = [NSMutableArray array];
+    for (uint32_t f = 0; f < count; f++) {
+        NSDictionary<NSString *, NSData *> *t = fp_face_tables(target, f, &why);
+        if (!t) { *errorOut = [@"System font: " stringByAppendingString:why]; return nil; }
+        NSDictionary *face = fp_adapt_tables(t, s, collection, errorOut, notes);
+        if (!face) return nil;
+        [faces addObject:face];
+    }
+    NSData *font = collection ? fp_assemble_collection(faces) : fp_assemble(faces[0]);
     *noteOut = [notes componentsJoinedByString:@", "];
-    printf("[FONTPATCH] %u glyphs, %u -> %u units, %lu tables, %lu bytes (%s)\n", numGlyphs, sourceUPM, targetUPM,
-           (unsigned long)out.count, (unsigned long)font.length, (*noteOut).UTF8String);
+    printf("[FONTPATCH] %u face(s), %lu tables in the first, %lu bytes (%s)\n", count, (unsigned long)faces[0].count,
+           (unsigned long)font.length, (*noteOut).UTF8String);
     return font;
 }

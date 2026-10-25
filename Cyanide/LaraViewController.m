@@ -73,31 +73,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
     if (self.tool == LaraToolPerformanceHUD || self.tool == LaraToolHiddenSettings) [self readState];
     if (self.tool == LaraToolJIT || self.tool == LaraToolAppLimit || self.tool == LaraToolCards ||
         self.tool == LaraToolDecrypt) [self listJITApps];
-    if (self.tool == LaraToolFonts) {
-        self.fonts = fontow_imported_fonts();
-        // Which files the Lock Screen clock styles use (diagnostic for adding
-        // them as targets): every system font, and font assets (MobileAsset),
-        // which need the filesystem sandbox lifted.
-        settings_unlock_filesystem_async(NO, ^(BOOL ok, NSString *message) {
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-                NSFileManager *fm = NSFileManager.defaultManager;
-                for (NSString *root in @[ @"/System/Library/Fonts", @"/private/var/MobileAsset/AssetsV2" ]) {
-                    NSUInteger fonts = 0;
-                    NSDirectoryEnumerator *en = [fm enumeratorAtPath:root];
-                    for (NSString *rel in en) {
-                        NSString *ext = rel.pathExtension.lowercaseString;
-                        if (![@[ @"ttf", @"ttc", @"otf" ] containsObject:ext]) continue;
-                        fonts++;
-                        unsigned long long size = [fm attributesOfItemAtPath:[root stringByAppendingPathComponent:rel] error:nil].fileSize;
-                        printf("[FONTOW] font file: %s/%s (%llu bytes)\n", root.UTF8String, rel.UTF8String, size);
-                    }
-                    printf("[FONTOW] %s: %lu font file(s)%s\n", root.UTF8String, (unsigned long)fonts,
-                           en ? "" : " (folder not readable)");
-                }
-                printf("[FONTOW] filesystem access for the asset search: %s\n", ok ? "yes" : (message ?: @"no").UTF8String);
-            });
-        });
-    }
+    if (self.tool == LaraToolFonts) self.fonts = fontow_imported_fonts();
 }
 
 #pragma mark Font Overwrite
@@ -461,7 +437,7 @@ static const NSInteger kLaraHUDModeCount = sizeof(kLaraHUDModes) / sizeof(kLaraH
             about = @"Changes the material behind the dock, folders, Control Center, notification banners and the app switcher: Apple's (Visible), your own tint and blur (Color), or none (Disabled). Tap Apply after changing something. It works in SpringBoard's memory, so a respring undoes it: apply again after one.\n\nNotification Banners: on the Lock Screen, iOS draws notifications as one shared blur cut into rounded shapes. With Color they drop out of it and show square there (with lara's files too); banners elsewhere stay rounded.\n\nControl Center Blur: with Color, Control Center's own uncolored blur shows for a moment while it closes; iOS fades it separately.";
             break;
         case LaraToolFonts:
-            about = @"Replaces a system font in memory: nothing on the sealed system volume changes, and a restart always brings the original back; Restore does it without one (the original is backed up first). Import a .ttf, .otf or .ttc from Files, tap it and pick the font to replace; it has to be the same size or smaller. A plain font is adapted to the system font on the device first (its weights and names, as lara's font patcher does; kerning is dropped if it has to be scaled). Fonts with PostScript (CFF) outlines can't be adapted. If SpringBoard keeps crashing after the respring, force-restart the device.";
+            about = @"Replaces a system font in memory: nothing on the sealed system volume changes, and a restart always brings the original back; Restore does it without one (the original is backed up first). Import a .ttf, .otf or .ttc from Files, tap it and pick the font to replace; it has to be the same size or smaller. A plain font is adapted to the system font on the device first (its weights and names, as lara's font patcher does; kerning is dropped if it has to be scaled). Fonts with PostScript (CFF) outlines can't be adapted. Lock Screen Clock changes every clock style at once; the weight slider has no effect on the new font. If SpringBoard keeps crashing after the respring, force-restart the device.";
             break;
         case LaraToolJIT:
             about = @"Tap an app to open it with JIT (for emulators and similar apps). Only apps signed with a development profile can get it. JIT lasts until the app quits; some apps can't tell it's on.";

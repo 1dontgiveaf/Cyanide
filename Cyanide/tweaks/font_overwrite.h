@@ -22,6 +22,7 @@ typedef NS_ENUM(NSInteger, FontOWTarget) {
     FontOWTargetSystem,
     FontOWTargetItalic,
     FontOWTargetMono,
+    FontOWTargetClock,      // the Lock Screen clock's styles
     FontOWTargetCount,
 };
 
