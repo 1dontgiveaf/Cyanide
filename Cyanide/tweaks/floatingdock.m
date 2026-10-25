@@ -393,22 +393,37 @@ static uint64_t floatingdock_ensure_modal_library_controller(uint64_t iconContro
             return 0;
         }
 
-        // iOS 18: SpringBoard builds the modal Library and its view controller
-        // itself, from the scene alone (on SBIconController or the scene's
-        // SBHomeScreenController).
-        uint64_t homeScreenController = r_responds(scene, "homeScreenController")
-            ? r_msg2(scene, "homeScreenController", 0, 0, 0, 0) : 0;
-        uint64_t creator = r_responds(iconController, "createModalLibraryControllerForWindowScene:") ? iconController
-            : r_is_objc_ptr(homeScreenController) &&
-              r_responds(homeScreenController, "createModalLibraryControllerForWindowScene:") ? homeScreenController : 0;
-        if (creator) {
-            modalController = r_msg2_main(creator, "createModalLibraryControllerForWindowScene:", scene, 0, 0, 0);
+        // iOS 18 only has createModalLibraryControllerForWindowScene:, which
+        // builds a second SBLibraryViewController -- and that one registers the
+        // Home gesture again: SpringBoard aborts. Build the modal controller
+        // around the App Library that already exists instead.
+        uint64_t modalCls = r_class("SBModalLibraryController");
+        uint64_t iconManager = r_responds(iconController, "iconManager")
+            ? r_msg2(iconController, "iconManager", 0, 0, 0, 0) : 0;
+        if (!r_responds(iconController, "createModalLibraryControllerForWindowScene:withLibraryViewController:") &&
+            r_is_objc_ptr(modalCls) &&
+            r_responds(modalCls, "instancesRespondToSelector:") &&
+            r_msg2(modalCls, "instancesRespondToSelector:",
+                   r_sel("initWithIconManager:libraryViewController:floatingDockController:windowScene:"), 0, 0, 0)) {
+            uint64_t libraryViewController = r_responds(iconController, "overlayLibraryViewController")
+                ? r_msg2_main(iconController, "overlayLibraryViewController", 0, 0, 0, 0) : 0;
+            if (!r_is_objc_ptr(libraryViewController) || !r_is_objc_ptr(iconManager)) {
+                printf("[FLOATING-DOCK] no existing App Library view controller (libraryVC=0x%llx iconManager=0x%llx); skipped modal Library\n",
+                       libraryViewController, iconManager);
+                return 0;
+            }
+            uint64_t allocated = r_msg2_main(modalCls, "alloc", 0, 0, 0, 0);
+            modalController = r_is_objc_ptr(allocated)
+                ? r_msg2_main(allocated, "initWithIconManager:libraryViewController:floatingDockController:windowScene:",
+                              iconManager, libraryViewController, floatingController, scene)
+                : 0;
             if (!r_is_objc_ptr(modalController)) {
-                printf("[FLOATING-DOCK] SpringBoard did not create an SBModalLibraryController (scene-only path)\n");
+                printf("[FLOATING-DOCK] SBModalLibraryController init failed\n");
                 return 0;
             }
             r_msg2_main(sceneContext, "setModalLibraryController:", modalController, 0, 0, 0);
-            printf("[FLOATING-DOCK] created modal Library controller=0x%llx (scene-only path)\n", modalController);
+            printf("[FLOATING-DOCK] created modal Library controller=0x%llx around the existing libraryVC=0x%llx\n",
+                   modalController, libraryViewController);
         } else if (!r_responds(iconController,
                                "createModalLibraryControllerForWindowScene:withLibraryViewController:")) {
             printf("[FLOATING-DOCK] Modal App Library creation path is unavailable\n");
