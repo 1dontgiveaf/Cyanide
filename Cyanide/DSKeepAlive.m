@@ -5,6 +5,8 @@
 
 #import "DSKeepAlive.h"
 #import "LogTextView.h"
+#import "SettingsViewController.h"
+#import "TaskRop/Exception.h"
 #import <AVFoundation/AVFoundation.h>
 #import <CoreFoundation/CoreFoundation.h>
 #import <UIKit/UIKit.h>
@@ -173,12 +175,18 @@ static void ds_keepalive_install_observers_once(void)
                      queue:nil
                 usingBlock:^(NSNotification *note) {
         NSNumber *typeNum = note.userInfo[AVAudioSessionInterruptionTypeKey];
+        if (typeNum.unsignedIntegerValue == AVAudioSessionInterruptionTypeBegan) {
+            // The silent audio stopped: iOS may suspend Cyanide now, so no
+            // live-tweak call may be started in the background.
+            excport_gate_set_background_live(false);
+        }
         if (typeNum.unsignedIntegerValue == AVAudioSessionInterruptionTypeEnded) {
             // iOS posts this when the interrupting audio finishes (call hung up,
             // Siri dismissed, alarm dismissed). Reactivate even if the OS didn't
             // set AVAudioSessionInterruptionOptionShouldResume — silent keepalive
             // doesn't get that hint reliably on iOS 18.
             ds_keepalive_revive(@"interruption ended");
+            settings_background_live_arm("Keep Alive resumed");
         }
     }];
 

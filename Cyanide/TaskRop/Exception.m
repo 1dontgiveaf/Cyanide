@@ -26,6 +26,12 @@
 // this toolchain's GNU __atomic_* builtins reject _Atomic-qualified pointers.
 static _Atomic int g_excport_backgrounded = 0;
 static _Atomic int g_excport_terminating = 0;
+// Round 55: set only while Cyanide is kept running in the background (Keep
+// Alive audio) and the backgrounding transition has settled. The deadlock the
+// gate prevents is with runningboardd's policy changes AROUND transitions; in
+// the steady kept-alive state live tweaks (Gravity, StatBar, ...) may call
+// again. Every backgrounded change clears it.
+static _Atomic int g_excport_background_live = 0;
 // Round 22-regression: teardown-owned exception-port operations (the drain's
 // trojan restore, the synthetic exit dispatch, trojan restore in destroy)
 // MUST sign even while the gate is blocked — the round-21 gate refusing them
@@ -90,6 +96,8 @@ static bool excport_gate_blocked_for_caller(const char *what)
 
 void excport_gate_set_backgrounded(bool backgrounded)
 {
+    if (atomic_exchange(&g_excport_background_live, 0))
+        printf("[EXCPORT] gate: background live calls closed (lifecycle change)\n");
     int prev = atomic_exchange(&g_excport_backgrounded, backgrounded ? 1 : 0);
     if (prev != (backgrounded ? 1 : 0))
         printf("[EXCPORT] gate: backgrounded=%d — own-process exception-port "
@@ -104,10 +112,21 @@ void excport_gate_set_terminating(void)
                "now REFUSED\n");
 }
 
+void excport_gate_set_background_live(bool allowed)
+{
+    // Only meaningful while backgrounded: a foreground gate is open anyway.
+    if (allowed && atomic_load(&g_excport_backgrounded) == 0) return;
+    int prev = atomic_exchange(&g_excport_background_live, allowed ? 1 : 0);
+    if (prev != (allowed ? 1 : 0))
+        printf("[EXCPORT] gate: background live calls %s\n",
+               allowed ? "ALLOWED (kept alive, transition settled)" : "closed");
+}
+
 bool excport_gate_blocked(void)
 {
-    return atomic_load(&g_excport_backgrounded) != 0 ||
-           atomic_load(&g_excport_terminating) != 0;
+    if (atomic_load(&g_excport_terminating) != 0) return true;
+    return atomic_load(&g_excport_backgrounded) != 0 &&
+           atomic_load(&g_excport_background_live) == 0;
 }
 
 void excport_gate_snapshot(int *backgrounded, int *terminating)

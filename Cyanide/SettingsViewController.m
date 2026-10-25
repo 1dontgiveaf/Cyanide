@@ -7012,6 +7012,47 @@ static void locsvc_switcher_note_safe(BOOL clean)
 }
 
 
+// Live tweaks (Gravity's tilt feed, StatBar, NSBar, ...) are meant to keep
+// calling into SpringBoard while Cyanide is in the background, kept running by
+// Keep Alive's silent audio. The round-21 gate refuses those calls around the
+// backgrounding transition (the runningboardd deadlock); once it has settled
+// and Keep Alive is really playing, they are let through again until the next
+// lifecycle change -- or until Keep Alive stops, since then iOS may suspend
+// Cyanide (a new transition).
+static volatile uint64_t g_background_live_generation = 0;
+
+static void settings_background_live_watch(uint64_t generation)
+{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)NSEC_PER_SEC),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        if (generation != g_background_live_generation || !g_app_in_background) return;
+        if (!ds_keepalive_is_running()) {
+            excport_gate_set_background_live(false);
+            log_user("[WARN] Keep Alive stopped: live tweaks pause until Cyanide is opened again.\n");
+            return;
+        }
+        settings_background_live_watch(generation);
+    });
+}
+
+void settings_background_live_arm(const char *why)
+{
+    uint64_t generation = __sync_add_and_fetch(&g_background_live_generation, 1);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * (int64_t)NSEC_PER_SEC),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        if (generation != g_background_live_generation || !g_app_in_background ||
+            settings_cleanup_in_progress()) return;
+        if (!ds_keepalive_is_running()) {
+            printf("[SETTINGS] background live calls stay off (%s): Keep Alive isn't playing\n",
+                   why ?: "background");
+            return;
+        }
+        excport_gate_set_background_live(true);
+        printf("[SETTINGS] background live calls on (%s)\n", why ?: "background");
+        settings_background_live_watch(generation);
+    });
+}
+
 void settings_application_did_enter_background(void)
 {
     // Round 21: refuse NEW own-process exception-port traps from this moment
@@ -7081,6 +7122,7 @@ void settings_application_did_enter_background(void)
     if (anyLiveLoopNeeded) {
         if ([d boolForKey:kSettingsKeepAlive]) {
             ds_keepalive_apply_enabled(YES);
+            settings_background_live_arm("entered background");
         }
         settings_begin_statbar_background_task_async("entered background");
     }
