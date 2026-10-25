@@ -393,64 +393,65 @@ static uint64_t floatingdock_ensure_modal_library_controller(uint64_t iconContro
             return 0;
         }
 
-        // iOS 18 only has createModalLibraryControllerForWindowScene:, which
-        // builds a second SBLibraryViewController -- and that one registers the
-        // Home gesture again: SpringBoard aborts. Build the modal controller
-        // around the App Library that already exists instead.
-        uint64_t modalCls = r_class("SBModalLibraryController");
-        uint64_t iconManager = r_responds(iconController, "iconManager")
-            ? r_msg2(iconController, "iconManager", 0, 0, 0, 0) : 0;
-        if (!r_responds(iconController, "createModalLibraryControllerForWindowScene:withLibraryViewController:") &&
-            r_is_objc_ptr(modalCls) &&
-            r_responds(modalCls, "instancesRespondToSelector:") &&
-            r_msg2(modalCls, "instancesRespondToSelector:",
-                   r_sel("initWithIconManager:libraryViewController:floatingDockController:windowScene:"), 0, 0, 0)) {
-            uint64_t libraryViewController = r_responds(iconController, "overlayLibraryViewController")
-                ? r_msg2_main(iconController, "overlayLibraryViewController", 0, 0, 0, 0) : 0;
-            if (!r_is_objc_ptr(libraryViewController) || !r_is_objc_ptr(iconManager)) {
-                printf("[FLOATING-DOCK] no existing App Library view controller (libraryVC=0x%llx iconManager=0x%llx); skipped modal Library\n",
-                       libraryViewController, iconManager);
-                return 0;
-            }
-            uint64_t allocated = r_msg2_main(modalCls, "alloc", 0, 0, 0, 0);
-            modalController = r_is_objc_ptr(allocated)
-                ? r_msg2_main(allocated, "initWithIconManager:libraryViewController:floatingDockController:windowScene:",
-                              iconManager, libraryViewController, floatingController, scene)
-                : 0;
-            if (!r_is_objc_ptr(modalController)) {
-                printf("[FLOATING-DOCK] SBModalLibraryController init failed\n");
-                return 0;
-            }
-            r_msg2_main(sceneContext, "setModalLibraryController:", modalController, 0, 0, 0);
-            printf("[FLOATING-DOCK] created modal Library controller=0x%llx around the existing libraryVC=0x%llx\n",
-                   modalController, libraryViewController);
-        } else if (!r_responds(iconController,
-                               "createModalLibraryControllerForWindowScene:withLibraryViewController:")) {
+        // The popup needs its own App Library: SBHModalLibraryPresenter hides
+        // the view of the one it is given when it dismisses and adds its own
+        // pan gesture to it, so sharing the page's left the page broken (only
+        // recents). SpringBoard's creators build one (iOS 17: passing nil;
+        // iOS 18: scene only), but a second SBLibraryViewController asks for
+        // the same Home gesture again and SBSystemGestureManager aborts ("we
+        // already have one"). That registration is made a no-op for the
+        // duration of the one call; the page keeps its gesture.
+        uint64_t creator = 0;
+        bool withLibraryArg = false;
+        uint64_t homeScreenController = r_responds(scene, "homeScreenController")
+            ? r_msg2(scene, "homeScreenController", 0, 0, 0, 0) : 0;
+        if (r_responds(iconController, "createModalLibraryControllerForWindowScene:withLibraryViewController:")) {
+            creator = iconController;
+            withLibraryArg = true;
+        } else if (r_responds(iconController, "createModalLibraryControllerForWindowScene:")) {
+            creator = iconController;
+        } else if (r_is_objc_ptr(homeScreenController) &&
+                   r_responds(homeScreenController, "createModalLibraryControllerForWindowScene:")) {
+            creator = homeScreenController;
+        }
+        if (!creator) {
             printf("[FLOATING-DOCK] Modal App Library creation path is unavailable\n");
             return 0;
-        } else {
-            uint64_t existingLibraryViewController =
-                r_responds(iconController, "overlayLibraryViewController")
-                ? r_msg2_main(iconController, "overlayLibraryViewController", 0, 0, 0, 0) : 0;
-            if (!r_is_objc_ptr(existingLibraryViewController)) {
-                printf("[FLOATING-DOCK] No existing Library view controller is available; skipped unsafe runtime creation\n");
-                return 0;
-            }
-            printf("[FLOATING-DOCK] creating modal Library with existing libraryVC=0x%llx\n",
-                   existingLibraryViewController);
-
-            modalController = r_msg2_main(
-                iconController,
-                "createModalLibraryControllerForWindowScene:withLibraryViewController:",
-                scene, existingLibraryViewController, 0, 0);
-            if (!r_is_objc_ptr(modalController)) {
-                printf("[FLOATING-DOCK] SpringBoard did not create an SBModalLibraryController\n");
-                return 0;
-            }
-            r_msg2_main(sceneContext, "setModalLibraryController:", modalController, 0, 0, 0);
-            printf("[FLOATING-DOCK] created modal Library controller=0x%llx using existing libraryVC=0x%llx\n",
-                   modalController, existingLibraryViewController);
         }
+
+        uint64_t gestureMethod = floatingdock_instance_method(r_class("SBSystemGestureManager"),
+                                                              r_sel("addGestureRecognizer:withType:"));
+        uint64_t noopMethod = floatingdock_instance_method(r_class("NSObject"), r_sel("self"));
+        uint64_t noopImp = noopMethod
+            ? r_dlsym_call(R_TIMEOUT, "method_getImplementation", noopMethod, 0, 0, 0, 0, 0, 0, 0) : 0;
+        if (!gestureMethod || !noopImp) {
+            printf("[FLOATING-DOCK] gesture registration can't be paused (method=0x%llx noop=0x%llx); skipped modal Library\n",
+                   gestureMethod, noopImp);
+            return 0;
+        }
+        uint64_t gestureImp = r_dlsym_call(R_TIMEOUT, "method_setImplementation",
+                                           gestureMethod, noopImp, 0, 0, 0, 0, 0, 0);
+        if (!gestureImp) {
+            printf("[FLOATING-DOCK] gesture registration couldn't be paused; skipped modal Library\n");
+            return 0;
+        }
+        modalController = withLibraryArg
+            ? r_msg2_main(creator, "createModalLibraryControllerForWindowScene:withLibraryViewController:", scene, 0, 0, 0)
+            : r_msg2_main(creator, "createModalLibraryControllerForWindowScene:", scene, 0, 0, 0);
+        uint64_t restored = r_dlsym_call(R_TIMEOUT, "method_setImplementation",
+                                         gestureMethod, gestureImp, 0, 0, 0, 0, 0, 0);
+        printf("[FLOATING-DOCK] gesture registration restored: %s\n", restored == noopImp ? "yes" : "NOT CONFIRMED");
+        if (!r_is_objc_ptr(modalController)) {
+            printf("[FLOATING-DOCK] SpringBoard did not create an SBModalLibraryController\n");
+            return 0;
+        }
+        r_msg2_main(sceneContext, "setModalLibraryController:", modalController, 0, 0, 0);
+        uint64_t ownLibrary = r_responds(modalController, "libraryViewController")
+            ? r_msg2_main(modalController, "libraryViewController", 0, 0, 0, 0) : 0;
+        uint64_t pageLibrary = r_responds(iconController, "overlayLibraryViewController")
+            ? r_msg2_main(iconController, "overlayLibraryViewController", 0, 0, 0, 0) : 0;
+        printf("[FLOATING-DOCK] created modal Library controller=0x%llx with its own libraryVC=0x%llx (page's: 0x%llx)\n",
+               modalController, ownLibrary, pageLibrary);
     } else {
         printf("[FLOATING-DOCK] reused modal Library controller=0x%llx\n", modalController);
     }
