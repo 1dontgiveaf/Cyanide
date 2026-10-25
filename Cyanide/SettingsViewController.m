@@ -1072,6 +1072,8 @@ static NSString * const kSettingsPowercuffAppliedLevel = @"PowercuffAppliedLevel
 static NSString * const kSettingsPowercuffNominalNoticeShown = @"cyanide.powercuff.nominalDefaultNoticeShown.v1";
 
 NSString * const kSettingsDSDisableAppLibrary = @"DSDisableAppLibrary";
+// SpringBoard pid Disable App Library was last applied in.
+static NSString * const kSettingsDSAppLibraryDisabledPID = @"DSAppLibraryDisabledSpringBoardPID";
 NSString * const kSettingsDSDisableIconFlyIn  = @"DSDisableIconFlyIn";
 NSString * const kSettingsDSHideNewAppDots    = @"DSHideNewAppDots";
 NSString * const kSettingsDSZeroWakeAnimation = @"DSZeroWakeAnimation";
@@ -2011,18 +2013,27 @@ void settings_mark_tweak_needs_apply(NSString *key)
 }
 
 // iPad Dock needs the App Library: running it turns Disable App Library off.
-// That tweak can't be undone in a running SpringBoard (it replaces methods),
-// so when it was active in this one, the App Library button comes back with
-// the next respring.
 static void settings_floatingdock_take_over_app_library(NSUserDefaults *d)
 {
     if (![d boolForKey:kSettingsDSDisableAppLibrary]) return;
-    BOOL wasActive = settings_tweak_is_applied(kSettingsDSDisableAppLibrary);
     [d setBool:NO forKey:kSettingsDSDisableAppLibrary];
     settings_mark_tweak_applied(kSettingsDSDisableAppLibrary, NO);
     settings_notify_package_queue_changed_async();
-    log_user("[OK] Disable App Library turned off: iPad Dock needs the App Library.%s\n",
-             wasActive ? " It was active, so the App Library button appears after the next respring." : "");
+    log_user("[OK] Disable App Library turned off: iPad Dock needs the App Library.\n");
+}
+
+// Disable App Library can't be undone in a running SpringBoard. The pid it
+// was applied in tells (also after Cyanide restarted) whether this one still
+// has it. Needs the SpringBoard session.
+static void settings_floatingdock_note_app_library(NSUserDefaults *d)
+{
+    NSInteger pid = [d integerForKey:kSettingsDSAppLibraryDisabledPID];
+    if (pid <= 0) return;
+    if (pid != remote_call_current_pid()) {
+        [d removeObjectForKey:kSettingsDSAppLibraryDisabledPID];
+        return;
+    }
+    log_user("[WARN] Disable App Library is still active in this SpringBoard. If the Dock's App Library button stays empty, respring and apply again.\n");
 }
 
 // SpringBoard Tools: anything set to something other than Apple's look.
@@ -4904,6 +4915,8 @@ static SettingsDarkTweaksResult settings_apply_dark_tweaks_from_defaults_locked(
     if (disableAppLibrary) {
         result.any = true;
         result.disableAppLibrary = darksword_tweak_disable_app_library_in_session();
+        if (result.disableAppLibrary)
+            [d setInteger:remote_call_current_pid() forKey:kSettingsDSAppLibraryDisabledPID];
     }
     if (disableIconFlyIn) {
         result.any = true;
@@ -8837,6 +8850,7 @@ static void settings_schedule_live_apply_for_key(NSString *key)
                         ![d boolForKey:kSettingsFloatingDockEnabled] ||
                         !g_springboard_rc_ready) return;
                     settings_floatingdock_take_over_app_library(d);
+                    settings_floatingdock_note_app_library(d);
                     bool ok = floatingdock_apply_in_session();
                     settings_mark_tweak_applied(kSettingsFloatingDockEnabled,
                                                 ok && [d boolForKey:kSettingsFloatingDockEnabled]);
@@ -9966,6 +9980,7 @@ static void settings_run_actions_internal(BOOL pendingOnly)
 
                     if (runFloatingDock) {
                         settings_progress(&step, total, "Creating iPad Dock");
+                        settings_floatingdock_note_app_library(d);
                         bool ok = floatingdock_apply_in_session();
                         settings_mark_tweak_applied(kSettingsFloatingDockEnabled,
                                                     ok && [d boolForKey:kSettingsFloatingDockEnabled]);

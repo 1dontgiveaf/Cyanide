@@ -388,34 +388,54 @@ static uint64_t floatingdock_ensure_modal_library_controller(uint64_t iconContro
         }
         if (!r_is_objc_ptr(iconController) || !r_is_objc_ptr(scene) ||
             !r_is_objc_ptr(sceneContext) ||
-            !r_responds(iconController,
-                        "createModalLibraryControllerForWindowScene:withLibraryViewController:") ||
             !r_responds(sceneContext, "setModalLibraryController:")) {
             printf("[FLOATING-DOCK] Modal App Library creation path is unavailable\n");
             return 0;
         }
 
-        uint64_t existingLibraryViewController =
-            r_responds(iconController, "overlayLibraryViewController")
-            ? r_msg2_main(iconController, "overlayLibraryViewController", 0, 0, 0, 0) : 0;
-        if (!r_is_objc_ptr(existingLibraryViewController)) {
-            printf("[FLOATING-DOCK] No existing Library view controller is available; skipped unsafe runtime creation\n");
+        // iOS 18: SpringBoard builds the modal Library and its view controller
+        // itself, from the scene alone (on SBIconController or the scene's
+        // SBHomeScreenController).
+        uint64_t homeScreenController = r_responds(scene, "homeScreenController")
+            ? r_msg2(scene, "homeScreenController", 0, 0, 0, 0) : 0;
+        uint64_t creator = r_responds(iconController, "createModalLibraryControllerForWindowScene:") ? iconController
+            : r_is_objc_ptr(homeScreenController) &&
+              r_responds(homeScreenController, "createModalLibraryControllerForWindowScene:") ? homeScreenController : 0;
+        if (creator) {
+            modalController = r_msg2_main(creator, "createModalLibraryControllerForWindowScene:", scene, 0, 0, 0);
+            if (!r_is_objc_ptr(modalController)) {
+                printf("[FLOATING-DOCK] SpringBoard did not create an SBModalLibraryController (scene-only path)\n");
+                return 0;
+            }
+            r_msg2_main(sceneContext, "setModalLibraryController:", modalController, 0, 0, 0);
+            printf("[FLOATING-DOCK] created modal Library controller=0x%llx (scene-only path)\n", modalController);
+        } else if (!r_responds(iconController,
+                               "createModalLibraryControllerForWindowScene:withLibraryViewController:")) {
+            printf("[FLOATING-DOCK] Modal App Library creation path is unavailable\n");
             return 0;
-        }
-        printf("[FLOATING-DOCK] creating modal Library with existing libraryVC=0x%llx\n",
-               existingLibraryViewController);
+        } else {
+            uint64_t existingLibraryViewController =
+                r_responds(iconController, "overlayLibraryViewController")
+                ? r_msg2_main(iconController, "overlayLibraryViewController", 0, 0, 0, 0) : 0;
+            if (!r_is_objc_ptr(existingLibraryViewController)) {
+                printf("[FLOATING-DOCK] No existing Library view controller is available; skipped unsafe runtime creation\n");
+                return 0;
+            }
+            printf("[FLOATING-DOCK] creating modal Library with existing libraryVC=0x%llx\n",
+                   existingLibraryViewController);
 
-        modalController = r_msg2_main(
-            iconController,
-            "createModalLibraryControllerForWindowScene:withLibraryViewController:",
-            scene, existingLibraryViewController, 0, 0);
-        if (!r_is_objc_ptr(modalController)) {
-            printf("[FLOATING-DOCK] SpringBoard did not create an SBModalLibraryController\n");
-            return 0;
+            modalController = r_msg2_main(
+                iconController,
+                "createModalLibraryControllerForWindowScene:withLibraryViewController:",
+                scene, existingLibraryViewController, 0, 0);
+            if (!r_is_objc_ptr(modalController)) {
+                printf("[FLOATING-DOCK] SpringBoard did not create an SBModalLibraryController\n");
+                return 0;
+            }
+            r_msg2_main(sceneContext, "setModalLibraryController:", modalController, 0, 0, 0);
+            printf("[FLOATING-DOCK] created modal Library controller=0x%llx using existing libraryVC=0x%llx\n",
+                   modalController, existingLibraryViewController);
         }
-        r_msg2_main(sceneContext, "setModalLibraryController:", modalController, 0, 0, 0);
-        printf("[FLOATING-DOCK] created modal Library controller=0x%llx using existing libraryVC=0x%llx\n",
-               modalController, existingLibraryViewController);
     } else {
         printf("[FLOATING-DOCK] reused modal Library controller=0x%llx\n", modalController);
     }

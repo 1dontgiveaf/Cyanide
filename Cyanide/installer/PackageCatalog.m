@@ -388,7 +388,7 @@ static const NSInteger kSecOTA              = SectionOTA;
                                      enabledKey:kSettingsFloatingDockEnabled
                                           isNew:YES];
         floatingDock.settingsSection = kSecFloatingDock;
-        floatingDock.unstableWarning = @"Beta: uses SpringBoard's private Dock controllers and turns on its iPad Dock in memory. Unsupported builds may glitch the Dock or crash SpringBoard; a respring restores the stock Dock.";
+        floatingDock.unstableWarning = @"Uses SpringBoard's private Dock controllers in memory. If the Dock looks wrong, turn it off or respring.";
 
         Package *quickLoader = [[Package alloc] initWithIdentifier:@"com.darksword.quickloader"
                                            name:@"QuickLoader"
