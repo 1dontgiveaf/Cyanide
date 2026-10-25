@@ -2010,6 +2010,21 @@ void settings_mark_tweak_needs_apply(NSString *key)
     settings_mark_tweak_applied(key, NO);
 }
 
+// iPad Dock needs the App Library: running it turns Disable App Library off.
+// That tweak can't be undone in a running SpringBoard (it replaces methods),
+// so when it was active in this one, the App Library button comes back with
+// the next respring.
+static void settings_floatingdock_take_over_app_library(NSUserDefaults *d)
+{
+    if (![d boolForKey:kSettingsDSDisableAppLibrary]) return;
+    BOOL wasActive = settings_tweak_is_applied(kSettingsDSDisableAppLibrary);
+    [d setBool:NO forKey:kSettingsDSDisableAppLibrary];
+    settings_mark_tweak_applied(kSettingsDSDisableAppLibrary, NO);
+    settings_notify_package_queue_changed_async();
+    log_user("[OK] Disable App Library turned off: iPad Dock needs the App Library.%s\n",
+             wasActive ? " It was active, so the App Library button appears after the next respring." : "");
+}
+
 // SpringBoard Tools: anything set to something other than Apple's look.
 static BOOL settings_sbtools_has_changes(NSUserDefaults *d)
 {
@@ -8821,10 +8836,7 @@ static void settings_schedule_live_apply_for_key(NSString *key)
                     if (settings_cleanup_in_progress() ||
                         ![d boolForKey:kSettingsFloatingDockEnabled] ||
                         !g_springboard_rc_ready) return;
-                    if ([d boolForKey:kSettingsDSDisableAppLibrary]) {
-                        log_user("[WARN] iPad Dock skipped: it needs the App Library, which Disable App Library removes. Turn one of them off.\n");
-                        return;
-                    }
+                    settings_floatingdock_take_over_app_library(d);
                     bool ok = floatingdock_apply_in_session();
                     settings_mark_tweak_applied(kSettingsFloatingDockEnabled,
                                                 ok && [d boolForKey:kSettingsFloatingDockEnabled]);
@@ -9534,6 +9546,8 @@ static void settings_run_actions_internal(BOOL pendingOnly)
             BOOL axonLiteEnabled = [d boolForKey:kSettingsAxonLiteEnabled];
             BOOL appSwitcherGridEnabled = [d boolForKey:kSettingsAppSwitcherGridEnabled];
             BOOL floatingDockEnabled = [d boolForKey:kSettingsFloatingDockEnabled];
+            // Before the DarkSword tweaks read their switches below.
+            if (floatingDockEnabled) settings_floatingdock_take_over_app_library(d);
             BOOL themerEnabled = [d boolForKey:kSettingsThemerEnabled];
             BOOL snowboardLiteEnabled = [d boolForKey:kSettingsSnowBoardLiteEnabled];
             BOOL liveWPEnabled = [d boolForKey:kSettingsLiveWPEnabled];
@@ -9950,11 +9964,7 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                         appswitchergrid_stop_in_session();
                     }
 
-                    if (runFloatingDock && [d boolForKey:kSettingsDSDisableAppLibrary]) {
-                        settings_progress(&step, total, "Creating iPad Dock");
-                        log_user("[WARN] iPad Dock skipped: it needs the App Library, which Disable App Library removes. Turn one of them off.\n");
-                        [runWarnings addObject:@"iPad Dock"];
-                    } else if (runFloatingDock) {
+                    if (runFloatingDock) {
                         settings_progress(&step, total, "Creating iPad Dock");
                         bool ok = floatingdock_apply_in_session();
                         settings_mark_tweak_applied(kSettingsFloatingDockEnabled,
@@ -15245,7 +15255,7 @@ UIViewController *settings_make_daemons_viewer(void)
         return @"Runtime patch. It changes SpringBoard's app switcher style in memory, writes no system files, and a respring restores stock. Unsupported builds may glitch the app switcher or crash SpringBoard.";
     }
     if (s == SectionFloatingDock) {
-        return @"SpringBoard's own iPad-style Dock with the App Library button, created in memory for the current SpringBoard session. Writes no system files; it turns on SpringBoard's \"App Library in Dock\" preference while active and off again when you turn the tweak off. Doesn't go together with Disable App Library.\n\nPorted from hxhlb/cyanide (Banana).";
+        return @"SpringBoard's own iPad-style Dock with the App Library button, created in memory for the current SpringBoard session. Writes no system files; it turns on SpringBoard's \"App Library in Dock\" preference while active and off again when you turn the tweak off. Turns Disable App Library off, since it needs the App Library.\n\nPorted from hxhlb/cyanide (Banana).";
     }
     if (s == SectionGravityLite) {
         return @"RemoteCall-only core port of Julio Verne's Gravity. Run applies UIDynamicAnimator gravity, collision, bounce, friction, optional dock physics, and accelerometer steering to SpringBoard icon snapshots. It can restore the icon layout or fire a manual explosion pulse while the SpringBoard session is active.\n\nNot included in this core port: Activator/Home-button hooks, drag gestures, automatic shake effects, and preference-daemon notifications.";
