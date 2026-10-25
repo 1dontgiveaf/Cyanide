@@ -442,7 +442,9 @@ static uint64_t floatingdock_ensure_modal_library_controller(uint64_t iconContro
                                          gestureMethod, gestureImp, 0, 0, 0, 0, 0, 0);
         printf("[FLOATING-DOCK] gesture registration restored: %s\n", restored == noopImp ? "yes" : "NOT CONFIRMED");
         if (!r_is_objc_ptr(modalController)) {
-            printf("[FLOATING-DOCK] SpringBoard did not create an SBModalLibraryController\n");
+            // iOS 17's Disable App Library answers SpringBoard's "App Library
+            // supported" checks with NO, which can stop this too.
+            log_user("[WARN] iPad Dock: SpringBoard did not create the Dock's App Library. If Disable App Library is on, turn it off and respring.\n");
             return 0;
         }
         r_msg2_main(sceneContext, "setModalLibraryController:", modalController, 0, 0, 0);

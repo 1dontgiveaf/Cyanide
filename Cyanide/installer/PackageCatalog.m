@@ -379,7 +379,7 @@ static const NSInteger kSecOTA              = SectionOTA;
         Package *floatingDock = [[Package alloc] initWithIdentifier:@"com.darksword.floatingdock"
                                            name:@"iPad Dock"
                                shortDescription:@"iPad-style Dock with App Library"
-                                longDescription:@"Turns the Dock into SpringBoard's own iPad-style Dock, including the App Library button, for the current SpringBoard session.\n\nWrites no system files. Turning it off brings the stock Dock back; so does a respring. Turns Disable App Library off, since it needs the App Library.\n\nPorted from hxhlb/cyanide."
+                                longDescription:@"Turns the Dock into SpringBoard's own iPad-style Dock, including the App Library button, for the current SpringBoard session.\n\nWrites no system files. Turning it off brings the stock Dock back; so does a respring. Works together with Disable App Library: the App Library is then only in the Dock.\n\nPorted from hxhlb/cyanide."
                                         version:version
                                          author:@"Banana"
                                        category:@"SpringBoard"

@@ -1072,8 +1072,6 @@ static NSString * const kSettingsPowercuffAppliedLevel = @"PowercuffAppliedLevel
 static NSString * const kSettingsPowercuffNominalNoticeShown = @"cyanide.powercuff.nominalDefaultNoticeShown.v1";
 
 NSString * const kSettingsDSDisableAppLibrary = @"DSDisableAppLibrary";
-// SpringBoard pid Disable App Library was last applied in.
-static NSString * const kSettingsDSAppLibraryDisabledPID = @"DSAppLibraryDisabledSpringBoardPID";
 NSString * const kSettingsDSDisableIconFlyIn  = @"DSDisableIconFlyIn";
 NSString * const kSettingsDSHideNewAppDots    = @"DSHideNewAppDots";
 NSString * const kSettingsDSZeroWakeAnimation = @"DSZeroWakeAnimation";
@@ -2014,30 +2012,6 @@ BOOL settings_tweak_is_applied(NSString *key)
 void settings_mark_tweak_needs_apply(NSString *key)
 {
     settings_mark_tweak_applied(key, NO);
-}
-
-// iPad Dock needs the App Library: running it turns Disable App Library off.
-static void settings_floatingdock_take_over_app_library(NSUserDefaults *d)
-{
-    if (![d boolForKey:kSettingsDSDisableAppLibrary]) return;
-    [d setBool:NO forKey:kSettingsDSDisableAppLibrary];
-    settings_mark_tweak_applied(kSettingsDSDisableAppLibrary, NO);
-    settings_notify_package_queue_changed_async();
-    log_user("[OK] Disable App Library turned off: iPad Dock needs the App Library.\n");
-}
-
-// Disable App Library can't be undone in a running SpringBoard. The pid it
-// was applied in tells (also after Cyanide restarted) whether this one still
-// has it. Needs the SpringBoard session.
-static void settings_floatingdock_note_app_library(NSUserDefaults *d)
-{
-    NSInteger pid = [d integerForKey:kSettingsDSAppLibraryDisabledPID];
-    if (pid <= 0) return;
-    if (pid != remote_call_current_pid()) {
-        [d removeObjectForKey:kSettingsDSAppLibraryDisabledPID];
-        return;
-    }
-    log_user("[WARN] Disable App Library is still active in this SpringBoard. If the Dock's App Library button stays empty, respring and apply again.\n");
 }
 
 // SpringBoard Tools: anything set to something other than Apple's look.
@@ -4919,8 +4893,6 @@ static SettingsDarkTweaksResult settings_apply_dark_tweaks_from_defaults_locked(
     if (disableAppLibrary) {
         result.any = true;
         result.disableAppLibrary = darksword_tweak_disable_app_library_in_session();
-        if (result.disableAppLibrary)
-            [d setInteger:remote_call_current_pid() forKey:kSettingsDSAppLibraryDisabledPID];
     }
     if (disableIconFlyIn) {
         result.any = true;
@@ -8853,8 +8825,6 @@ static void settings_schedule_live_apply_for_key(NSString *key)
                     if (settings_cleanup_in_progress() ||
                         ![d boolForKey:kSettingsFloatingDockEnabled] ||
                         !g_springboard_rc_ready) return;
-                    settings_floatingdock_take_over_app_library(d);
-                    settings_floatingdock_note_app_library(d);
                     bool ok = floatingdock_apply_in_session();
                     settings_mark_tweak_applied(kSettingsFloatingDockEnabled,
                                                 ok && [d boolForKey:kSettingsFloatingDockEnabled]);
@@ -9564,8 +9534,6 @@ static void settings_run_actions_internal(BOOL pendingOnly)
             BOOL axonLiteEnabled = [d boolForKey:kSettingsAxonLiteEnabled];
             BOOL appSwitcherGridEnabled = [d boolForKey:kSettingsAppSwitcherGridEnabled];
             BOOL floatingDockEnabled = [d boolForKey:kSettingsFloatingDockEnabled];
-            // Before the DarkSword tweaks read their switches below.
-            if (floatingDockEnabled) settings_floatingdock_take_over_app_library(d);
             BOOL themerEnabled = [d boolForKey:kSettingsThemerEnabled];
             BOOL snowboardLiteEnabled = [d boolForKey:kSettingsSnowBoardLiteEnabled];
             BOOL liveWPEnabled = [d boolForKey:kSettingsLiveWPEnabled];
@@ -9984,7 +9952,6 @@ static void settings_run_actions_internal(BOOL pendingOnly)
 
                     if (runFloatingDock) {
                         settings_progress(&step, total, "Creating iPad Dock");
-                        settings_floatingdock_note_app_library(d);
                         bool ok = floatingdock_apply_in_session();
                         settings_mark_tweak_applied(kSettingsFloatingDockEnabled,
                                                     ok && [d boolForKey:kSettingsFloatingDockEnabled]);
@@ -15274,7 +15241,7 @@ UIViewController *settings_make_daemons_viewer(void)
         return @"Runtime patch. It changes SpringBoard's app switcher style in memory, writes no system files, and a respring restores stock. Unsupported builds may glitch the app switcher or crash SpringBoard.";
     }
     if (s == SectionFloatingDock) {
-        return @"SpringBoard's own iPad-style Dock with the App Library button, created in memory for the current SpringBoard session. Writes no system files; it turns on SpringBoard's \"App Library in Dock\" preference while active and off again when you turn the tweak off. Turns Disable App Library off, since it needs the App Library.\n\nPorted from hxhlb/cyanide (Banana).";
+        return @"SpringBoard's own iPad-style Dock with the App Library button, created in memory for the current SpringBoard session. Writes no system files; it turns on SpringBoard's \"App Library in Dock\" preference while active and off again when you turn the tweak off. Works together with Disable App Library: the App Library is then only in the Dock.\n\nPorted from hxhlb/cyanide (Banana).";
     }
     if (s == SectionGravityLite) {
         return @"RemoteCall-only core port of Julio Verne's Gravity. Run applies UIDynamicAnimator gravity, collision, bounce, friction, optional dock physics, and accelerometer steering to SpringBoard icon snapshots. It can restore the icon layout or fire a manual explosion pulse while the SpringBoard session is active.\n\nNot included in this core port: Activator/Home-button hooks, drag gestures, automatic shake effects, and preference-daemon notifications.";
