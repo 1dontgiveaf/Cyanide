@@ -678,6 +678,18 @@ static const double kQuietMinPhase = 0.35;   // a phase stays readable at least 
 // starts, so only a request that never started shows as "still active";
 // the window leaves room for a slow (cold) relaunch of that app.
 - (void)leaveToApp:(NSString *)bundleID {
+    // Live tweaks keep calling into SpringBoard while Cyanide is in front; one
+    // cut off by the background gate kills SpringBoard. Let them finish first.
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        settings_quiesce_remote_calls_before_leaving("Location Services return");
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf leaveToAppNow:bundleID];
+        });
+    });
+}
+
+- (void)leaveToAppNow:(NSString *)bundleID {
     if (bundleID.length == 0 || !scene_open_app(bundleID)) {
         if (bundleID.length) NSLog(@"[URL] could not reopen the previous app; going Home");
         scene_suspend_to_home();

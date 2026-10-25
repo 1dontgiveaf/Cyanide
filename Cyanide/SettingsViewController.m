@@ -7181,6 +7181,29 @@ NSInteger settings_location_services_take_origin(NSString **bundleID)
     return origin;
 }
 
+void settings_quiesce_remote_calls_before_leaving(const char *why)
+{
+    // Every live-tweak call (Gravity's tilt feed, StatBar, ...) runs under the
+    // RemoteCall lock: holding it means none is half-way. Closing the gate
+    // while still holding it means none starts before iOS takes Cyanide to the
+    // background -- a call caught by the gate half-way leaves its injected
+    // thread in SpringBoard without an answer, and SpringBoard is killed
+    // (2026-10-25: Gravity tick + Location Services return, SpringBoard
+    // SIGKILL in performSelectorOnMainThread:waitUntilDone:).
+    @synchronized (settings_rc_lock()) {
+        uint64_t deadlineNs = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) + 2ULL * 1000000000ULL;
+        int waitedMs = 0;
+        while (remote_call_inflight_count() != 0 &&
+               clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) < deadlineNs) {
+            usleep(20000);
+            waitedMs += 20;
+        }
+        excport_gate_set_backgrounded(true);
+        printf("[SETTINGS] RemoteCalls quiesced before leaving (%s): in flight=%d, waited %d ms\n",
+               why ?: "leave", remote_call_inflight_count(), waitedMs);
+    }
+}
+
 void settings_location_services_set_async(int desired, BOOL allowFullExploit,
                                           BOOL removeFromSwitcher,
                                           BOOL resolveOrigin,
