@@ -42,6 +42,7 @@
 #import "tweaks/livewp.h"
 #import "tweaks/gravitylite.h"
 #import "tweaks/appswitchergrid.h"
+#import "tweaks/floatingdock.h"
 #import "tweaks/hide_home_bar.h"
 #import "tweaks/QuickLoader.h"
 #import "tweaks/RepoTweaks.h"
@@ -1204,6 +1205,7 @@ static NSString * const kSettingsNiceBarLiteLayoutCenterX = @"NiceBarLiteLayoutC
 NSString * const kSettingsAxonLiteEnabled = @"AxonLiteEnabled";
 
 NSString * const kSettingsAppSwitcherGridEnabled = @"AppSwitcherGridEnabled";
+NSString * const kSettingsFloatingDockEnabled = @"FloatingDockEnabled";
 NSString * const kSettingsFastLockXLiteEnabled = @"FastLockXLiteEnabled";
 static NSString * const kSettingsFastLockXLiteBlockMusic = @"FastLockXLiteBlockMusic";
 static NSString * const kSettingsFastLockXLiteBlockFlashlight = @"FastLockXLiteBlockFlashlight";
@@ -1505,6 +1507,15 @@ static bool settings_stop_appswitchergrid_registered(BOOL springboardWillDie)
     return appswitchergrid_stop_in_session();
 }
 
+static bool settings_stop_floatingdock_registered(BOOL springboardWillDie)
+{
+    if (springboardWillDie) {
+        floatingdock_forget_remote_state();
+        return false;
+    }
+    return floatingdock_stop_in_session();
+}
+
 static bool settings_stop_gravitylite_registered(BOOL springboardWillDie)
 {
     (void)springboardWillDie;
@@ -1614,6 +1625,7 @@ static void settings_each_springboard_cleanup_entry(void (^block)(const Settings
         { kSettingsNiceBarLiteEnabled, "NiceBar Lite", settings_request_nicebarlite_stop, settings_stop_nicebarlite_registered, nicebarlite_forget_remote_state, settings_nicebarlite_running, YES, YES },
         { kSettingsAxonLiteEnabled, "Axon Lite", settings_request_axonlite_stop, settings_stop_axonlite_registered, axonlite_forget_remote_state, settings_axonlite_running, YES, YES },
         { kSettingsAppSwitcherGridEnabled, "App Switcher Grid", NULL, settings_stop_appswitchergrid_registered, appswitchergrid_forget_remote_state, NULL, YES, YES },
+        { kSettingsFloatingDockEnabled, "iPad Dock", NULL, settings_stop_floatingdock_registered, floatingdock_forget_remote_state, NULL, NO, YES },
         { kSettingsGravityLiteEnabled, "Gravity Lite", settings_request_gravitylite_stop, settings_stop_gravitylite_registered, gravitylite_forget_remote_state, NULL, YES, YES },
         { kSettingsThemerEnabled, "Themer", settings_request_themer_stop, settings_stop_themer_registered, themer_forget_remote_state, settings_themer_running, YES, YES },
         { kSettingsSnowBoardLiteEnabled, "SnowBoard Lite", NULL, settings_stop_themer_registered, themer_forget_remote_state, NULL, YES, YES },
@@ -8198,6 +8210,11 @@ static BOOL settings_key_is_appswitchergrid(NSString *key)
     return [key isEqualToString:kSettingsAppSwitcherGridEnabled];
 }
 
+static BOOL settings_key_is_floatingdock(NSString *key)
+{
+    return [key isEqualToString:kSettingsFloatingDockEnabled];
+}
+
 static BOOL settings_key_is_gravitylite(NSString *key)
 {
     return [key isEqualToString:kSettingsGravityLiteEnabled] ||
@@ -8797,6 +8814,40 @@ static void settings_schedule_live_apply_for_key(NSString *key)
         return;
     }
 
+    if (settings_key_is_floatingdock(key)) {
+        if ([d boolForKey:kSettingsFloatingDockEnabled] && g_springboard_rc_ready) {
+            dispatch_async(dispatch_get_global_queue(0, 0), ^{
+                @synchronized (settings_rc_lock()) {
+                    if (settings_cleanup_in_progress() ||
+                        ![d boolForKey:kSettingsFloatingDockEnabled] ||
+                        !g_springboard_rc_ready) return;
+                    if ([d boolForKey:kSettingsDSDisableAppLibrary]) {
+                        log_user("[WARN] iPad Dock skipped: it needs the App Library, which Disable App Library removes. Turn one of them off.\n");
+                        return;
+                    }
+                    bool ok = floatingdock_apply_in_session();
+                    settings_mark_tweak_applied(kSettingsFloatingDockEnabled,
+                                                ok && [d boolForKey:kSettingsFloatingDockEnabled]);
+                    printf("[SETTINGS] live iPad Dock apply result=%d\n", ok);
+                }
+                settings_notify_package_queue_changed_async();
+            });
+        } else if (![d boolForKey:kSettingsFloatingDockEnabled]) {
+            settings_mark_tweak_applied(kSettingsFloatingDockEnabled, NO);
+            settings_notify_package_queue_changed_async();
+            if (g_springboard_rc_ready) {
+                dispatch_async(dispatch_get_global_queue(0, 0), ^{
+                    @synchronized (settings_rc_lock()) {
+                        if (g_springboard_rc_ready) floatingdock_stop_in_session();
+                    }
+                });
+            } else {
+                floatingdock_forget_remote_state();
+            }
+        }
+        return;
+    }
+
     if (settings_key_is_nsbar(key)) {
         if ([d boolForKey:kSettingsNSBarEnabled] && g_springboard_rc_ready) {
             settings_apply_nsbar_once_async("live settings");
@@ -9290,6 +9341,7 @@ void settings_register_defaults(void)
         kSettingsLiveWPVideoPath: @"",
 
         kSettingsAppSwitcherGridEnabled: @NO,
+        kSettingsFloatingDockEnabled: @NO,
 
         kSettingsQuickLoaderEnabled: @NO,
         kSettingsRepoTweaksEnabled: @NO,
@@ -9481,6 +9533,7 @@ static void settings_run_actions_internal(BOOL pendingOnly)
             BOOL niceBarLiteEnabled = [d boolForKey:kSettingsNiceBarLiteEnabled];
             BOOL axonLiteEnabled = [d boolForKey:kSettingsAxonLiteEnabled];
             BOOL appSwitcherGridEnabled = [d boolForKey:kSettingsAppSwitcherGridEnabled];
+            BOOL floatingDockEnabled = [d boolForKey:kSettingsFloatingDockEnabled];
             BOOL themerEnabled = [d boolForKey:kSettingsThemerEnabled];
             BOOL snowboardLiteEnabled = [d boolForKey:kSettingsSnowBoardLiteEnabled];
             BOOL liveWPEnabled = [d boolForKey:kSettingsLiveWPEnabled];
@@ -9494,6 +9547,7 @@ static void settings_run_actions_internal(BOOL pendingOnly)
             BOOL runNiceBarLite = settings_enabled_tweak_should_run(d, kSettingsNiceBarLiteEnabled, springBoardPendingOnly);
             BOOL runAxonLite = settings_enabled_tweak_should_run(d, kSettingsAxonLiteEnabled, springBoardPendingOnly);
             BOOL runAppSwitcherGrid = settings_enabled_tweak_should_run(d, kSettingsAppSwitcherGridEnabled, springBoardPendingOnly);
+            BOOL runFloatingDock = settings_enabled_tweak_should_run(d, kSettingsFloatingDockEnabled, springBoardPendingOnly);
             BOOL runThemer = settings_enabled_tweak_should_run(d, kSettingsThemerEnabled, springBoardPendingOnly);
             BOOL runSnowBoardLite = settings_enabled_tweak_should_run(d, kSettingsSnowBoardLiteEnabled, springBoardPendingOnly);
             BOOL runLiveWP = settings_enabled_tweak_should_run(d, kSettingsLiveWPEnabled, springBoardPendingOnly);
@@ -9522,7 +9576,7 @@ static void settings_run_actions_internal(BOOL pendingOnly)
             BOOL runSBTools = settings_enabled_tweak_should_run(d, kSettingsSBToolsWithTweaks, springBoardPendingOnly) &&
                               settings_sbtools_has_changes(d);
             BOOL cleanupDisabledSpringBoardTweaks = settings_disabled_applied_springboard_cleanup_needed(d);
-            BOOL needsSpringBoardWork = runSBTools || runSBC || runDarkTweaks || runStatBar || runNSBar || runNiceBarLite || runAxonLite || runGravityLite || runLayoutExtras || restoreLayoutExtras || runAppSwitcherGrid || runThemer || runSnowBoardLite || runLiveWP || runStageStrip || runFastLockXLite || runQuickLoader || runRepoTweaks || cleanupDisabledSpringBoardTweaks;
+            BOOL needsSpringBoardWork = runSBTools || runSBC || runDarkTweaks || runStatBar || runNSBar || runNiceBarLite || runAxonLite || runGravityLite || runLayoutExtras || restoreLayoutExtras || runAppSwitcherGrid || runFloatingDock || runThemer || runSnowBoardLite || runLiveWP || runStageStrip || runFastLockXLite || runQuickLoader || runRepoTweaks || cleanupDisabledSpringBoardTweaks;
             BOOL runSandboxEscape = [d boolForKey:kSettingsRunSandboxEscape] && (!pendingOnly || needsSpringBoardWork);
             BOOL needsSpringBoard = runSandboxEscape || needsSpringBoardWork || forceSpringBoardRefresh;
 
@@ -9552,6 +9606,7 @@ static void settings_run_actions_internal(BOOL pendingOnly)
             if (runAxonLite) total++;
             if (runGravityLite) total++;
             if (runAppSwitcherGrid) total++;
+            if (runFloatingDock) total++;
             if (runStageStrip) total++;
             if (runFastLockXLite) total++;
             if (runQuickLoader) total++;
@@ -9570,6 +9625,7 @@ static void settings_run_actions_internal(BOOL pendingOnly)
             if (runNiceBarLite) [enabledTweaks addObject:@"nicebar"];
             if (runAxonLite) [enabledTweaks addObject:@"axon"];
             if (runAppSwitcherGrid) [enabledTweaks addObject:@"app-switcher-grid"];
+            if (runFloatingDock) [enabledTweaks addObject:@"ipad-dock"];
             if (runGravityLite) [enabledTweaks addObject:[NSString stringWithFormat:@"gravity(%ld%%)", (long)[d integerForKey:kSettingsGravityLiteMagnitudePct]]];
             if (runPowercuff) [enabledTweaks addObject:[NSString stringWithFormat:@"power(%@)", [d stringForKey:kSettingsPowercuffLevel] ?: @"nominal"]];
             if (runDarkTweaks) [enabledTweaks addObject:@"dark"];
@@ -9892,6 +9948,24 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                         if (!ok) [runWarnings addObject:@"App Switcher Grid"];
                     } else if (!appSwitcherGridEnabled) {
                         appswitchergrid_stop_in_session();
+                    }
+
+                    if (runFloatingDock && [d boolForKey:kSettingsDSDisableAppLibrary]) {
+                        settings_progress(&step, total, "Creating iPad Dock");
+                        log_user("[WARN] iPad Dock skipped: it needs the App Library, which Disable App Library removes. Turn one of them off.\n");
+                        [runWarnings addObject:@"iPad Dock"];
+                    } else if (runFloatingDock) {
+                        settings_progress(&step, total, "Creating iPad Dock");
+                        bool ok = floatingdock_apply_in_session();
+                        settings_mark_tweak_applied(kSettingsFloatingDockEnabled,
+                                                    ok && [d boolForKey:kSettingsFloatingDockEnabled]);
+                        printf("[SETTINGS] iPad Dock result=%d\n", ok);
+                        log_user("%s iPad Dock %s.\n",
+                                 ok ? "[OK]" : "[WARN]",
+                                 ok ? "created" : "did not apply");
+                        if (!ok) [runWarnings addObject:@"iPad Dock"];
+                    } else if (!floatingDockEnabled) {
+                        floatingdock_stop_in_session();
                     }
 
                     if (runFastLockXLite) {
@@ -14733,6 +14807,16 @@ static const NSInteger kPasscodePreviewRow = 1;
     ];
 }
 
+- (NSArray<NSDictionary *> *)floatingDockRows
+{
+    BOOL applied = settings_tweak_is_applied(kSettingsFloatingDockEnabled);
+    return @[
+        @{ @"kind": @"info",
+           @"title": applied ? @"Dock: iPad" : @"Dock: Stock",
+           @"subtitle": @"Turn it off in the Installer to bring the stock Dock back; a respring always does." },
+    ];
+}
+
 - (NSArray<NSDictionary *> *)fastLockXLiteRows
 {
     return @[
@@ -14819,6 +14903,9 @@ static const NSInteger kPasscodePreviewRow = 1;
     } else if (section == SectionAppSwitcherGrid) {
         [out addObject:@{@"title": @"Switcher style",
                          @"value": settings_tweak_is_applied(kSettingsAppSwitcherGridEnabled) ? @"Grid" : @"Stock"}];
+    } else if (section == SectionFloatingDock) {
+        [out addObject:@{@"title": @"Dock",
+                         @"value": settings_tweak_is_applied(kSettingsFloatingDockEnabled) ? @"iPad" : @"Stock"}];
     } else if (section == SectionFastLockXLite) {
         BOOL alwaysOnIntent = [d boolForKey:kSettingsFastLockXLiteEnabled];
         BOOL alwaysOnApplied = settings_tweak_is_applied(kSettingsFastLockXLiteEnabled);
@@ -14890,6 +14977,7 @@ static const NSInteger kPasscodePreviewRow = 1;
         case SectionNiceBarLite: return self.nicebarLiteRows;
         case SectionAxonLite:  return self.axonLiteRows;
         case SectionAppSwitcherGrid: return self.appSwitcherGridRows;
+        case SectionFloatingDock: return self.floatingDockRows;
         case SectionFastLockXLite: return settings_fastlockx_lite_install_allowed() ? self.fastLockXLiteRows : @[];
         case SectionGravityLite: return self.gravityLiteRows;
         case SectionLocationSim: return self.locationSimRows;
@@ -14922,6 +15010,7 @@ static const NSInteger kPasscodePreviewRow = 1;
 #endif
         @{ @"title": @"Gravity Lite",       @"icon": @"arrow.down.circle.fill",              @"color": [UIColor systemGreenColor],  @"section": @(SectionGravityLite) },
         @{ @"title": @"App Switcher Grid",  @"icon": @"square.grid.2x2.fill",                @"color": [UIColor systemOrangeColor], @"section": @(SectionAppSwitcherGrid) },
+        @{ @"title": @"iPad Dock",          @"icon": @"dock.rectangle",                      @"color": [UIColor systemBlueColor],   @"section": @(SectionFloatingDock) },
         @{ @"title": @"Location Simulator", @"icon": @"location.fill",                       @"color": [UIColor systemGreenColor],  @"section": @(SectionLocationSim) },
         @{ @"title": @"SnowBoard Lite",     @"icon": @"square.stack.3d.up.fill",             @"color": [UIColor systemCyanColor],   @"section": @(SectionSnowBoardLite) },
         @{ @"title": @"LiveWP",             @"icon": @"play.rectangle.fill",                 @"color": [UIColor systemPurpleColor], @"section": @(SectionLiveWP) },
@@ -15154,6 +15243,9 @@ UIViewController *settings_make_daemons_viewer(void)
     }
     if (s == SectionAppSwitcherGrid) {
         return @"Runtime patch. It changes SpringBoard's app switcher style in memory, writes no system files, and a respring restores stock. Unsupported builds may glitch the app switcher or crash SpringBoard.";
+    }
+    if (s == SectionFloatingDock) {
+        return @"SpringBoard's own iPad-style Dock with the App Library button, created in memory for the current SpringBoard session. Writes no system files; it turns on SpringBoard's \"App Library in Dock\" preference while active and off again when you turn the tweak off. Doesn't go together with Disable App Library.\n\nPorted from hxhlb/cyanide (Banana).";
     }
     if (s == SectionGravityLite) {
         return @"RemoteCall-only core port of Julio Verne's Gravity. Run applies UIDynamicAnimator gravity, collision, bounce, friction, optional dock physics, and accelerometer steering to SpringBoard icon snapshots. It can restore the icon layout or fire a manual explosion pulse while the SpringBoard session is active.\n\nNot included in this core port: Activator/Home-button hooks, drag gestures, automatic shake effects, and preference-daemon notifications.";

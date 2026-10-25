@@ -122,6 +122,7 @@ static const NSInteger kSecLiveWP           = SectionLiveWP;
 static const NSInteger kSecLocationSim      = SectionLocationSim;
 static const NSInteger kSecGravityLite      = SectionGravityLite;
 static const NSInteger kSecAppSwitcherGrid  = SectionAppSwitcherGrid;
+static const NSInteger kSecFloatingDock     = SectionFloatingDock;
 static const NSInteger kSecFastLockXLite    = SectionFastLockXLite;
 static const NSInteger kSecQuickLoader      = SectionQuickLoader;
 static const NSInteger kSecRepoTweaks       = SectionRepoTweaks;
@@ -375,6 +376,20 @@ static const NSInteger kSecOTA              = SectionOTA;
         appSwitcherGrid.settingsSection = kSecAppSwitcherGrid;
         appSwitcherGrid.unstableWarning = @"Beta: patches SpringBoard runtime methods in memory. Respring restores stock, but unsupported builds may glitch the app switcher or crash SpringBoard. Re-run after any respring.";
 
+        Package *floatingDock = [[Package alloc] initWithIdentifier:@"com.darksword.floatingdock"
+                                           name:@"iPad Dock"
+                               shortDescription:@"iPad-style Dock with App Library"
+                                longDescription:@"Turns the Dock into SpringBoard's own iPad-style Dock, including the App Library button, for the current SpringBoard session.\n\nWrites no system files. Turning it off brings the stock Dock back; so does a respring. Doesn't go together with Disable App Library.\n\nPorted from hxhlb/cyanide."
+                                        version:version
+                                         author:@"Banana"
+                                       category:@"SpringBoard"
+                                     symbolName:@"dock.rectangle"
+                                           kind:PackageInstallKindToggle
+                                     enabledKey:kSettingsFloatingDockEnabled
+                                          isNew:YES];
+        floatingDock.settingsSection = kSecFloatingDock;
+        floatingDock.unstableWarning = @"Beta: uses SpringBoard's private Dock controllers and turns on its iPad Dock in memory. Unsupported builds may glitch the Dock or crash SpringBoard; a respring restores the stock Dock.";
+
         Package *quickLoader = [[Package alloc] initWithIdentifier:@"com.darksword.quickloader"
                                            name:@"QuickLoader"
                                shortDescription:@"Executes custom .js code"
@@ -610,6 +625,7 @@ static const NSInteger kSecOTA              = SectionOTA;
             snowboardLite,
             liveWP,
             appSwitcherGrid,
+            floatingDock,
             quickLoader,
         ];
     });

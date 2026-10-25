@@ -37,6 +37,7 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
     SectionRepoTweaks,
     SectionLockScreenDuration,
     SectionPasscodeTheme,
+    SectionFloatingDock,
     SectionCount,
 };
 
@@ -134,6 +135,7 @@ extern NSString * const kSettingsNiceBarLiteEnabled;
 extern NSString * const kSettingsAxonLiteEnabled;
 
 extern NSString * const kSettingsAppSwitcherGridEnabled;
+extern NSString * const kSettingsFloatingDockEnabled;
 extern NSString * const kSettingsFastLockXLiteEnabled;
 
 extern NSString * const kSettingsGravityLiteEnabled;
