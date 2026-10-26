@@ -14528,7 +14528,20 @@ static NSUInteger settings_tab_index_for_title(UITabBarController *tab, NSString
 
 - (NSArray<NSDictionary *> *)gravityLiteRows
 {
+    BOOL active = [NSUserDefaults.standardUserDefaults boolForKey:kSettingsGravityLiteEnabled] &&
+                  settings_tweak_is_applied(kSettingsGravityLiteEnabled);
     return @[
+        active
+            ? @{ @"kind": @"button",
+                 @"title": @"Deactivate",
+                 @"subtitle": @"Stops the physics and puts the icons back.",
+                 @"action": @"gravitylite-deactivate",
+                 @"destructive": @YES }
+            : @{ @"kind": @"button",
+                 @"title": @"Activate",
+                 @"subtitle": @"Starts Gravity Lite right away, without the Apply queue.",
+                 @"action": @"gravitylite-activate",
+                 @"style": @"prominent" },
         @{ @"kind": @"toggle",
            @"key": kSettingsGravityLiteDockEnabled,
            @"title": @"Include Dock" },
@@ -18678,9 +18691,68 @@ void cyanide_present_contact(UIViewController *host)
                                                         object:[PackageQueue sharedQueue]];
 }
 
+// Activate / Deactivate on Gravity Lite's page: started or stopped right away
+// in SpringBoard, not through the Apply queue. Uses live or parked kernel
+// access; a full exploit run only after the user agreed to it.
+- (void)runGravityLiteToggle:(BOOL)activate
+{
+    if (!settings_device_supported()) return;
+    __weak typeof(self) weakSelf = self;
+    [self presentActivityLogWithCompletion:^{
+        NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
+        log_user("[GRAVITY] %s…\n", activate ? "Activating" : "Deactivating");
+        settings_springboard_tool_async("Gravity Lite", ^BOOL{
+            __sync_lock_test_and_set(&g_gravitylite_background_armed, 0);
+            settings_stop_gravity_motion();
+            bool stopped = gravitylite_stop_in_session();
+            if (!activate) {
+                [d setBool:NO forKey:kSettingsGravityLiteEnabled];
+                settings_mark_tweak_applied(kSettingsGravityLiteEnabled, NO);
+                log_user("[OK] Gravity Lite deactivated%s.\n", stopped ? "; icons put back" : "");
+                return YES;
+            }
+            [d setBool:YES forKey:kSettingsGravityLiteEnabled];
+            GravityLiteConfig config = settings_gravitylite_config_from_defaults(d);
+            bool ok = gravitylite_apply_in_session(config);
+            // Applied before the tool closes the SpringBoard channel: an active
+            // Gravity keeps it open for its tilt feed.
+            settings_mark_tweak_applied(kSettingsGravityLiteEnabled, ok);
+            if (ok) {
+                settings_start_gravity_motion(config.magnitude, config.explosionForce);
+                log_user("[OK] Gravity Lite active.\n");
+            }
+            return ok;
+        }, ^(BOOL ok, NSString *message) {
+            typeof(self) me = weakSelf;
+            settings_notify_package_queue_changed_async();
+            if ([message isEqualToString:kSettingsFullExploitRequiredMessage]) {
+                settings_post_actions_complete_async(NO, kSettingsNoKernelAccessHint);
+                if (!me) return;
+                void (^offer)(void) = ^{
+                    typeof(self) owner = weakSelf;
+                    if (!owner) return;
+                    settings_tool_needs_exploit(owner, owner.tableView, @"Gravity Lite", ^{
+                        [weakSelf runGravityLiteToggle:activate];
+                    });
+                };
+                if (me.presentedViewController) [me dismissViewControllerAnimated:YES completion:offer];
+                else offer();
+                return;
+            }
+            settings_post_actions_complete_async(ok, ok ? (activate ? @"Gravity Lite active." : @"Gravity Lite deactivated.")
+                                                        : (message ?: @"Gravity Lite did not start. Check the log."));
+            [me reloadSectionOrAll:SectionGravityLite];
+        });
+    }];
+}
+
 - (void)runGravityLiteAction:(NSString *)action
 {
     if (!settings_device_supported()) return;
+    if ([action isEqualToString:@"gravitylite-activate"] || [action isEqualToString:@"gravitylite-deactivate"]) {
+        [self runGravityLiteToggle:[action isEqualToString:@"gravitylite-activate"]];
+        return;
+    }
     BOOL restore = [action isEqualToString:@"gravitylite-restore"];
     BOOL explosion = [action isEqualToString:@"gravitylite-explosion"];
     if (!restore && !explosion) return;
