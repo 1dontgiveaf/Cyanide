@@ -10144,6 +10144,14 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                         if (!ok) [runWarnings addObject:@"Home Layout Extras restore"];
                     }
 
+                    // SBCustomizer and Layout Extras change the Dock's icons after
+                    // the iPad Dock was built; it keeps its old slots until resized
+                    // (issue #12: a 5th icon squeezed in at the left edge).
+                    if ((runSBC || runLayoutExtras || restoreLayoutExtras) &&
+                        settings_tweak_is_applied(kSettingsFloatingDockEnabled)) {
+                        floatingdock_relayout_in_session();
+                    }
+
                     // Hide labels LAST — after HSSCALE's relayout — so our own
                     // relayout can't re-show them. On iOS 17 label visibility is
                     // per-SBIconView and recomputed each layout (issue #7); doing

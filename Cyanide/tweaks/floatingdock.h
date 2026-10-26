@@ -15,6 +15,10 @@
 
 bool floatingdock_apply_in_session(void);
 bool floatingdock_stop_in_session(void);
+// Sizes and lays out the iPad Dock for its current icons again: SBCustomizer
+// changes the Dock's icons (count, apps moved in) after the iPad Dock exists,
+// and the iPad Dock keeps the slots it was built with.
+bool floatingdock_relayout_in_session(void);
 void floatingdock_forget_remote_state(void);
 
 #endif /* floatingdock_h */
