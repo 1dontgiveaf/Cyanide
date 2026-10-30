@@ -256,14 +256,6 @@ void settings_run_actions(void);
 void settings_run_pending_actions(void);
 // YES while a chain/run (not an ordinary action) owns the actions lock.
 BOOL settings_run_in_flight(void);
-// Before Cyanide switches itself to another app: waits for a live tweak's
-// RemoteCall to finish and stops new ones (the background gate), so none is
-// cut off half-way. Blocking; call off the main thread. Becoming active again
-// reopens the gate.
-void settings_quiesce_remote_calls_before_leaving(const char *why);
-// Lets live tweaks call into SpringBoard again 2 s into a kept-alive
-// background (Keep Alive playing); no-op in the foreground.
-void settings_background_live_arm(const char *why);
 // Records a pre-run failure (e.g. an installer package whose apply failed
 // before the run started) to be folded into the next run's completion, so a
 // failed install can't end with the progress screen showing "Done".

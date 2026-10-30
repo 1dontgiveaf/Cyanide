@@ -49,10 +49,6 @@ void reply_with_state(ExceptionMessage *exc, arm_thread_state64_internal *state)
 // excport_op_begin/end.
 void excport_gate_set_backgrounded(bool backgrounded);
 void excport_gate_set_terminating(void);
-// Round 55: lets live-tweak calls through while backgrounded, for the steady
-// kept-alive state only (see Exception.m). Cleared by every
-// excport_gate_set_backgrounded() and ignored while not backgrounded.
-void excport_gate_set_background_live(bool allowed);
 // True when exception-port traps must not be initiated.
 bool excport_gate_blocked(void);
 // Round 31: snapshot of the two gate flags for the early launch trace

@@ -7012,47 +7012,6 @@ static void locsvc_switcher_note_safe(BOOL clean)
 }
 
 
-// Live tweaks (Gravity's tilt feed, StatBar, NSBar, ...) are meant to keep
-// calling into SpringBoard while Cyanide is in the background, kept running by
-// Keep Alive's silent audio. The round-21 gate refuses those calls around the
-// backgrounding transition (the runningboardd deadlock); once it has settled
-// and Keep Alive is really playing, they are let through again until the next
-// lifecycle change -- or until Keep Alive stops, since then iOS may suspend
-// Cyanide (a new transition).
-static volatile uint64_t g_background_live_generation = 0;
-
-static void settings_background_live_watch(uint64_t generation)
-{
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)NSEC_PER_SEC),
-                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        if (generation != g_background_live_generation || !g_app_in_background) return;
-        if (!ds_keepalive_is_running()) {
-            excport_gate_set_background_live(false);
-            log_user("[WARN] Keep Alive stopped: live tweaks pause until Cyanide is opened again.\n");
-            return;
-        }
-        settings_background_live_watch(generation);
-    });
-}
-
-void settings_background_live_arm(const char *why)
-{
-    uint64_t generation = __sync_add_and_fetch(&g_background_live_generation, 1);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * (int64_t)NSEC_PER_SEC),
-                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        if (generation != g_background_live_generation || !g_app_in_background ||
-            settings_cleanup_in_progress()) return;
-        if (!ds_keepalive_is_running()) {
-            printf("[SETTINGS] background live calls stay off (%s): Keep Alive isn't playing\n",
-                   why ?: "background");
-            return;
-        }
-        excport_gate_set_background_live(true);
-        printf("[SETTINGS] background live calls on (%s)\n", why ?: "background");
-        settings_background_live_watch(generation);
-    });
-}
-
 void settings_application_did_enter_background(void)
 {
     // Round 21: refuse NEW own-process exception-port traps from this moment
@@ -7122,7 +7081,6 @@ void settings_application_did_enter_background(void)
     if (anyLiveLoopNeeded) {
         if ([d boolForKey:kSettingsKeepAlive]) {
             ds_keepalive_apply_enabled(YES);
-            settings_background_live_arm("entered background");
         }
         settings_begin_statbar_background_task_async("entered background");
     }
@@ -7221,29 +7179,6 @@ NSInteger settings_location_services_take_origin(NSString **bundleID)
     os_unfair_lock_unlock(&g_locsvc_origin_lock);
     if (bundleID) *bundleID = app;
     return origin;
-}
-
-void settings_quiesce_remote_calls_before_leaving(const char *why)
-{
-    // Every live-tweak call (Gravity's tilt feed, StatBar, ...) runs under the
-    // RemoteCall lock: holding it means none is half-way. Closing the gate
-    // while still holding it means none starts before iOS takes Cyanide to the
-    // background -- a call caught by the gate half-way leaves its injected
-    // thread in SpringBoard without an answer, and SpringBoard is killed
-    // (2026-10-25: Gravity tick + Location Services return, SpringBoard
-    // SIGKILL in performSelectorOnMainThread:waitUntilDone:).
-    @synchronized (settings_rc_lock()) {
-        uint64_t deadlineNs = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) + 2ULL * 1000000000ULL;
-        int waitedMs = 0;
-        while (remote_call_inflight_count() != 0 &&
-               clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) < deadlineNs) {
-            usleep(20000);
-            waitedMs += 20;
-        }
-        excport_gate_set_backgrounded(true);
-        printf("[SETTINGS] RemoteCalls quiesced before leaving (%s): in flight=%d, waited %d ms\n",
-               why ?: "leave", remote_call_inflight_count(), waitedMs);
-    }
 }
 
 void settings_location_services_set_async(int desired, BOOL allowFullExploit,
@@ -10142,14 +10077,6 @@ static void settings_run_actions_internal(BOOL pendingOnly)
                                  ok ? "[OK]" : "[WARN]",
                                  ok ? "returned to stock layout" : "did not complete cleanly");
                         if (!ok) [runWarnings addObject:@"Home Layout Extras restore"];
-                    }
-
-                    // SBCustomizer and Layout Extras change the Dock's icons after
-                    // the iPad Dock was built; it keeps its old slots until resized
-                    // (issue #12: a 5th icon squeezed in at the left edge).
-                    if ((runSBC || runLayoutExtras || restoreLayoutExtras) &&
-                        settings_tweak_is_applied(kSettingsFloatingDockEnabled)) {
-                        floatingdock_relayout_in_session();
                     }
 
                     // Hide labels LAST — after HSSCALE's relayout — so our own
@@ -14536,20 +14463,7 @@ static NSUInteger settings_tab_index_for_title(UITabBarController *tab, NSString
 
 - (NSArray<NSDictionary *> *)gravityLiteRows
 {
-    BOOL active = [NSUserDefaults.standardUserDefaults boolForKey:kSettingsGravityLiteEnabled] &&
-                  settings_tweak_is_applied(kSettingsGravityLiteEnabled);
     return @[
-        active
-            ? @{ @"kind": @"button",
-                 @"title": @"Deactivate",
-                 @"subtitle": @"Stops the physics and puts the icons back.",
-                 @"action": @"gravitylite-deactivate",
-                 @"destructive": @YES }
-            : @{ @"kind": @"button",
-                 @"title": @"Activate",
-                 @"subtitle": @"Starts Gravity Lite right away, without the Apply queue.",
-                 @"action": @"gravitylite-activate",
-                 @"style": @"prominent" },
         @{ @"kind": @"toggle",
            @"key": kSettingsGravityLiteDockEnabled,
            @"title": @"Include Dock" },
@@ -18699,68 +18613,9 @@ void cyanide_present_contact(UIViewController *host)
                                                         object:[PackageQueue sharedQueue]];
 }
 
-// Activate / Deactivate on Gravity Lite's page: started or stopped right away
-// in SpringBoard, not through the Apply queue. Uses live or parked kernel
-// access; a full exploit run only after the user agreed to it.
-- (void)runGravityLiteToggle:(BOOL)activate
-{
-    if (!settings_device_supported()) return;
-    __weak typeof(self) weakSelf = self;
-    [self presentActivityLogWithCompletion:^{
-        NSUserDefaults *d = NSUserDefaults.standardUserDefaults;
-        log_user("[GRAVITY] %s…\n", activate ? "Activating" : "Deactivating");
-        settings_springboard_tool_async("Gravity Lite", ^BOOL{
-            __sync_lock_test_and_set(&g_gravitylite_background_armed, 0);
-            settings_stop_gravity_motion();
-            bool stopped = gravitylite_stop_in_session();
-            if (!activate) {
-                [d setBool:NO forKey:kSettingsGravityLiteEnabled];
-                settings_mark_tweak_applied(kSettingsGravityLiteEnabled, NO);
-                log_user("[OK] Gravity Lite deactivated%s.\n", stopped ? "; icons put back" : "");
-                return YES;
-            }
-            [d setBool:YES forKey:kSettingsGravityLiteEnabled];
-            GravityLiteConfig config = settings_gravitylite_config_from_defaults(d);
-            bool ok = gravitylite_apply_in_session(config);
-            // Applied before the tool closes the SpringBoard channel: an active
-            // Gravity keeps it open for its tilt feed.
-            settings_mark_tweak_applied(kSettingsGravityLiteEnabled, ok);
-            if (ok) {
-                settings_start_gravity_motion(config.magnitude, config.explosionForce);
-                log_user("[OK] Gravity Lite active.\n");
-            }
-            return ok;
-        }, ^(BOOL ok, NSString *message) {
-            typeof(self) me = weakSelf;
-            settings_notify_package_queue_changed_async();
-            if ([message isEqualToString:kSettingsFullExploitRequiredMessage]) {
-                settings_post_actions_complete_async(NO, kSettingsNoKernelAccessHint);
-                if (!me) return;
-                void (^offer)(void) = ^{
-                    typeof(self) owner = weakSelf;
-                    if (!owner) return;
-                    settings_tool_needs_exploit(owner, owner.tableView, @"Gravity Lite", ^{
-                        [weakSelf runGravityLiteToggle:activate];
-                    });
-                };
-                if (me.presentedViewController) [me dismissViewControllerAnimated:YES completion:offer];
-                else offer();
-                return;
-            }
-            settings_post_actions_complete_async(ok, ok ? (activate ? @"Gravity Lite active." : @"Gravity Lite deactivated.")
-                                                        : (message ?: @"Gravity Lite did not start. Check the log."));
-            [me reloadSectionOrAll:SectionGravityLite];
-        });
-    }];
-}
-
 - (void)runGravityLiteAction:(NSString *)action
 {
     if (!settings_device_supported()) return;
-    if ([action isEqualToString:@"gravitylite-activate"] || [action isEqualToString:@"gravitylite-deactivate"]) {
-        [self runGravityLiteToggle:[action isEqualToString:@"gravitylite-activate"]];
-        return;
-    }
     BOOL restore = [action isEqualToString:@"gravitylite-restore"];
     BOOL explosion = [action isEqualToString:@"gravitylite-explosion"];
     if (!restore && !explosion) return;

@@ -36,9 +36,8 @@ Confirmed working on iPhone 16 Pro Max (iOS 18.5), iPhone 15 Pro Max
 Installed from the in-app Installer. Most tweaks are applied in memory for the
 current boot, and a respring undoes them. A few write files or system settings
 that last beyond a respring or reboot: the OTA blocker, the call recording
-sound, Hide Home Bar, Passcode Style, Lock Screen Duration, Watch Pairing
-Override and the Daemon Manager stay until you switch them off in Cyanide, and
-the Cache Cleaner deletes what you select.
+sound, Hide Home Bar and the Daemon Manager stay until you switch them off in
+Cyanide, and the Cache Cleaner deletes what you select.
 
 ### Home Screen
 
@@ -55,13 +54,11 @@ the Cache Cleaner deletes what you select.
 | --- | --- |
 | **Axon Lite** | Group Notification Center requests by app |
 | **App Switcher Grid** | Grid-style app switcher |
-| **iPad Dock** | iPad-style Dock with the App Library button |
-| **SpringBoard Tools** | Apply the dock, folder and Control Center look from Settings → Lara with the other tweaks |
-| **Lock Screen Duration** | Keep the lock screen awake longer |
 | **QuickLoader** | Executes custom .js code |
 | **Disable App Library** | Remove the App Library page |
 | **Disable Icon Fly-In** | Skip the icon spring animation |
 | **Hide New App Dots** | No blue dot next to new or updated apps |
+| **iPad Dock** | iPad-style Dock with the App Library button |
 | **Zero Wake Animation** | Snap on instantly when waking |
 | **Zero Backlight Fade** | Instant lock/unlock backlight |
 | **Double-Tap to Lock** | Lock with a wallpaper double-tap |
@@ -81,14 +78,13 @@ the Cache Cleaner deletes what you select.
 | --- | --- |
 | **SnowBoard Lite** | Local SnowBoard-style icon themes |
 | **LiveWP** | Video wallpaper for Home and Lock Screen |
-| **Passcode Style** | Custom Lock Screen passcode keypad artwork |
 
 ### System
 
 | Tweak | What it does |
 | --- | --- |
 | **Powercuff** | Underclock the CPU/GPU thermal pressure |
-| **Location Simulator** | CoreLocation static point simulation, plus a Location Services on/off switch |
+| **Location Simulator** | CoreLocation static point simulation |
 | **Watch Pairing Override** | Pair a newer watch or revive an older one |
 | **Call Recording Sound** | Silence disclosure start/stop sounds |
 | **OTA Updates** | Enable or disable over-the-air system updates |
@@ -100,54 +96,16 @@ the Cache Cleaner deletes what you select.
 | **Dynamic Stage Lite** | Two floating app windows, iPad-style |
 | **FastLockX Lite** | Face ID retry + unlock controls |
 
-## Tools
-
-### Settings → Lara
-
-Ideas from [lara](https://github.com/rooootdev/lara) by rooootdev, ported with
-his permission.
-
-| Tool | What it does |
-| --- | --- |
-| **Performance HUD** | Core Animation's frame-rate and GPU overlay, until you turn it off or restart |
-| **Debug Overlay** | Apple's internal UIKit inspector; double-tap the status bar to open it |
-| **Upside Down** | Let the Home Screen and Lock Screen rotate upside down |
-| **Hidden Settings** | Hidden iOS preferences |
-| **JIT Enabler** | Open a development-signed app with JIT (emulators and similar) |
-| **3-App Limit** | Free the 3-app slots of a free Apple ID's sideloaded apps |
-| **Wallet Card Art** | Replace a Wallet card's picture with your own (cosmetic, restorable) |
-| **App Decrypt** | Make a decrypted IPA of an installed App Store app |
-| **SpringBoard Tools** | Your own tint and blur, or none, for the dock, folders, Control Center, notifications and the app switcher |
-| **Font Overwrite** | Replace the system font, its italic and monospaced variants, or the Lock Screen clock, in memory only; plain fonts are adapted on the device |
-
-### Settings → System
-
-| Tool | What it does |
-| --- | --- |
-| **Process Viewer** | Running processes, with details and actions |
-| **File Browser** | Browse the file system, with a plist editor and optional read-only root access |
-| **Daemon Manager** | Turn system daemons off or on (persists) |
-| **System Info** | Device, battery and kernel access details |
-| **Cache Cleaner** | Delete selected caches |
-
-**Location Services** can also be switched from a Control Center control
-(iOS 18) or a Shortcuts / Action button action (iOS 17 and later).
-
 ## Options
 
 Under **Settings → Launch Options**:
 
 | Option | |
 | --- | --- |
-| **A18 exploit path** | `pe_v3` (default), `pe_v1` (compatibility) or `pe_v2` (legacy fallback). A18/M4 only. |
-| **A18 interleaved search, memory shaping, bounded search** | Fine-tuning for the `pe_v1` path. A18/M4 only. |
-| **Auto-retry failed chain runs** | Re-run the chain automatically after a miss, up to an attempt cap. |
-| **Controlled panic on injection wedge** | Diagnostic: write the log and panic on purpose instead of waiting for a watchdog reset. |
+| **A18 exploit path** | `pe_v1` (default) or `pe_v2` (fallback). A18/M4 only. |
 | **Tweak apply speed** | Compatible / Fast / Fastest. Higher settings cut the delay paid between the remote calls that apply a tweak. |
-| **Verbose logging** | Full RemoteCall internals in the log, for bug reports. |
+| **Auto-run kexploit on launch** | Get kernel read/write as soon as Cyanide opens. |
 | **Sandbox escape** | Run the sandbox escape demo. |
-| **Location Services links** | Allow `cyanide://location-services` links (off by default). |
-| **Repo sources** | Show or hide the Sources tab and repo tweaks. |
 | **Keep app alive in background** | Needed by tweaks that keep running while Cyanide is backgrounded. |
 
 Each tweak has its own section in Settings once installed.
@@ -363,7 +321,7 @@ iOS/iPadOS 18.7.2 and 26.1. Later builds are outside this kernel exploit window.
 
 - [`opa334`](https://github.com/opa334): original [`darksword-kexploit`](https://github.com/opa334/darksword-kexploit), ChOma, and XPF — the kernel r/w primitive Cyanide is built on.
 - [`wh1te4ever`](https://github.com/wh1te4ever): [`kfun` / `darksword-kexploit-fun`](https://github.com/wh1te4ever/darksword-kexploit-fun) — the RemoteCall implementation that lets a sideloaded app apply tweaks inside SpringBoard. Cyanide is a fork of this project.
-- [`rooootdev`](https://github.com/rooootdev): working kexploit behavior used to stabilize this fork, and [lara](https://github.com/rooootdev/lara), whose ideas App Decrypt, SpringBoard Tools and Font Overwrite are ported from (with permission).
+- [`rooootdev`](https://github.com/rooootdev): working kexploit behavior used to stabilize this fork.
 - [`neonmodder123`](https://github.com/neonmodder123): Web Respring method.
 - [`kolbicz`](https://github.com/kolbicz): OTA Disabler, SpringBoard tweaks, and
   the RemoteCall/CLSimulationManager GPS spoofer prototype used as the starting

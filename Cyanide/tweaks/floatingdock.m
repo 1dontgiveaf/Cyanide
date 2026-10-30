@@ -698,37 +698,6 @@ bool floatingdock_apply_in_session(void)
     return true;
 }
 
-bool floatingdock_relayout_in_session(void)
-{
-    if (!gFloatingDockApplied || !r_is_objc_ptr(gFloatingDockControllerHint)) return false;
-    uint64_t dockViewController = floatingdock_view_controller(gFloatingDockControllerHint);
-    if (!r_is_objc_ptr(dockViewController)) return false;
-    uint64_t userList = r_responds(dockViewController, "userIconListView")
-        ? r_msg2_main(dockViewController, "userIconListView", 0, 0, 0, 0) : 0;
-    uint64_t model = r_is_objc_ptr(userList) && r_responds(userList, "model")
-        ? r_msg2_main(userList, "model", 0, 0, 0, 0) : 0;
-    uint64_t icons = r_is_objc_ptr(model) && r_responds(model, "icons")
-        ? r_msg2_main(model, "icons", 0, 0, 0, 0) : 0;
-    uint64_t count = r_is_objc_ptr(icons) ? r_msg2_main(icons, "count", 0, 0, 0, 0) : 0;
-    bool resized = false, laidOut = false;
-    if (r_responds(dockViewController, "_resizeDockForChangedNumberOfIconsAnimated:")) {
-        r_msg2_main(dockViewController, "_resizeDockForChangedNumberOfIconsAnimated:", 0, 0, 0, 0);
-        resized = true;
-    }
-    if (r_responds(dockViewController, "layoutUserControlledIconListsWithAnimationType:forceRelayout:")) {
-        r_msg2_main(dockViewController, "layoutUserControlledIconListsWithAnimationType:forceRelayout:", 0, 1, 0, 0);
-        laidOut = true;
-    }
-    uint64_t dockView = r_responds(dockViewController, "view")
-        ? r_msg2_main(dockViewController, "view", 0, 0, 0, 0) : 0;
-    if (r_is_objc_ptr(dockView)) {
-        r_msg2_main(dockView, "setNeedsLayout", 0, 0, 0, 0);
-        r_msg2_main(dockView, "layoutIfNeeded", 0, 0, 0, 0);
-    }
-    printf("[FLOATING-DOCK] relayout for %llu Dock icon(s): resize=%d layout=%d\n", count, resized, laidOut);
-    return resized || laidOut;
-}
-
 bool floatingdock_stop_in_session(void)
 {
     if (!gFloatingDockApplied) return false;
